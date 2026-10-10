@@ -98,9 +98,6 @@ template [[host_name("kernel_cpy_f32_q4_0")]]   kernel cpy_f_q_t kernel_cpy_f32_
 template [[host_name("kernel_cpy_f32_q4_1")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK4_1,  block_q4_1,   quantize_q4_1>;
 template [[host_name("kernel_cpy_f32_q5_0")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK5_0,  block_q5_0,   quantize_q5_0>;
 template [[host_name("kernel_cpy_f32_q5_1")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK5_1,  block_q5_1,   quantize_q5_1>;
-template [[host_name("kernel_cpy_f32_q3_K")]]    kernel cpy_f_q_t kernel_cpy_f32_q<QK_K,    block_q3_K,    quantize_q3_K>;
-template [[host_name("kernel_cpy_f32_q4_K")]]    kernel cpy_f_q_t kernel_cpy_f32_q<QK_K,    block_q4_K,    quantize_q4_K>;
-template [[host_name("kernel_cpy_f32_mxfp4")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK_MXFP4, block_mxfp4,  quantize_mxfp4>;
 template [[host_name("kernel_cpy_f32_iq4_nl")]] kernel cpy_f_q_t kernel_cpy_f32_q<QK4_NL, block_iq4_nl, quantize_iq4_nl>;
 template [[host_name("kernel_cpy_f32_tq2_0")]]  kernel cpy_f_q_t kernel_cpy_f32_q<QK_K,   block_tq2_0,  quantize_tq2_0>;
 
@@ -148,9 +145,6 @@ template [[host_name("kernel_cpy_q4_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<
 template [[host_name("kernel_cpy_q4_1_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q4_1, 2, dequantize_q4_1>;
 template [[host_name("kernel_cpy_q5_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q5_0, 2, dequantize_q5_0>;
 template [[host_name("kernel_cpy_q5_1_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q5_1, 2, dequantize_q5_1>;
-template [[host_name("kernel_cpy_q3_K_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q3_K, QK_NL, dequantize_q3_K>;
-template [[host_name("kernel_cpy_q4_K_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q4_K, QK_NL, dequantize_q4_K>;
-template [[host_name("kernel_cpy_mxfp4_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_mxfp4, 2, dequantize_mxfp4>;
 template [[host_name("kernel_cpy_q8_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q8_0, 2, dequantize_q8_0>;
 
 template [[host_name("kernel_cpy_tq2_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_tq2_0, QK_NL, dequantize_tq2_0>;
@@ -161,9 +155,6 @@ template [[host_name("kernel_cpy_q4_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<
 template [[host_name("kernel_cpy_q4_1_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q4_1, 2, dequantize_q4_1>;
 template [[host_name("kernel_cpy_q5_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q5_0, 2, dequantize_q5_0>;
 template [[host_name("kernel_cpy_q5_1_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q5_1, 2, dequantize_q5_1>;
-template [[host_name("kernel_cpy_q3_K_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q3_K, QK_NL, dequantize_q3_K>;
-template [[host_name("kernel_cpy_q4_K_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q4_K, QK_NL, dequantize_q4_K>;
-template [[host_name("kernel_cpy_mxfp4_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_mxfp4, 2, dequantize_mxfp4>;
 template [[host_name("kernel_cpy_q8_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q8_0, 2, dequantize_q8_0>;
 
 template [[host_name("kernel_cpy_tq2_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_tq2_0, QK_NL, dequantize_tq2_0>;

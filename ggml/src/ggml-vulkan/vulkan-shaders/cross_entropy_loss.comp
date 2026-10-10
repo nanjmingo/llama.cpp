@@ -68,10 +68,7 @@ void main() {
 
     FLOAT_TYPE loss = FLOAT_TYPE(0.0f);
     for (uint i = tid; i < p.KX; i += BLOCK_SIZE) {
-        const FLOAT_TYPE label = FLOAT_TYPE(data_b[off + i]);
-        if (label != FLOAT_TYPE(0.0f)) {
-            loss += (FLOAT_TYPE(data_a[off + i]) - max_logit - log_sum) * label;
-        }
+        loss += (FLOAT_TYPE(data_a[off + i]) - max_logit - log_sum) * FLOAT_TYPE(data_b[off + i]);
     }
     loss = -wg_reduce_sum(loss) / FLOAT_TYPE(p.KY);
 

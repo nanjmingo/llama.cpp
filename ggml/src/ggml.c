@@ -3653,15 +3653,6 @@ struct ggml_tensor * ggml_cpy(
     return ggml_cpy_impl(ctx, a, b);
 }
 
-struct ggml_tensor * ggml_cpy_no_grad(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * a,
-        struct ggml_tensor  * b) {
-    struct ggml_tensor * result = ggml_cpy_impl(ctx, a, b);
-    ggml_set_op_params_i32(result, 0, 1);
-    return result;
-}
-
 struct ggml_tensor * ggml_cast(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
@@ -6347,12 +6338,10 @@ struct ggml_tensor * ggml_opt_step_adamw(
         struct ggml_tensor  * adamw_params) {
     GGML_ASSERT(a->flags & GGML_TENSOR_FLAG_PARAM);
     GGML_ASSERT(ggml_are_same_shape(a, grad));
-    GGML_ASSERT((ggml_are_same_shape(a, m) && ggml_are_same_shape(a, v)) ||
-        (m->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0 &&
-         ggml_is_contiguous(m) && ggml_is_contiguous(v) &&
-         ggml_nelements(m) >= ggml_nelements(a) && ggml_nelements(v) >= ggml_nelements(a)));
+    GGML_ASSERT(ggml_are_same_shape(a, m));
+    GGML_ASSERT(ggml_are_same_shape(a, v));
     GGML_ASSERT(adamw_params->type == GGML_TYPE_F32);
-    GGML_ASSERT(ggml_nelements(adamw_params) == 8);
+    GGML_ASSERT(ggml_nelements(adamw_params) == 7);
 
     struct ggml_tensor * result = ggml_view_tensor(ctx, a);
 
@@ -7064,7 +7053,7 @@ static void ggml_compute_backward(
             // cpy overwrites value of src1 by src0 and returns view(src1)
             // the overwriting is mathematically equivalent to:
             // tensor = src0 * 1 + src1 * 0
-            if (src0_needs_grads && ggml_get_op_params_i32(tensor, 0) == 0) {
+            if (src0_needs_grads) {
                 // dsrc0 = dtensor * 1
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_reshape(ctx, grad, src0));
             }
@@ -7545,9 +7534,6 @@ void ggml_build_backward_expand(
             case GGML_OP_GET_ROWS_BACK: // same as for GET_ROWS
             case GGML_OP_ROPE:          // positions not differentiable
                 ignore_src[1] = true;
-                if (node->op == GGML_OP_CPY && (ggml_get_op_params_i32(node, 0) != 0 || ggml_is_quantized(node->src[0]->type))) {
-                    ignore_src[0] = true;
-                }
                 break;
             case GGML_OP_ADD_ID:
                 ignore_src[2] = true;

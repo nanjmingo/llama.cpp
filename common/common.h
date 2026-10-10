@@ -504,7 +504,6 @@ struct common_params {
     struct common_params_diffusion   diffusion;
 
     struct common_params_model model;
-    std::string moe_prune_profile; // immutable MoE pruning profile loaded with the model
 
     std::set<std::string> model_alias;     // model aliases                                                 // NOLINT
     std::set<std::string> model_tags;      // model tags (informational, not used for routing)              // NOLINT
@@ -609,7 +608,7 @@ struct common_params {
     // finetune
     struct lr_opt lr;
     enum ggml_opt_optimizer_type optimizer = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
-    float   val_split              = 0.05f; // fraction of the data used for the validation set
+    float val_split = 0.05f; // fraction of the data used for the validation set
 
     // qlora fine-tuning
     int32_t     lora_rank          = 16;              // LoRA rank (r)
@@ -622,28 +621,11 @@ struct common_params {
     int32_t save_every             = 0;     // save checkpoint every N optimizer steps (0 = disabled)
     int32_t lora_freeze_layers     = 0;     // do not apply LoRA to the first N transformer layers
     int32_t grad_checkpoint_interval = 0;  // gradient checkpointing interval to reduce peak VRAM (0 = disabled)
-    int32_t optimizer_restart_every = 0;   // reset optimizer state every N epochs (0 = disabled)
-    std::string lora_qat             = "none"; // none, q3_k, q4_k, q4_0, mxfp4, q6_k, q8_0
     std::string lr_scheduler         = "constant"; // constant, cosine
     int32_t warmup_steps             = 0;   // linear learning-rate warmup in logical training steps
     float   warmup_init_ratio        = 0.1f; // initial warmup learning rate as a fraction of peak learning rate
     bool    verbose_loss           = false; // print one structured loss line per SFT window
-    bool    train_on_prompt        = false; // include prompt tokens in training loss (default: response tokens only)
     bool    shuffle_dataset        = false; // shuffle dataset windows at the start of each epoch
-    std::string critical_token_mode = "none"; // none, spans, confidence, hybrid
-    float   critical_token_weight = 3.0f;
-    float   critical_confidence_threshold = 0.25f;
-    std::string critical_weight_shape = "constant"; // constant, linear
-    int32_t critical_warmup_steps = 0;
-    float   critical_max_fraction = 1.0f;
-    int32_t critical_stats_every = 10;
-
-    // grpo training
-    bool    grpo_mode              = false; // enable GRPO IPC training loop
-    int32_t grpo_n_gen             = 8;     // generations per prompt
-    int32_t grpo_n_steps           = 500;   // total GRPO optimizer steps
-    float   grpo_temperature       = 0.8f;  // sampling temperature for rollouts
-    int32_t grpo_max_tokens        = 512;   // max tokens per generation
 
     // embedding
     bool embedding         = false; // get only sentence embedding
@@ -1191,7 +1173,7 @@ inline void llm_add_n_cpu_ffn_overrides(int n, const char * ffn_regex, std::vect
 
 ggml_opt_dataset_t common_opt_dataset_init(struct llama_context * ctx, const std::vector<llama_token> & tokens, int64_t stride);
 
-// "adamw", "adamw_f16", "adamw_q8_0", "adamw_q6_k", "adamw_iq4_nl", or "sgd" (case insensitive)
+// "adamw" or "sgd" (case insensitive)
 enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 
 //

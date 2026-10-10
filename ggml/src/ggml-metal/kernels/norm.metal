@@ -306,27 +306,3 @@ kernel void kernel_group_norm_f32(
         dst[j] *= scale;
     }
 }
-
-kernel void kernel_rms_norm_back_f32(
-        constant ggml_metal_kargs_training & args [[buffer(0)]],
-        device const float * grad [[buffer(1)]],
-        device const float * x [[buffer(2)]],
-        device float * dst [[buffer(3)]],
-        uint gid [[thread_position_in_grid]]) {
-    if (gid >= args.ne) {
-        return;
-    }
-
-    const uint ncols = args.ne00;
-    const uint row = gid/ncols;
-    const uint base = row*ncols;
-    float sum_xx = 0.0f;
-    float sum_xg = 0.0f;
-    for (uint col = 0; col < ncols; ++col) {
-        sum_xx += x[base + col]*x[base + col];
-        sum_xg += x[base + col]*grad[base + col];
-    }
-    const float scale_g = rsqrt(sum_xx/float(ncols) + args.param);
-    const float scale_x = -scale_g*sum_xg/(sum_xx + float(ncols)*args.param);
-    dst[gid] = scale_g*grad[gid] + scale_x*x[gid];
-}

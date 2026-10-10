@@ -24,20 +24,6 @@
 #include <string>
 #include <unordered_set>
 
-void llm_graph_input_moe_mask::set_input(const llama_ubatch * ubatch) {
-    GGML_UNUSED(ubatch);
-    std::vector<float> values(n_expert, 0.0f);
-    for (int32_t expert : disabled_experts) {
-        values[expert] = -INFINITY;
-    }
-    ggml_backend_tensor_set(mask, values.data(), 0, values.size() * sizeof(float));
-}
-
-bool llm_graph_input_moe_mask::can_reuse(const llm_graph_params & params) {
-    GGML_UNUSED(params);
-    return true;
-}
-
 // dedup helpers
 
 static ggml_tensor * build_attn_inp_kq_mask(
@@ -1466,20 +1452,6 @@ void llm_graph_result::set_params(const llm_graph_params & params) {
 // llm_graph_context
 //
 
-// Warm all active experts so their compute graphs are allocated before inference.
-static uint32_t llm_graph_warmup_n_expert_used(const llama_hparams & hparams) {
-    if (!hparams.moe_prune_active) {
-        return hparams.n_expert;
-    }
-    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
-        const auto & disabled = hparams.moe_disabled_experts[il];
-        if (disabled.any()) {
-            return hparams.n_expert - (uint32_t) disabled.count();
-        }
-    }
-    return hparams.n_expert;
-}
-
 llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     arch             (params.arch),
     hparams          (params.hparams),
@@ -1497,7 +1469,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     n_embd_head_v    (hparams.n_embd_head_v()),
     n_embd_v_gqa     (hparams.n_embd_v_gqa()),
     n_expert         (hparams.n_expert),
-    n_expert_used    (cparams.warmup ? llm_graph_warmup_n_expert_used(hparams) : hparams.n_expert_used()),
+    n_expert_used    (cparams.warmup ? hparams.n_expert : hparams.n_expert_used()),
     freq_base        (cparams.rope_freq_base),
     freq_scale       (cparams.rope_freq_scale),
     ext_factor       (cparams.yarn_ext_factor),
@@ -1558,40 +1530,9 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         const float adapter_scale = lora.second;
         const float scale = lw->get_scale(lora.first->alpha, adapter_scale);
 
-        auto fake_quant = [&](ggml_tensor * tensor) {
-            enum ggml_type type = GGML_TYPE_COUNT;
-            switch (cparams.lora_qat_type) {
-                case LLAMA_LORA_QAT_TYPE_Q3_K:  type = GGML_TYPE_Q3_K; break;
-                case LLAMA_LORA_QAT_TYPE_Q4_K:  type = GGML_TYPE_Q4_K; break;
-                case LLAMA_LORA_QAT_TYPE_Q4_0:  type = GGML_TYPE_Q4_0; break;
-                case LLAMA_LORA_QAT_TYPE_MXFP4: type = GGML_TYPE_MXFP4; break;
-                case LLAMA_LORA_QAT_TYPE_Q6_K:  type = GGML_TYPE_Q6_K; break;
-                case LLAMA_LORA_QAT_TYPE_Q8_0:  type = GGML_TYPE_Q8_0; break;
-                default: return tensor;
-            }
-
-            const int64_t n_per_row = w->ne[0];
-            if (n_per_row % ggml_blck_size(type) != 0) {
-                return tensor;
-            }
-
-            const int64_t ne = ggml_nelements(tensor);
-            if (ne % ggml_blck_size(type) != 0) {
-                return tensor;
-            }
-            ggml_tensor * flat = ggml_reshape_1d(ctx0, tensor, ne);
-            ggml_tensor * quant = ggml_new_tensor_1d(ctx0, type, ne);
-            quant = ggml_cpy(ctx0, flat, quant);
-            ggml_tensor * fake = ggml_cast(ctx0, quant, GGML_TYPE_F32);
-            fake = ggml_reshape(ctx0, fake, tensor);
-            ggml_tensor * fake_stop = ggml_cpy_no_grad(ctx0, fake, ggml_dup_tensor(ctx0, fake));
-            ggml_tensor * master_stop = ggml_cpy_no_grad(ctx0, tensor, ggml_dup_tensor(ctx0, tensor));
-            return ggml_add(ctx0, tensor, ggml_sub(ctx0, fake_stop, master_stop));
-        };
-
         ggml_tensor * ab_cur = ggml_mul_mat(
-                ctx0, fake_quant(lw->b),
-                ggml_mul_mat(ctx0, fake_quant(lw->a), cur)
+                ctx0, lw->b,
+                ggml_mul_mat(ctx0, lw->a, cur)
                 );
 
         ab_cur = ggml_scale(ctx0, ab_cur, scale);
@@ -2095,24 +2036,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(logits, "ffn_moe_logits_biased", il);
     }
 
-    ggml_tensor * prune_mask = nullptr;
-    if (il >= 0 && hparams.moe_disabled_experts[il].any()) {
-        std::vector<int32_t> disabled_experts;
-        for (int32_t expert = 0; expert < n_expert; ++expert) {
-            if (hparams.moe_disabled_experts[il][expert]) {
-                disabled_experts.push_back(expert);
-            }
-        }
-        auto inp = std::make_unique<llm_graph_input_moe_mask>(n_expert, disabled_experts);
-        inp->mask = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_expert);
-        ggml_set_input(inp->mask);
-        prune_mask = inp->mask;
-        res->add_input(std::move(inp));
-
-        logits = ggml_add(ctx0, logits, prune_mask);
-        cb(logits, "ffn_moe_logits_masked", il);
-    }
-
     ggml_tensor * probs = nullptr;
     switch (gating_op) {
         case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:
@@ -2153,11 +2076,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (arch == LLM_ARCH_GROVEMOE) {
         selection_probs = ggml_sigmoid(ctx0, logits); // [n_expert, n_tokens]
         cb(selection_probs, "ffn_moe_probs_biased", il);
-    }
-
-    if (prune_mask != nullptr) {
-        selection_probs = ggml_add(ctx0, selection_probs, prune_mask);
-        cb(selection_probs, "ffn_moe_probs_pruned", il);
     }
 
     // select top n_group_used expert groups

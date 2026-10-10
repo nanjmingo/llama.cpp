@@ -1,10 +1,10 @@
 # llama.cpp — Native QLoRA Training
 
-Native QLoRA + Reward-Weighted SFT training pipeline for quantized GGUF models.
+Native QLoRA SFT training pipeline for quantized GGUF models.
 
 The base model weights remain **frozen** (quantized tensors are skipped by `llama_set_param` because they are not `GGML_TYPE_F32`). Only freshly-allocated F32 LoRA A/B tensors are trained. The saved adapter GGUF is directly compatible with the existing `llama_adapter_lora_init` loader and `llama-export-lora` merge tool.
 
-**Status:** Working. Phase 1 (QLoRA SFT) and Phase 2 (Reward-Weighted SFT) are implemented and functional. Training speed is currently limited by full backprop through quantized weights — see [Known Limitations](#known-limitations).
+**Status:** QLoRA SFT is implemented and functional. Training speed is currently limited by full backprop through quantized weights — see [Known Limitations](#known-limitations).
 
 ---
 
@@ -23,39 +23,18 @@ cmake --build build --target llama-finetune-qlora -j$(nproc)
 cmake --build build -j$(nproc)
 
 # ROCm build:
-./ROCm-build.sh
-
-# Optional: compile for a specific AMD GPU architecture:
-GPU_TARGETS=gfx1100 ./ROCm-build.sh
-
-# Radeon 680M (gfx1035, unsupported test configuration):
-# ROCm's packaged rocBLAS kernels target gfx1030, so use a separate build.
-BUILD_DIR=build-rocm-gfx1030 GPU_TARGETS=gfx1030 ./ROCm-build.sh
-
-# Incremental ROCm rebuild:
+cmake -B build-rocm -DGGML_HIP=ON -DLLAMA_CURL=OFF
 cmake --build build-rocm --target llama-finetune-qlora -j$(nproc)
 ```
 
-Run the Radeon 680M compatibility build with:
-
-```bash
-HSA_OVERRIDE_GFX_VERSION=10.3.0 \
-GGML_CUDA_DISABLE_GRAPHS=1 \
-./build-rocm-gfx1030/bin/llama-finetune-qlora ...
-```
-
-The Radeon 680M is not in AMD's supported ROCm GPU matrix. This compatibility
-mode is intended for local testing and uses the packaged gfx1030 rocBLAS
-kernels. Do not combine gfx1030 and gfx1035 objects in one build directory.
-
-The ROCm build supports the same SFT, reward-weighted SFT, GRPO, resume,
-checkpointing, LoRA QAT, partial offload, and optimizer modes as the CUDA build.
+The ROCm build supports the same SFT, resume, checkpointing, partial offload,
+and optimizer modes as the CUDA build.
 HIP compiles the shared `ggml-cuda` training kernels, including quantized
 `OUT_PROD`, `OUT_PROD_ID`, and device-resident Q8 AdamW state.
 
 ---
 
-## Phase 1 — QLoRA SFT (`llama-finetune-qlora`)
+## QLoRA SFT (`llama-finetune-qlora`)
 
 Trains LoRA adapters on a quantized GGUF model.
 
@@ -97,21 +76,12 @@ Trains LoRA adapters on a quantized GGUF model.
 | `--lora-rank` | `16` | LoRA rank r |
 | `--lora-alpha` | `0` (= rank) | LoRA alpha; effective scale = alpha/rank |
 | `--lora-targets` | see below | Comma-separated internal tensor name substrings |
-| `--lora-out` | `adapter.gguf` | Output adapter GGUF path (supports `~`) |
+| `--lora-out` | `adapter.gguf` | Output adapter GGUF path |
 | `--resume` | *(none)* | Resume weights and training position from a `--save-every` checkpoint |
 | `--save-every` | `0` | Save checkpoint every N dataset windows (0 = end only) |
 | `--freeze-layers` | `0` | Skip LoRA on first N transformer layers (blk.0..N-1); backward already pruned automatically |
 | `--grad-checkpoint` | `0` | Mark every Nth forward node persistent to reduce activation VRAM; good values: 32–64 |
-| `--train-on-prompt` | off | Compute loss on prompt tokens too (default: response-only loss) |
 | `--shuffle-dataset` | off | Shuffle dataset windows at the start of each epoch |
-| `--critical-token-mode` | `none` | Critical-Token SFT mode: `none`, `spans`, `confidence`, or `hybrid` |
-| `--critical-token-weight` | `3.0` | Weight assigned to automatically selected tokens and spans without an explicit weight |
-| `--critical-confidence-threshold` | `0.25` | Select supervised targets whose correct-token probability is below this value |
-| `--critical-weight-shape` | `constant` | Confidence weight shape: `constant` or `linear` |
-| `--critical-warmup-steps` | `0` | Optimizer steps used to linearly warm up the extra critical weight |
-| `--critical-max-fraction` | `1.0` | Maximum automatically selected fraction of supervised tokens per microbatch |
-| `--critical-stats-every` | `10` | Print Critical-Token SFT diagnostics every N optimizer steps |
-| `--val-split` | `0.05` | Fraction of data to hold out for validation (e.g. `0.1` = 10%); val loss logged per epoch |
 | `-epochs` / `--epochs` | `3` | Training epochs |
 | `-c` / `--ctx-size` | `512` | Training context window (tokens) |
 | `-b` / `--batch-size` | `2048` | Tokens per `llama_decode` call; set equal to `-c` |
@@ -125,8 +95,7 @@ Trains LoRA adapters on a quantized GGUF model.
 | `-lr-min` / `--learning-rate-min` | `-1` | Cosine floor; values below 0 use 0 |
 | `--seed` | `42` | Random seed for LoRA init |
 
-For SFT, one scheduler step is one completed dataset window. For GRPO, it is
-one completed GRPO iteration. The recommended `-b == -c` configuration performs
+One scheduler step is one completed dataset window. The recommended `-b == -c` configuration performs
 one optimizer update per SFT scheduler step. Micro-batches used for gradient
 accumulation do not advance the schedule. Checkpoints store the completed
 scheduler step, so warmup and cosine decay continue from the same position after
@@ -150,7 +119,7 @@ while `epoch_mean` resets at each epoch.
 
 ### Resume from a checkpoint
 
-Use the same model, dataset, context size, and validation split as the original run. `--epochs` is the total target epoch count, not the number of additional epochs.
+Use the same model and dataset as the original run. `--epochs` is the total target epoch count, not the number of additional epochs.
 
 ```bash
 ./build/bin/llama-finetune-qlora \
@@ -196,7 +165,7 @@ llama.cpp uses **internal GGUF tensor names**, not HuggingFace names:
 
 ### Dataset format (JSONL)
 
-**Chat format** (loss on response only; use `--train-on-prompt` for all tokens):
+**Chat format** (loss on response only):
 ```json
 {"messages": [{"role": "user", "content": "Hello"}, {"role": "assistant", "content": "Hi!"}]}
 ```
@@ -211,45 +180,6 @@ llama.cpp uses **internal GGUF tensor names**, not HuggingFace names:
 {"text": "The quick brown fox."}
 ```
 
-**With reward** (Phase 2 — scales gradient by reward):
-```json
-{"prompt": "...", "response": "...", "reward": 0.85}
-```
-
-Rewards are normalized per epoch: clipped to `[-1, 1]`, then min-max scaled to `[0, 1]`. Reward 0 = sample ignored; reward 1 = full gradient.
-
-### Critical-Token SFT
-
-Critical-Token SFT increases the contribution of selected response tokens while keeping the overall loss normalized:
-
-```text
-loss = sum(active * effective_weight * token_nll) / sum(active * effective_weight)
-```
-
-Normalizing by the sum of active weights prevents a batch with more critical tokens from scaling the entire gradient. Prompt, padding, and ignored labels have zero effective weight. The `none` mode uses the original loss graph and does not parse or allocate critical-token metadata.
-
-Explicit annotations use half-open UTF-8 byte offsets into the raw `response` value. A token is selected when its reconstructed response-side byte range has any nonempty overlap with a span. Template-only special tokens cannot overlap a raw response span. Overlapping spans use their maximum weight.
-
-```json
-{"messages":[{"role":"user","content":"What is the time complexity of binary search?"},{"role":"assistant","content":"Binary search runs in O(log n) time."}],"critical_spans":[{"start":22,"end":30,"weight":4.0}]}
-```
-
-`spans` uses only annotations. `confidence` selects supervised targets with `p(correct token) < threshold`. `hybrid` uses the maximum of the span and confidence weights. Constant confidence weighting uses `W`; linear weighting interpolates from 1 at the threshold to `W` at probability zero. When the confidence cap is active, the graph deterministically retains the lowest-confidence targets in each microbatch. Explicit spans are exempt from the cap. Cap selection reuses the target probabilities and the existing backend argsort plus row-scatter operations; its sort cost is `O(n log n)` on CPU and `O(n log^2 n)` for bitonic backend implementations, where `n` is the microbatch token count.
-
-Critical warmup applies only to the extra critical component: `warmed = 1 + scale * (critical - 1)`. The scale uses the resumed global optimizer step, so it does not restart after a checkpoint resume. For reward-weighted data, the single effective weight is `reward_weight * warmed`; the loss is normalized once by the sum of these effective weights.
-
-```bash
-./build/bin/llama-finetune-qlora \
-  --model model.gguf \
-  --train-file train.jsonl \
-  --critical-token-mode hybrid \
-  --critical-token-weight 3.0 \
-  --critical-confidence-threshold 0.25 \
-  --critical-weight-shape linear \
-  --critical-warmup-steps 100 \
-  --critical-max-fraction 0.25
-```
-
 ### Verify and use the adapter
 
 ```bash
@@ -259,124 +189,6 @@ Critical warmup applies only to the extra critical component: `warmed = 1 + scal
 # Merge into base model
 ./build/bin/llama-export-lora \
   --model base.gguf --lora adapter.gguf --output merged.gguf
-```
-
----
-
-## Phase 2 — Reward-Weighted SFT
-
-Built into `llama-finetune-qlora`. When the dataset contains a `reward` or `score` field, the cross-entropy loss for that sample is scaled by the reward before backprop. No extra flags needed — detection is automatic.
-
----
-
-## Phase 3 — GRPO (Online RL via IPC)
-
-`llama-finetune-qlora --grpo-mode` implements a full GRPO training loop where the Python process owns prompt sampling and reward scoring, and the C++ process owns model state, generation, and gradient updates.
-
-### Quick start
-
-```bash
-python3 examples/qlora_training/grpo_example.py \
-    --model  ~/qwen3-1.7b-q4_k_m.gguf \
-    --lora-out ~/grpo-adapter.gguf \
-    --rank 16 --n-steps 200 --n-gen 8
-```
-
-For verbose output (includes IPC message trace):
-
-```bash
-python3 examples/qlora_training/grpo_example.py \
-    --model ~/qwen3-1.7b-q4_k_m.gguf \
-    --lora-out ~/grpo-adapter.gguf \
-    --verbose
-```
-
-Resume from a checkpoint:
-
-```bash
-python3 examples/qlora_training/grpo_example.py \
-    --model ~/qwen3-1.7b-q4_k_m.gguf \
-    --resume   ~/grpo-adapter.ckpt50.gguf \
-    --lora-out ~/grpo-adapter.gguf
-```
-
-### GRPO-specific flags
-
-| Flag | Default | Description |
-|---|---|---|
-| `--grpo-mode` | off | Enable GRPO IPC mode |
-| `--n-gen` | `8` | Rollouts per prompt |
-| `--n-steps` | `500` | Total GRPO steps |
-| `--grpo-temp` | `0.8` | Sampling temperature for rollouts |
-| `--grpo-max-tokens` | `512` | Max tokens per generation |
-
-All standard flags (`--lora-rank`, `-lr`, `-c`, `-ngl`, `--save-every`, etc.) work in GRPO mode too. `--train-file` is **not** required in GRPO mode.
-
-### IPC protocol
-
-The protocol is line-based over stdout (C++ → Python) and stdin (Python → C++). All non-protocol C++ output (timing, debug, model logs) goes to **stderr** and never contaminates the protocol channel.
-
-**C++ → Python (stdout):**
-
-| Line | When |
-|---|---|
-| `[QLORA:READY]` | Process initialised, model loaded |
-| `[QLORA:PROMPT_REQ:<step>]` | C++ requests the prompt for step N |
-| `[QLORA:GEN:<k>/<n>] <text>` | One generation (newlines escaped as `\n`) |
-| `[QLORA:REWARD_REQ:<n>]` | C++ requests N reward scores |
-| `[QLORA:PROGRESS] step=X/Y loss=Z epoch=A/B` | After each weight update |
-| `[QLORA:CHECKPOINT] <path>` | After saving a checkpoint |
-| `[QLORA:DONE] final_loss=X` | Training complete |
-| `[QLORA:ERROR] <message>` | Fatal error |
-
-**Python → C++ (stdin):**
-
-| Line | Meaning |
-|---|---|
-| `PROMPT <escaped_text>` | Send prompt for the most recent `PROMPT_REQ` |
-| `REWARD <r1> <r2> … <rN>` | Send N advantage scores in `[0, 1]` range |
-| `STOP` | Request graceful shutdown after current step |
-
-**Text encoding:** newlines in generation text are escaped as the two-character sequence `\n`; backslashes are doubled. Use `unescape()` from `grpo_example.py` (or any equivalent) to recover the original text.
-
-### Writing your own driver
-
-`grpo_example.py` contains two functions you replace with your own logic:
-
-```python
-def get_prompt(step: int) -> str:
-    """Return the training prompt for step N."""
-    ...
-
-def score_generations(prompt: str, generations: List[str]) -> List[float]:
-    """Score each generation. Any numeric range — will be normalised."""
-    ...
-```
-
-The IPC helpers (`escape`, `unescape`, `parse_ipc`, `read_ipc`, `write_cmd`, `wait_for`, `normalise_rewards`) are standalone and have no external dependencies — copy them into your own project if needed.
-
-### Training loop diagram
-
-```
-Python                         C++ (llama-finetune-qlora --grpo-mode)
-  │                                │
-  │◄──── [QLORA:READY] ────────────┤  model loaded
-  │                                │
-  │  ┌─────────────────────────────┤
-  │  │ for each step:              │
-  │  │   ◄── PROMPT_REQ:N ─────────┤
-  │  │   ──► PROMPT <text> ────────►  generate n_gen rollouts
-  │  │        ◄── GEN:1/n <text> ──┤
-  │  │        ◄── GEN:2/n <text> ──┤
-  │  │        ...                  │
-  │  │        ◄── GEN:n/n <text> ──┤
-  │  │   ◄── REWARD_REQ:n ─────────┤
-  │  │   (score generations)       │
-  │  │   ──► REWARD a1 a2 … an ────►  one backward + AdamW step
-  │  │   ◄── PROGRESS step=N/M … ──┤
-  │  └─────────────────────────────┤
-  │                                │
-  │◄──── [QLORA:DONE] ─────────────┤  adapter saved
 ```
 
 ---
@@ -400,10 +212,9 @@ Gradients propagate through all layers that have LoRA adapters. Use `--freeze-la
 |---|---|---|---|
 | ✅ Done | **`--freeze-layers N`** — no LoRA on first N layers; backward auto-pruned | Proportional to N/total | Implemented |
 | ✅ Done | **`--grad-checkpoint N`** — keep every Nth activation alive through backward | Reduces peak activation VRAM | Implemented |
-| ✅ Done | **`--train-on-prompt`** — compute loss on prompt tokens too | Configurable loss target | Implemented |
 | ✅ Done | **`--shuffle-dataset`** — shuffle windows each epoch | Better convergence | Implemented |
 | ✅ Done | **BOS separators** — insert BOS between concatenated samples | Correct cross-sample boundaries | Implemented |
-| ✅ Done | **Per-epoch loss summary** — log train/val loss after each epoch | Observability | Implemented |
+| ✅ Done | **Per-epoch loss summary** — log train loss after each epoch | Observability | Implemented |
 | ✅ Done | **`MUL_MAT_ID` backward** — LoRA on MoE dense FFN layers; `OUT_PROD_ID` for scattered outer product | Unlocks Mixtral/Nemotron-MoE | Implemented |
 | Done | **Quantized `OUT_PROD`** - dequantize on GPU + cuBLAS/hipBLAS for backward matmul | Full GPU training (no CPU fallback) | Implemented |
 | ✅ Done | **Reuse `ctx_compute_opt`** — allocate tensor metadata context once, `ggml_reset()` across ubatches | Eliminate ~0.5 s/step overhead | Implemented |
@@ -420,11 +231,11 @@ Gradients propagate through all layers that have LoRA adapters. Use `--freeze-la
 | File | Change |
 |---|---|
 | `ggml/src/ggml.c` | Backward graph fixes: `GET_ROWS` 3D, `SET_ROWS`, `MUL_MAT_ID`, `SSM_SCAN/CONV`, `FLASH_ATTN_EXT` all stop gradient; inplace-op assert → warn+skip |
-| `src/llama-context.cpp` | `opt_init`: scheduler and graph sized with inflated capacity before `ggml_opt_init`; `opt_epoch_iter`: per-ubatch timing instrumentation; reward scaling via `g_reward_weights` TLS |
+| `src/llama-context.cpp` | `opt_init`: scheduler and graph sized with inflated capacity before `ggml_opt_init`; `opt_epoch_iter`: per-ubatch timing instrumentation |
 | `src/llama-adapter.cpp` | Repack-buft fallback for LoRA tensors: tries device-native buft before CPU |
-| `common/common.h` | Added `save_every`, `lora_resume`, `lora_freeze_layers`, `grad_checkpoint_interval`, `train_on_prompt`, `shuffle_dataset` fields |
-| `common/arg.cpp` | Added `--save-every`, `--resume`, `--freeze-layers`, `--grad-checkpoint`, `--train-on-prompt`, `--shuffle-dataset` arguments |
-| `include/llama.h` | Added `llama_opt_set_reward_weights()` and `llama_opt_epoch_range()`; `grad_checkpoint_interval` in `llama_opt_params`; `shuffle` param in `llama_opt_epoch` |
+| `common/common.h` | Added `save_every`, `lora_resume`, `lora_freeze_layers`, `grad_checkpoint_interval`, `shuffle_dataset` fields |
+| `common/arg.cpp` | Added `--save-every`, `--resume`, `--freeze-layers`, `--grad-checkpoint`, `--shuffle-dataset` arguments |
+| `include/llama.h` | Added `llama_opt_epoch_range()`; `grad_checkpoint_interval` in `llama_opt_params`; `shuffle` param in `llama_opt_epoch` |
 | `ggml/src/ggml-cuda/out-prod.cu` | Shared CUDA/HIP `OUT_PROD` with quantized src0 (dequantize on GPU + cuBLAS/hipBLAS); `OUT_PROD_ID` for MoE backward |
 | `ggml/src/ggml-cuda/ggml-cuda.cu` | `supports_op` for quantized `OUT_PROD` and `OUT_PROD_ID`; CPU-resident ids fix in `mul_mat_id` |
 | `ggml/include/ggml-opt.h` | Added `grad_checkpoint_interval` to `ggml_opt_params` |
@@ -442,7 +253,3 @@ Gradients propagate through all layers that have LoRA adapters. Use `--freeze-la
 ### Why opt_init inflation matters
 
 `ggml_opt_init` captures `sched.get()` at construction time. The backward graph (`gb_grad`, `gb_opt`) is ~3–5× larger than the forward graph in node count. If the scheduler hash_set is sized only for the forward graph, `ggml_backend_sched_alloc_graph` on the backward graph will overflow it. We recreate `sched` with `inflated = fwd_nodes × 4` slots BEFORE calling `ggml_opt_init`.
-
-### Reward weighting implementation
-
-`llama_opt_set_reward_weights(weights, n)` sets thread-local `g_reward_weights`. In `opt_epoch`, each window reads `g_reward_weights[idata]` and passes it as `reward_scale` to `opt_epoch_iter`. Inside the iter loop, instead of writing `1.0f` for the correct token's label position in the cross-entropy label tensor, it writes `reward_scale`. Since cross-entropy loss = `-mean(label × log(softmax(logit)))`, scaling the label scales both loss and gradient identically.

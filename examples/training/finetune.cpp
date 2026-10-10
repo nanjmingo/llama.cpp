@@ -73,16 +73,7 @@ int main(int argc, char ** argv) {
         /*get_opt_pars    =*/common_opt_lr_pars,
         /*get_opt_pars_ud =*/&params.lr,
         /*optimizer_type  =*/params.optimizer,
-        /*lora_qat_type   =*/LLAMA_LORA_QAT_TYPE_NONE,
-        /*grad_checkpoint_interval =*/params.grad_checkpoint_interval,
-        /*critical_token_mode      =*/LLAMA_OPT_CRITICAL_TOKEN_MODE_NONE,
-        /*critical_token_weight    =*/1.0f,
-        /*critical_confidence_threshold =*/0.25f,
-        /*critical_weight_shape    =*/LLAMA_OPT_CRITICAL_WEIGHT_SHAPE_CONSTANT,
-        /*critical_warmup_steps    =*/0,
-        /*critical_max_fraction    =*/1.0f,
-        /*critical_step            =*/nullptr,
-        /*critical_stats_every     =*/0,
+        /*.grad_checkpoint_interval =*/params.grad_checkpoint_interval,
     };
     llama_opt_init(ctx, model, lopt_params);
 

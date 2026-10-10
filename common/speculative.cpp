@@ -1079,13 +1079,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return;
         }
 
-        // note: prompt.size() is a token count while pos_max is on the position scale.
-        //       the two legitimately diverge once the prompt contains media chunks, so this
-        //       is only a heuristic - any real hole is closed by process()
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), seq_id);
         if (pos_max < N - 1) {
-            LOG_DBG("%s: ctx_dft pos_max=%d < N-1=%d - process() did not run on every prefill ubatch, "
-                    "or the prompt contains media chunks. Drafts may degrade.\n",
+            LOG_WRN("%s: ctx_dft pos_max=%d < N-1=%d - process() did not run on every prefill ubatch. "
+                    "Drafts may degrade.\n",
                     __func__, (int) pos_max, N - 1);
         }
     }

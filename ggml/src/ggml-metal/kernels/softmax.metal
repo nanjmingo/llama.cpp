@@ -221,22 +221,3 @@ template [[host_name("kernel_soft_max_f16")]]   kernel kernel_soft_max_t   kerne
 template [[host_name("kernel_soft_max_f32")]]   kernel kernel_soft_max_t   kernel_soft_max<float>;
 template [[host_name("kernel_soft_max_f16_4")]] kernel kernel_soft_max_4_t kernel_soft_max_4<half4>;
 template [[host_name("kernel_soft_max_f32_4")]] kernel kernel_soft_max_4_t kernel_soft_max_4<float4>;
-
-kernel void kernel_soft_max_back_f32(
-        constant ggml_metal_kargs_training & args [[buffer(0)]],
-        device const float * grad [[buffer(1)]],
-        device const float * y [[buffer(2)]],
-        device float * dst [[buffer(3)]],
-        uint gid [[thread_position_in_grid]]) {
-    if (gid >= args.ne) {
-        return;
-    }
-
-    const uint ncols = args.ne00;
-    const uint base = (gid/ncols)*ncols;
-    float dot = 0.0f;
-    for (uint col = 0; col < ncols; ++col) {
-        dot += y[base + col]*grad[base + col];
-    }
-    dst[gid] = args.param*(grad[gid] - dot)*y[gid];
-}

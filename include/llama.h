@@ -310,12 +310,6 @@ extern "C" {
         ggml_backend_buffer_type_t buft;
     };
 
-    struct llama_moe_prune_layer {
-        int32_t layer;
-        const int32_t * disabled_experts;
-        size_t n_disabled_experts;
-    };
-
     struct llama_model_params {
         // NULL-terminated list of devices to use for offloading (if NULL, all available devices are used)
         ggml_backend_dev_t * devices;
@@ -543,15 +537,6 @@ extern "C" {
             "use llama_model_free instead");
 
     LLAMA_API void llama_model_free(struct llama_model * model);
-
-    LLAMA_API bool llama_model_set_moe_prune(
-                  struct llama_model * model,
-        const struct llama_moe_prune_layer * layers,
-                                  size_t n_layers,
-                                    char * error,
-                                  size_t error_size);
-
-    LLAMA_API int32_t llama_model_n_expert_used(const struct llama_model * model);
 
     LLAMA_API struct llama_context * llama_init_from_model(
                      struct llama_model * model,
@@ -1623,33 +1608,6 @@ extern "C" {
     // always returns true
     LLAMA_API bool llama_opt_param_filter_all(const struct ggml_tensor * tensor, void * userdata);
 
-    enum llama_lora_qat_type {
-        LLAMA_LORA_QAT_TYPE_NONE,
-        LLAMA_LORA_QAT_TYPE_Q3_K,
-        LLAMA_LORA_QAT_TYPE_Q4_K,
-        LLAMA_LORA_QAT_TYPE_Q4_0,
-        LLAMA_LORA_QAT_TYPE_MXFP4,
-        LLAMA_LORA_QAT_TYPE_Q6_K,
-        LLAMA_LORA_QAT_TYPE_Q8_0,
-    };
-
-    struct llama_opt_critical_token_metadata {
-        float span_weight;
-        float reward_weight;
-    };
-
-    enum llama_opt_critical_token_mode {
-        LLAMA_OPT_CRITICAL_TOKEN_MODE_NONE,
-        LLAMA_OPT_CRITICAL_TOKEN_MODE_SPANS,
-        LLAMA_OPT_CRITICAL_TOKEN_MODE_CONFIDENCE,
-        LLAMA_OPT_CRITICAL_TOKEN_MODE_HYBRID,
-    };
-
-    enum llama_opt_critical_weight_shape {
-        LLAMA_OPT_CRITICAL_WEIGHT_SHAPE_CONSTANT,
-        LLAMA_OPT_CRITICAL_WEIGHT_SHAPE_LINEAR,
-    };
-
     struct llama_opt_params {
         uint32_t n_ctx_train; // assumed context size post training, use context size specified in llama_context if 0
 
@@ -1660,23 +1618,12 @@ extern "C" {
         void * get_opt_pars_ud;                     // userdata for calculating optimizer parameters
 
         enum ggml_opt_optimizer_type optimizer_type;
-        enum llama_lora_qat_type     lora_qat_type;
 
         // Gradient checkpointing: mark every Nth forward graph node as persistent so the
         // allocator cannot reuse its memory during backward.  Reduces peak activation VRAM
         // at the cost of ~0 extra compute (activations are kept, not recomputed).
         // Set to 0 (default) to disable.  Good values: 32–64 nodes ≈ every 1–2 transformer layers.
         int32_t grad_checkpoint_interval;
-
-        enum llama_opt_critical_token_mode   critical_token_mode;
-        float                                critical_token_weight;
-        float                                critical_confidence_threshold;
-        enum llama_opt_critical_weight_shape critical_weight_shape;
-        int32_t                              critical_warmup_steps;
-        float                                critical_max_fraction;
-        const int64_t                      * critical_step;
-        int32_t                              critical_stats_every;
-
     };
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
@@ -1688,12 +1635,6 @@ extern "C" {
             struct llama_context * lctx,
             ggml_opt_dataset_t     dataset,
             int64_t                idata);
-
-    // weights: array of floats, one per dataset window (indexed by idata), already normalized to [0,1].
-    // n_weights: length of the array.
-    // Pass NULL/0 to disable (equivalent to all-ones, i.e. standard SFT).
-    // The pointer must remain valid for the duration of all llama_opt_epoch calls.
-    LLAMA_API void llama_opt_set_reward_weights(const float * weights, int64_t n_weights);
 
     LLAMA_API void llama_opt_epoch(
             struct llama_context    * lctx,
