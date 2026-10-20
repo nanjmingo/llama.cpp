@@ -73,7 +73,6 @@ int main(int argc, char ** argv) {
         /*get_opt_pars    =*/common_opt_lr_pars,
         /*get_opt_pars_ud =*/&params.lr,
         /*optimizer_type  =*/params.optimizer,
-        /*.grad_checkpoint_interval =*/params.grad_checkpoint_interval,
     };
     llama_opt_init(ctx, model, lopt_params);
 

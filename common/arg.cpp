@@ -4530,16 +4530,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) { params.train_file = value; }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
     add_opt(common_arg(
-        {"-dthr", "--dataset-threads"}, "N",
-        "JSONL loading worker threads (default: physical CPU core count)",
-        [](common_params & params, int value) {
-            if (value < 1) {
-                throw std::invalid_argument("dataset-threads must be at least 1");
-            }
-            params.dataset_threads = value;
-        }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
-    add_opt(common_arg(
         {"--save-every"}, "N",
         "save adapter checkpoint every N dataset windows during training (default: 0 = only at end)",
         [](common_params & params, int value) { params.save_every = value; }
@@ -4548,11 +4538,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--freeze-layers"}, "N",
         "freeze first N transformer layers — no LoRA adapters allocated for blk.0..blk.N-1 (default: 0 = train all layers)",
         [](common_params & params, int value) { params.lora_freeze_layers = value; }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
-    add_opt(common_arg(
-        {"--grad-checkpoint"}, "N",
-        "gradient checkpointing interval to reduce peak activation VRAM (0 = disabled, default: 0)",
-        [](common_params & params, int value) { params.grad_checkpoint_interval = value; }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
     add_opt(common_arg(
         {"--lr-scheduler"}, "TYPE",

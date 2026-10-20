@@ -617,10 +617,8 @@ struct common_params {
     std::string lora_out           = "adapter.gguf";  // output adapter GGUF path
     std::string lora_resume        = "";              // QLoRA checkpoint GGUF to resume
     std::string train_file         = "";              // JSONL training dataset path
-    int32_t dataset_threads        = 0;               // dataset loading workers (0 = physical CPU cores)
     int32_t save_every             = 0;     // save checkpoint every N optimizer steps (0 = disabled)
     int32_t lora_freeze_layers     = 0;     // do not apply LoRA to the first N transformer layers
-    int32_t grad_checkpoint_interval = 0;  // gradient checkpointing interval to reduce peak VRAM (0 = disabled)
     std::string lr_scheduler         = "constant"; // constant, cosine
     int32_t warmup_steps             = 0;   // linear learning-rate warmup in logical training steps
     float   warmup_init_ratio        = 0.1f; // initial warmup learning rate as a fraction of peak learning rate

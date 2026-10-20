@@ -88,8 +88,6 @@ add_library(${TARGET}
     json-schema.h
     json.cpp
     json.h
-    jsonl.cpp
-    jsonl.h
     llguidance.cpp
     log.cpp
     log.h

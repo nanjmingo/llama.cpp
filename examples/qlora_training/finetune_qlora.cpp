@@ -44,73 +44,40 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "gguf.h"
-#include "jsonl.h"
 #include "llama.h"
 #include "log.h"
+#include "qlora_adapter.h"
+#include "qlora_dataset.h"
 
 // Internal adapter struct — included directly to avoid the temp-GGUF roundtrip
 // for wiring trainable LoRA tensors into the compute graph.
 #include "../../src/llama-adapter.h"
 
-#include <cerrno>
-
-#define JSON_ASSERT GGML_ASSERT
 #include <algorithm>
-#include <atomic>
 #include <clocale>
 #include <cmath>
-#include <condition_variable>
-#include <cstring>
-#include <exception>
-#include <fstream>
-#include <functional>
+#include <cstdio>
 #include <limits>
-#include <memory>
-#include <mutex>
-#include <nlohmann/json.hpp>
 #include <random>
-#include <set>
 #include <sstream>
 #include <string>
-#include <thread>
-#include <unordered_map>
 #include <vector>
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-static std::vector<std::string> split_csv(const std::string & s) {
-    std::vector<std::string> out;
-    std::istringstream       ss(s);
-    std::string              tok;
-    while (std::getline(ss, tok, ',')) {
-        if (!tok.empty()) {
-            out.push_back(tok);
-        }
-    }
-    return out;
-}
+static std::vector<std::string> split_csv(const std::string & input) {
+    std::vector<std::string> values;
+    std::istringstream       stream(input);
+    std::string              value;
 
-static std::string preview_text(const std::string & s, size_t max_len = 240) {
-    std::string out;
-    out.reserve(std::min(s.size(), max_len));
-    for (char c : s) {
-        if (out.size() >= max_len) {
-            out += "...";
-            break;
-        }
-        if (c == '\n') {
-            out += "\\n";
-        } else if (c == '\r') {
-            out += "\\r";
-        } else if (c == '\t') {
-            out += "\\t";
-        } else {
-            out += c;
+    while (std::getline(stream, value, ',')) {
+        if (!value.empty()) {
+            values.push_back(value);
         }
     }
-    return out;
+    return values;
 }
 
 struct qlora_lr_schedule {
@@ -123,20 +90,24 @@ struct qlora_lr_schedule {
     float          current_lr = 0.0f;
 
     float get_lr() const {
-        const float lr_base = lr->lr0;
+        const float base_lr = lr->lr0;
+
+        // Linearly increase the learning rate during warmup.
         if (step < warmup_steps) {
-            const float lr_start = lr_base * warmup_init_ratio;
-            const float progress = (float) step / (float) warmup_steps;
-            return lr_start + (lr_base - lr_start) * progress;
+            const float warmup_start_lr = base_lr * warmup_init_ratio;
+            const float warmup_progress = (float) step / (float) warmup_steps;
+            return warmup_start_lr + (base_lr - warmup_start_lr) * warmup_progress;
         }
+
+        // Use the configured schedule unless cosine decay is applicable.
         if (type != "cosine" || total_steps <= warmup_steps) {
             return lr->get_lr();
         }
 
-        const float  lr_min   = std::max(0.0f, lr->lr_min);
-        const double progress = (double) (step - warmup_steps) / (double) (total_steps - warmup_steps);
-        const double cosine   = 0.5 * (1.0 + std::cos(std::acos(-1.0) * std::min(1.0, progress)));
-        return lr_min + (lr_base - lr_min) * (float) cosine;
+        const float  min_lr         = std::max(0.0f, lr->lr_min);
+        const double decay_progress = (double) (step - warmup_steps) / (double) (total_steps - warmup_steps);
+        const double cosine_weight  = 0.5 * (1.0 + std::cos(std::acos(-1.0) * std::min(1.0, decay_progress)));
+        return min_lr + (base_lr - min_lr) * (float) cosine_weight;
     }
 };
 
@@ -147,912 +118,6 @@ static ggml_opt_optimizer_params qlora_opt_lr_pars(void * userdata) {
     result.adamw.alpha = result.sgd.alpha = schedule.current_lr;
     result.sgd.wd = result.adamw.wd = schedule.lr->wd;
     return result;
-}
-
-// Tensors whose names contain these substrings use MUL_MAT_ID (sparse MoE expert dispatch)
-// which has no backward implementation — exclude them from LoRA targets unconditionally.
-static const std::vector<std::string> EXCLUDED_SUBSTRINGS = {
-    "_exps",  // MoE expert weight stacks (ffn_gate_exps, ffn_up_exps, ffn_down_exps, ffn_gate_up_exps)
-};
-
-static bool tensor_is_excluded(const char * name) {
-    const std::string n(name);
-    for (const auto & ex : EXCLUDED_SUBSTRINGS) {
-        if (n.find(ex) != std::string::npos) {
-            return true;
-        }
-    }
-    return false;
-}
-
-// Extract the transformer block index from a tensor name of the form "blk.NN.<rest>".
-// Returns -1 if the name does not follow this pattern.
-static int tensor_layer_index(const char * name) {
-    // All per-layer tensors in llama.cpp GGUF are named "blk.<N>.<suffix>"
-    const char * p = strstr(name, "blk.");
-    if (!p) {
-        return -1;
-    }
-    p += 4;  // skip "blk."
-    char * end = nullptr;
-    long   idx = strtol(p, &end, 10);
-    if (end == p || (*end != '.' && *end != '\0')) {
-        return -1;
-    }
-    return (int) idx;
-}
-
-static bool tensor_matches_targets(const char * name, const std::vector<std::string> & targets, int freeze_layers = 0) {
-    if (tensor_is_excluded(name)) {
-        return false;
-    }
-    if (freeze_layers > 0) {
-        const int layer = tensor_layer_index(name);
-        if (layer >= 0 && layer < freeze_layers) {
-            return false;
-        }
-    }
-    for (const auto & t : targets) {
-        if (std::string(name).find(t) != std::string::npos) {
-            return true;
-        }
-    }
-    return false;
-}
-
-// ---------------------------------------------------------------------------
-// JSONL dataset loading
-// ---------------------------------------------------------------------------
-
-struct training_sample {
-    std::vector<llama_token> tokens;    // full token sequence
-    std::vector<bool>        is_label;  // true for tokens that contribute to loss
-};
-
-struct tokenization_request {
-    std::string prompt;
-    std::string response;
-};
-
-struct jsonl_load_result {
-    tokenization_request request;
-    training_sample      sample;
-    bool                 parsed = false;
-    bool                 valid  = false;
-};
-
-struct jsonl_line_state {
-    nlohmann::json                      data;
-    std::vector<const nlohmann::json *> message_data;
-    std::vector<common_chat_msg>        messages;
-    std::vector<common_chat_msg>        prompt_messages;
-    std::vector<std::string>            chatml_messages;
-    std::vector<llama_token>            prompt_tokens;
-    std::vector<llama_token>            response_tokens;
-    std::string                         last_assistant_content;
-    std::string                         prompt_text;
-    std::string                         full_text;
-    std::string                         response_text;
-    size_t                              last_assistant_index = std::numeric_limits<size_t>::max();
-    int                                 lineno               = 0;
-    bool                                json_valid           = false;
-    bool                                is_chat              = false;
-    bool                                parallel_messages    = false;
-    bool                                prepared             = false;
-    std::atomic<bool>                   failed{ false };
-};
-
-static std::string apply_chatml_message(const common_chat_msg & msg) {
-    size_t content_size = 0;
-    for (const common_chat_msg_content_part & part : msg.content_parts) {
-        content_size += part.text.size();
-    }
-
-    std::string out;
-    out.reserve(13 + msg.role.size() + 1 + content_size + 11);
-    out += "<|im_start|>";
-    out += msg.role;
-    out += '\n';
-    for (const common_chat_msg_content_part & part : msg.content_parts) {
-        out += part.text;
-    }
-    out += "<|im_end|>\n";
-    return out;
-}
-
-static std::string apply_qlora_chat_template(common_chat_templates *              tmpls,
-                                             const std::vector<common_chat_msg> & messages,
-                                             bool                                 add_generation_prompt) {
-    common_chat_templates_inputs inputs;
-    inputs.messages              = messages;
-    inputs.add_generation_prompt = add_generation_prompt;
-    inputs.tool_choice           = COMMON_CHAT_TOOL_CHOICE_NONE;
-    inputs.reasoning_format      = COMMON_REASONING_FORMAT_DEEPSEEK;
-    inputs.enable_thinking       = false;
-    return common_chat_templates_apply(tmpls, inputs).prompt;
-}
-
-struct jsonl_message_task {
-    size_t line_index;
-    size_t first_message;
-    size_t message_count;
-};
-
-struct jsonl_render_task {
-    size_t line_index;
-    bool   render_prompt;
-};
-
-struct jsonl_token_task {
-    size_t line_index;
-    int    part;
-};
-
-static std::vector<training_sample> load_jsonl(const std::string &     path,
-                                               const llama_model *     model,
-                                               const llama_vocab *     vocab,
-                                               common_chat_templates * tmpls,
-                                               int32_t                 n_threads) {
-    std::vector<training_sample>   samples;
-    bool                           logged_preview = false;
-    std::vector<common_jsonl_line> lines;
-    try {
-        lines = common_jsonl_read_lines(path, COMMON_JSONL_EMPTY_LINE_SKIP);
-    } catch (const std::exception & e) {
-        LOG_ERR("%s: %s\n", __func__, e.what());
-        return {};
-    }
-
-    std::vector<jsonl_load_result>                 results(lines.size());
-    std::vector<std::unique_ptr<jsonl_line_state>> states;
-    states.reserve(lines.size());
-    for (const common_jsonl_line & input : lines) {
-        auto state    = std::make_unique<jsonl_line_state>();
-        state->lineno = (int) input.number;
-        states.push_back(std::move(state));
-    }
-
-    const size_t worker_limit    = common_jsonl_worker_limit(n_threads);
-    const size_t n_json_workers  = common_jsonl_worker_count(n_threads, lines.size());
-    auto         parse_json_line = [&](size_t i) {
-        jsonl_line_state & state = *states[i];
-        try {
-            state.data       = nlohmann::json::parse(lines[i].text);
-            state.json_valid = true;
-        } catch (...) {
-            LOG_WRN("%s: skipping invalid JSON on line %d\n", __func__, state.lineno);
-        }
-    };
-
-    {
-        common_jsonl_worker_pool json_pool(n_json_workers);
-        json_pool.parallel_for(lines.size(), [&](size_t i, size_t) { parse_json_line(i); });
-    }
-    for (common_jsonl_line & input : lines) {
-        std::string().swap(input.text);
-    }
-
-    const size_t message_parallel_min = 8;
-    size_t       n_valid_json         = 0;
-    size_t       message_task_hint    = 0;
-    for (std::unique_ptr<jsonl_line_state> & state_ptr : states) {
-        jsonl_line_state & state = *state_ptr;
-        if (!state.json_valid) {
-            continue;
-        }
-        ++n_valid_json;
-
-        const nlohmann::json & data = state.data;
-        if (!data.contains("messages")) {
-            continue;
-        }
-
-        state.is_chat                   = true;
-        const nlohmann::json & messages = data.at("messages");
-        state.message_data.reserve(messages.size());
-        for (const nlohmann::json & message : messages) {
-            state.message_data.push_back(&message);
-        }
-        state.messages.resize(state.message_data.size());
-        if (!tmpls) {
-            state.chatml_messages.resize(state.message_data.size());
-        }
-        state.parallel_messages = worker_limit > 1 && state.message_data.size() >= message_parallel_min;
-        message_task_hint += state.parallel_messages ? state.message_data.size() : 1;
-    }
-
-    const size_t n_workers = std::min(worker_limit, std::max(n_valid_json, message_task_hint));
-    std::vector<common_chat_templates_ptr> template_copies;
-    std::vector<common_chat_templates *>   worker_templates(n_workers, tmpls);
-    if (tmpls && n_workers > 1) {
-        GGML_ASSERT(model != nullptr);
-        template_copies.reserve(n_workers - 1);
-        for (size_t i = 1; i < n_workers; ++i) {
-            template_copies.push_back(common_chat_templates_init(model, ""));
-            worker_templates[i] = template_copies.back().get();
-        }
-    }
-
-    {
-        common_jsonl_worker_pool        worker_pool(n_workers);
-        std::vector<jsonl_message_task> message_tasks;
-        message_tasks.reserve(message_task_hint);
-        for (size_t i = 0; i < states.size(); ++i) {
-            const jsonl_line_state & state = *states[i];
-            if (!state.json_valid || !state.is_chat || state.message_data.empty()) {
-                continue;
-            }
-            if (state.parallel_messages) {
-                for (size_t mi = 0; mi < state.message_data.size(); ++mi) {
-                    message_tasks.push_back({ i, mi, 1 });
-                }
-            } else {
-                message_tasks.push_back({ i, 0, state.message_data.size() });
-            }
-        }
-
-        worker_pool.parallel_for(message_tasks.size(), [&](size_t task_index, size_t) {
-            const jsonl_message_task & task  = message_tasks[task_index];
-            jsonl_line_state &         state = *states[task.line_index];
-            try {
-                for (size_t mi = task.first_message; mi < task.first_message + task.message_count; ++mi) {
-                    const nlohmann::json & data = *state.message_data[mi];
-                    state.messages[mi]          = common_jsonl_parse_chat_message(data, COMMON_JSONL_CHAT_PARSE_TEXT);
-                    if (!tmpls) {
-                        state.chatml_messages[mi] = apply_chatml_message(state.messages[mi]);
-                    }
-                }
-            } catch (const std::exception & e) {
-                state.failed.store(true);
-                LOG_WRN("%s: skipping invalid message on line %d: %s\n", __func__, state.lineno, e.what());
-            }
-        });
-
-        worker_pool.parallel_for(states.size(), [&](size_t i, size_t worker_index) {
-            jsonl_line_state & state = *states[i];
-            if (!state.json_valid || state.failed.load()) {
-                return;
-            }
-
-            try {
-                const nlohmann::json &  data           = state.data;
-                common_chat_templates * task_templates = tmpls ? worker_templates[worker_index] : nullptr;
-                if (state.is_chat) {
-                    if (state.messages.empty()) {
-                        return;
-                    }
-                    for (size_t mi = state.messages.size(); mi-- > 0;) {
-                        if (state.messages[mi].role == "assistant") {
-                            state.last_assistant_index = mi;
-                            break;
-                        }
-                    }
-                    if (state.last_assistant_index == std::numeric_limits<size_t>::max()) {
-                        LOG_DBG("%s: skipping line %d: no assistant turn\n", __func__, state.lineno);
-                        return;
-                    }
-
-                    const common_chat_msg & assistant = state.messages[state.last_assistant_index];
-                    state.last_assistant_content =
-                        assistant.content_parts.empty() ? "" : assistant.content_parts[0].text;
-                    state.prompt_messages.assign(state.messages.begin(),
-                                                 state.messages.begin() + state.last_assistant_index);
-
-                    if (!task_templates) {
-                        size_t total_size = 0;
-                        for (size_t mi = 0; mi <= state.last_assistant_index; ++mi) {
-                            total_size += state.chatml_messages[mi].size();
-                        }
-                        state.response_text.reserve(total_size);
-                        for (size_t mi = 0; mi <= state.last_assistant_index; ++mi) {
-                            state.response_text += state.chatml_messages[mi];
-                        }
-                    } else if (!state.parallel_messages) {
-                        state.prompt_text = apply_qlora_chat_template(task_templates, state.prompt_messages, true);
-                        std::vector<common_chat_msg> all_messages = state.prompt_messages;
-                        all_messages.push_back(assistant);
-                        state.full_text = apply_qlora_chat_template(task_templates, all_messages, false);
-                    }
-                } else if (data.contains("prompt") && data.contains("response")) {
-                    state.response_text          = data.at("response").get<std::string>();
-                    state.prompt_text            = data.at("prompt").get<std::string>();
-                    state.last_assistant_content = state.response_text;
-                } else if (data.contains("text")) {
-                    state.response_text          = data.at("text").get<std::string>();
-                    state.last_assistant_content = state.response_text;
-                } else {
-                    LOG_WRN("%s: unknown format on line %d, skipping\n", __func__, state.lineno);
-                    return;
-                }
-                state.prepared = true;
-            } catch (const std::exception & e) {
-                state.failed.store(true);
-                LOG_WRN("%s: skipping invalid data on line %d: %s\n", __func__, state.lineno, e.what());
-            }
-        });
-
-        std::vector<jsonl_render_task> render_tasks;
-        for (size_t i = 0; i < states.size(); ++i) {
-            const jsonl_line_state & state = *states[i];
-            if (state.prepared && state.is_chat && state.parallel_messages && tmpls) {
-                render_tasks.push_back({ i, true });
-                render_tasks.push_back({ i, false });
-            }
-        }
-
-        worker_pool.parallel_for(render_tasks.size(), [&](size_t task_index, size_t worker_index) {
-            const jsonl_render_task & task           = render_tasks[task_index];
-            jsonl_line_state &        state          = *states[task.line_index];
-            common_chat_templates *   task_templates = worker_templates[worker_index];
-            try {
-                if (task.render_prompt) {
-                    state.prompt_text = apply_qlora_chat_template(task_templates, state.prompt_messages, true);
-                } else {
-                    std::vector<common_chat_msg> all_messages = state.prompt_messages;
-                    all_messages.push_back(state.messages[state.last_assistant_index]);
-                    state.full_text = apply_qlora_chat_template(task_templates, all_messages, false);
-                }
-            } catch (const std::exception & e) {
-                state.failed.store(true);
-                LOG_WRN("%s: chat template failed on line %d: %s\n", __func__, state.lineno, e.what());
-            }
-        });
-
-        worker_pool.parallel_for(states.size(), [&](size_t i, size_t worker_index) {
-            jsonl_line_state &  state  = *states[i];
-            jsonl_load_result & result = results[i];
-            if (!state.prepared || state.failed.load()) {
-                return;
-            }
-
-            try {
-                if (state.is_chat && tmpls) {
-                    if (state.full_text.rfind(state.prompt_text, 0) == 0) {
-                        state.response_text = state.full_text.substr(state.prompt_text.size());
-                    } else {
-                        std::string marker = "__LLAMA_QLORA_RESPONSE_MARKER__";
-                        while (state.last_assistant_content.find(marker) != std::string::npos) {
-                            marker += "_";
-                        }
-
-                        common_chat_msg marked_message = state.messages[state.last_assistant_index];
-                        marked_message.content_parts.clear();
-                        common_chat_msg_content_part marker_part;
-                        marker_part.type = "text";
-                        marker_part.text = marker;
-                        marked_message.content_parts.push_back(std::move(marker_part));
-
-                        std::vector<common_chat_msg> marked_messages = state.prompt_messages;
-                        marked_messages.push_back(std::move(marked_message));
-                        const std::string marked_text =
-                            apply_qlora_chat_template(worker_templates[worker_index], marked_messages, false);
-                        const size_t marker_pos = marked_text.find(marker);
-                        if (marker_pos != std::string::npos) {
-                            const std::string suffix = marked_text.substr(marker_pos + marker.size());
-                            state.response_text.reserve(state.last_assistant_content.size() + suffix.size());
-                            state.response_text = state.last_assistant_content;
-                            state.response_text += suffix;
-                            LOG_WRN(
-                                "%s: line %d full chat render is not prefixed by prompt render; using marker-derived "
-                                "response suffix\n",
-                                __func__, state.lineno);
-                        } else {
-                            LOG_WRN(
-                                "%s: line %d could not derive template response suffix; using raw assistant content\n",
-                                __func__, state.lineno);
-                            state.response_text = state.last_assistant_content;
-                        }
-                    }
-                }
-
-                result.parsed  = true;
-                result.request = { std::move(state.prompt_text), std::move(state.response_text) };
-            } catch (const std::exception & e) {
-                state.failed.store(true);
-                LOG_WRN("%s: formatting failed on line %d: %s\n", __func__, state.lineno, e.what());
-            }
-        });
-
-        std::vector<jsonl_token_task> token_tasks;
-        token_tasks.reserve(results.size() * 2);
-        for (size_t i = 0; i < results.size(); ++i) {
-            if (!results[i].parsed || states[i]->failed.load()) {
-                continue;
-            }
-            if (states[i]->parallel_messages) {
-                token_tasks.push_back({ i, 0 });
-                token_tasks.push_back({ i, 1 });
-            } else {
-                token_tasks.push_back({ i, 2 });
-            }
-        }
-
-        worker_pool.parallel_for(token_tasks.size(), [&](size_t task_index, size_t) {
-            const jsonl_token_task &     task    = token_tasks[task_index];
-            jsonl_line_state &           state   = *states[task.line_index];
-            const tokenization_request & request = results[task.line_index].request;
-            try {
-                if (task.part == 0 || task.part == 2) {
-                    state.prompt_tokens =
-                        common_tokenize(vocab, request.prompt, /*add_special=*/true, /*parse_special=*/true);
-                }
-                if (task.part == 1 || task.part == 2) {
-                    state.response_tokens =
-                        common_tokenize(vocab, request.response, /*add_special=*/false, /*parse_special=*/true);
-                }
-            } catch (const std::exception & e) {
-                state.failed.store(true);
-                LOG_WRN("%s: tokenization failed on line %d: %s\n", __func__, state.lineno, e.what());
-            }
-        });
-
-        worker_pool.parallel_for(results.size(), [&](size_t i, size_t) {
-            jsonl_line_state &  state  = *states[i];
-            jsonl_load_result & result = results[i];
-            if (!result.parsed || state.failed.load()) {
-                return;
-            }
-            if (state.prompt_tokens.empty() && state.response_tokens.empty()) {
-                return;
-            }
-
-            training_sample & sample = result.sample;
-            sample.tokens.reserve(state.prompt_tokens.size() + state.response_tokens.size());
-            sample.tokens.insert(sample.tokens.end(), state.prompt_tokens.begin(), state.prompt_tokens.end());
-            sample.tokens.insert(sample.tokens.end(), state.response_tokens.begin(), state.response_tokens.end());
-            sample.is_label.resize(sample.tokens.size(), false);
-            for (size_t j = state.prompt_tokens.size(); j < sample.tokens.size(); ++j) {
-                sample.is_label[j] = true;
-            }
-            result.valid = true;
-        });
-    }
-
-    samples.reserve(results.size());
-    size_t n_requests = 0;
-    for (size_t i = 0; i < results.size(); ++i) {
-        const jsonl_load_result & result = results[i];
-        if (result.parsed) {
-            ++n_requests;
-        }
-        if (!result.valid) {
-            continue;
-        }
-        if (!logged_preview) {
-            logged_preview = true;
-            LOG_INF("%s: first prompt preview: \"%s\"\n", __func__, preview_text(result.request.prompt).c_str());
-            LOG_INF("%s: first response preview: \"%s\"\n", __func__, preview_text(result.request.response).c_str());
-            const size_t prompt_tokens = result.sample.tokens.size() -
-                                         std::count(result.sample.is_label.begin(), result.sample.is_label.end(), true);
-            LOG_INF("%s: first sample tokens: prompt=%zu response=%zu\n", __func__, prompt_tokens,
-                    result.sample.tokens.size() - prompt_tokens);
-        }
-        samples.push_back(std::move(results[i].sample));
-    }
-
-    LOG_INF("%s: tokenized %zu input lines with %zu workers\n", __func__, n_requests, n_workers);
-
-    LOG_INF("%s: loaded %zu samples from %s\n", __func__, samples.size(), path.c_str());
-    return samples;
-}
-
-// Pack variable-length samples into fixed-context-length windows and create
-// an ggml_opt_dataset. Labels for prompt tokens are set to -1 (ignored by
-// the loss in the epoch loop).
-static ggml_opt_dataset_t build_dataset(const std::vector<training_sample> & samples,
-                                        int32_t                              n_ctx,
-                                        llama_token                          bos_token) {
-    const int32_t overlap = n_ctx / 2;
-    const int32_t stride = n_ctx - overlap;
-
-    int64_t n_tokens = 0;
-    int64_t ndata = 0;
-    for (const auto & sample : samples) {
-        const int64_t sample_size = sample.tokens.size();
-        if (sample_size <= 1) continue; // cannot learn from only one token
-        n_tokens += sample_size - 1;
-        int64_t n_window = sample_size - 1 <= n_ctx ? 1 : 2 + (sample_size - 2 - n_ctx) / stride;
-        ndata += n_window;
-    }
-
-    if (ndata <= 0) {
-        LOG_ERR("%s: dataset has no tokens\n", __func__);
-        return nullptr;
-    }
-
-    ggml_opt_dataset_t dataset  = ggml_opt_dataset_init(GGML_TYPE_I32, GGML_TYPE_I32, n_ctx, n_ctx, ndata, 1);
-    int32_t *          data     = (int32_t *) ggml_opt_dataset_data(dataset)->data;
-    int32_t *          labels   = (int32_t *) ggml_opt_dataset_labels(dataset)->data;
-    int64_t            n_labels = 0;
-    int64_t            n_padded = 0;
-
-    int64_t c_window = 0;
-    for (const auto & sample : samples) {
-        const int64_t sample_size = sample.tokens.size();
-        if (sample_size <= 1) continue; // cannot learn from only one token
-        int64_t n_window = sample_size - 1 <= n_ctx ? 1 : 2 + (sample_size - 2 - n_ctx) / stride;
-        for (int64_t i = 0; i < n_window; ++i) {
-            size_t sample_offset = i * stride;
-            size_t dataset_offset = (c_window + i) * n_ctx;
-            for (int32_t j = 0; j < n_ctx; ++j) {
-                const int64_t s_idx = sample_offset + j;
-                const int64_t d_idx = dataset_offset + j;
-                if (s_idx + 1 < sample_size) {
-                    data[d_idx] = sample.tokens[s_idx];
-                    if (i > 0 && j < overlap) {
-                        labels[d_idx] = -1;
-                    } else {
-                        labels[d_idx] = sample.is_label[s_idx + 1] ? sample.tokens[s_idx + 1] : -1;
-                        if (labels[d_idx] >= 0) {
-                            ++n_labels;
-                        }
-                    }
-                } else {
-                    data[d_idx] = bos_token;
-                    labels[d_idx] = -1;
-                    ++n_padded;
-                }
-            }
-        }
-        c_window += n_window;
-    }
-
-    LOG_INF("%s: packed %ld tokens into %ld windows (ctx=%d stride=%ld, supervised labels=%ld, padded=%ld)\n", __func__,
-            (long) n_tokens, (long) ndata, n_ctx, (long) stride, (long) n_labels, (long) n_padded);
-    return dataset;
-}
-
-// ---------------------------------------------------------------------------
-// LoRA tensor allocation
-// ---------------------------------------------------------------------------
-
-struct lora_tensors {
-    struct ggml_context *                                                    ctx = nullptr;
-    struct ggml_backend_buffer *                                             buf = nullptr;
-    // map: base tensor name → {lora_a, lora_b}
-    std::unordered_map<std::string, std::pair<ggml_tensor *, ggml_tensor *>> ab;
-};
-
-static lora_tensors alloc_lora_tensors(const std::string &              model_path,
-                                       const std::vector<std::string> & targets,
-                                       int32_t                          rank,
-                                       std::mt19937 &                   rng,
-                                       int32_t                          freeze_layers = 0) {
-    lora_tensors lt;
-
-    // Open the model GGUF to discover tensor names and shapes
-    // without needing access to private llama_model internals.
-    struct ggml_context *   ctx_meta    = nullptr;
-    struct gguf_init_params gguf_params = { /*.no_alloc=*/true, /*.ctx=*/&ctx_meta };
-    struct gguf_context *   ctx_gguf    = gguf_init_from_file(model_path.c_str(), gguf_params);
-    if (!ctx_gguf) {
-        LOG_ERR("%s: failed to open model GGUF for tensor discovery: %s\n", __func__, model_path.c_str());
-        return lt;
-    }
-
-    // Collect matching 2-D tensors
-    struct tensor_info {
-        std::string name;
-        int64_t     ne0, ne1;
-    };
-
-    std::vector<tensor_info> matched;
-
-    for (ggml_tensor * t = ggml_get_first_tensor(ctx_meta); t; t = ggml_get_next_tensor(ctx_meta, t)) {
-        if (ggml_n_dims(t) < 2) {
-            continue;
-        }
-        if (!tensor_matches_targets(t->name, targets, freeze_layers)) {
-            continue;
-        }
-        matched.push_back({ t->name, t->ne[0], t->ne[1] });
-    }
-
-    gguf_free(ctx_gguf);
-    ggml_free(ctx_meta);
-
-    if (matched.empty()) {
-        LOG_ERR("%s: no model tensors matched --lora-targets; check spelling\n", __func__);
-        return lt;
-    }
-
-    if (freeze_layers > 0) {
-        LOG_INF("%s: freezing layers blk.0 .. blk.%d (no LoRA allocated; backward already pruned by grads_needed)\n",
-                __func__, freeze_layers - 1);
-    }
-    LOG_INF("%s: allocating LoRA A/B tensors for %zu weight matrices, rank=%d\n", __func__, matched.size(), rank);
-
-    // Allocate ggml context for A+B tensors (2 tensors per matched weight)
-    const size_t            mem = (2 * matched.size() + 16) * ggml_tensor_overhead();
-    struct ggml_init_params ip  = { mem, nullptr, /*no_alloc=*/true };
-    lt.ctx                      = ggml_init(ip);
-
-    for (const auto & ti : matched) {
-        const int64_t in_dim  = ti.ne0;  // columns (input features)
-        const int64_t out_dim = ti.ne1;  // rows    (output features)
-
-        // lora_a: [in_dim, rank]   applied first: a @ x
-        // lora_b: [rank,   out_dim] applied second: b @ (a @ x)
-        // Convention matches llama-adapter.cpp:48-60:
-        //   a->ne[0] == in_dim,  a->ne[1] == rank
-        //   b->ne[0] == rank,    b->ne[1] == out_dim
-        ggml_tensor * la = ggml_new_tensor_2d(lt.ctx, GGML_TYPE_F32, in_dim, rank);
-        ggml_tensor * lb = ggml_new_tensor_2d(lt.ctx, GGML_TYPE_F32, rank, out_dim);
-
-        ggml_set_name(la, (ti.name + ".lora_a").c_str());
-        ggml_set_name(lb, (ti.name + ".lora_b").c_str());
-
-        lt.ab[ti.name] = { la, lb };
-    }
-
-    // Allocate backend buffer for all LoRA tensors at once
-    lt.buf = ggml_backend_alloc_ctx_tensors_from_buft(lt.ctx, ggml_backend_cpu_buffer_type());
-
-    // Initialize: A ~ N(0, 1/sqrt(rank)), B = 0
-    const float                     std_a = 1.0f / std::sqrt((float) rank);
-    std::normal_distribution<float> dist(0.0f, std_a);
-
-    for (auto & kv : lt.ab) {
-        ggml_tensor * la = kv.second.first;
-        ggml_tensor * lb = kv.second.second;
-
-        // Fill A
-        float * data_a = (float *) la->data;
-        for (int64_t i = 0; i < ggml_nelements(la); ++i) {
-            data_a[i] = dist(rng);
-        }
-        // Zero B
-        memset(lb->data, 0, ggml_nbytes(lb));
-    }
-
-    return lt;
-}
-
-// ---------------------------------------------------------------------------
-// Param filter: only train lora_a / lora_b tensors
-// ---------------------------------------------------------------------------
-
-static bool lora_param_filter(const struct ggml_tensor * t, void * /*ud*/) {
-    const char * n   = t->name;
-    const size_t len = strlen(n);
-    if (len > 7 && strcmp(n + len - 7, ".lora_a") == 0) {
-        return true;
-    }
-    if (len > 7 && strcmp(n + len - 7, ".lora_b") == 0) {
-        return true;
-    }
-    return false;
-}
-
-// ---------------------------------------------------------------------------
-// Save adapter GGUF
-// ---------------------------------------------------------------------------
-
-static std::string basename_from_path(const std::string & p) {
-    const size_t pos = p.find_last_of("/\\");
-    if (pos == std::string::npos) {
-        return p;
-    }
-    return p.substr(pos + 1);
-}
-
-struct checkpoint_state {
-    std::string mode;
-    int64_t     epoch           = 0;
-    int64_t     window          = 0;
-    int64_t     step            = 0;
-    int64_t     dataset_windows = -1;
-    int64_t     context_length  = -1;
-    bool        shuffle         = false;
-    bool        has_metadata    = false;
-    float       alpha           = 0.0f;
-    bool        has_alpha       = false;
-    int64_t     schedule_step   = -1;
-};
-
-static bool parse_checkpoint_number(const std::string & path, size_t begin, size_t end, int64_t & value) {
-    if (begin >= end) {
-        return false;
-    }
-
-    const std::string number     = path.substr(begin, end - begin);
-    char *            number_end = nullptr;
-    errno                        = 0;
-    const long long parsed       = strtoll(number.c_str(), &number_end, 10);
-    if (errno != 0 || number_end != number.c_str() + number.size() || parsed < 0) {
-        return false;
-    }
-
-    value = (int64_t) parsed;
-    return true;
-}
-
-static bool checkpoint_state_from_filename(const std::string & path,
-                                           const std::string & mode,
-                                           checkpoint_state &  state) {
-    const size_t suffix = path.rfind(".gguf");
-    if (suffix == std::string::npos || suffix + 5 != path.size()) {
-        return false;
-    }
-
-    if (mode == "sft") {
-        const size_t epoch_tag = path.rfind(".epoch", suffix);
-        const size_t ckpt_tag  = path.rfind(".ckpt", suffix);
-        if (epoch_tag == std::string::npos || ckpt_tag == std::string::npos || epoch_tag >= ckpt_tag) {
-            return false;
-        }
-        if (!parse_checkpoint_number(path, epoch_tag + 6, ckpt_tag, state.epoch)) {
-            return false;
-        }
-        if (!parse_checkpoint_number(path, ckpt_tag + 5, suffix, state.window)) {
-            return false;
-        }
-    }
-
-    state.mode = mode;
-    return true;
-}
-
-static bool gguf_get_i64(const gguf_context * gctx, const char * key, int64_t & value) {
-    const int64_t key_id = gguf_find_key(gctx, key);
-    if (key_id < 0) {
-        return false;
-    }
-
-    switch (gguf_get_kv_type(gctx, key_id)) {
-        case GGUF_TYPE_UINT32:
-            value = gguf_get_val_u32(gctx, key_id);
-            return true;
-        case GGUF_TYPE_INT32:
-            value = gguf_get_val_i32(gctx, key_id);
-            return true;
-        case GGUF_TYPE_UINT64:
-            {
-                const uint64_t val = gguf_get_val_u64(gctx, key_id);
-                if (val > INT64_MAX) {
-                    return false;
-                }
-                value = (int64_t) val;
-                return true;
-            }
-        case GGUF_TYPE_INT64:
-            value = gguf_get_val_i64(gctx, key_id);
-            return true;
-        default:
-            return false;
-    }
-}
-
-static bool load_checkpoint_state(const std::string & path,
-                                  const std::string & expected_mode,
-                                  checkpoint_state &  state) {
-    ggml_context *         ctx_meta = nullptr;
-    const gguf_init_params params   = { true, &ctx_meta };
-    gguf_context *         gctx     = gguf_init_from_file(path.c_str(), params);
-    if (!gctx) {
-        LOG_ERR("%s: cannot open checkpoint %s\n", __func__, path.c_str());
-        return false;
-    }
-
-    const int64_t mode_id = gguf_find_key(gctx, "training.checkpoint.mode");
-    if (mode_id >= 0 && gguf_get_kv_type(gctx, mode_id) == GGUF_TYPE_STRING) {
-        state.mode         = gguf_get_val_str(gctx, mode_id);
-        state.has_metadata = true;
-        gguf_get_i64(gctx, "training.checkpoint.epoch", state.epoch);
-        gguf_get_i64(gctx, "training.checkpoint.window", state.window);
-        gguf_get_i64(gctx, "training.checkpoint.step", state.step);
-        gguf_get_i64(gctx, "training.dataset.windows", state.dataset_windows);
-        gguf_get_i64(gctx, "training.context_length", state.context_length);
-        gguf_get_i64(gctx, "training.scheduler.step", state.schedule_step);
-
-        const int64_t shuffle_id = gguf_find_key(gctx, "training.dataset.shuffle");
-        if (shuffle_id >= 0 && gguf_get_kv_type(gctx, shuffle_id) == GGUF_TYPE_BOOL) {
-            state.shuffle = gguf_get_val_bool(gctx, shuffle_id);
-        }
-    }
-
-    const int64_t alpha_id = gguf_find_key(gctx, "adapter.lora.alpha");
-    if (alpha_id >= 0 && gguf_get_kv_type(gctx, alpha_id) == GGUF_TYPE_FLOAT32) {
-        state.alpha     = gguf_get_val_f32(gctx, alpha_id);
-        state.has_alpha = true;
-    }
-
-    gguf_free(gctx);
-    ggml_free(ctx_meta);
-
-    if (!state.has_metadata && !checkpoint_state_from_filename(path, expected_mode, state)) {
-        LOG_ERR("%s: %s has no checkpoint metadata and its filename does not contain a checkpoint position\n", __func__,
-                path.c_str());
-        return false;
-    }
-    if (state.mode != expected_mode) {
-        LOG_ERR("%s: checkpoint mode is %s, expected %s\n", __func__, state.mode.c_str(), expected_mode.c_str());
-        return false;
-    }
-    if (state.mode == "sft" && state.epoch <= 0) {
-        LOG_ERR("%s: invalid checkpoint epoch %ld\n", __func__, (long) state.epoch);
-        return false;
-    }
-    if (state.window < 0 || state.step < 0 || state.schedule_step < -1) {
-        LOG_ERR("%s: checkpoint contains a negative training position\n", __func__);
-        return false;
-    }
-    return true;
-}
-
-static void save_adapter(const lora_tensors &     lt,
-                         const std::string &      out_path,
-                         const std::string &      arch,
-                         float                    alpha,
-                         const std::string &      base_model_path,
-                         const checkpoint_state * checkpoint = nullptr) {
-    // Build output GGUF context
-    struct gguf_context * gctx = gguf_init_empty();
-
-    // Metadata required by llama_adapter_lora_init
-    gguf_set_val_str(gctx, "general.type", "adapter");
-    gguf_set_val_str(gctx, "general.architecture", arch.c_str());
-    gguf_set_val_str(gctx, "adapter.type", "lora");
-    gguf_set_val_f32(gctx, "adapter.lora.alpha", alpha);
-    gguf_set_val_str(gctx, "adapter.base_model", basename_from_path(base_model_path).c_str());
-
-    if (checkpoint) {
-        gguf_set_val_u32(gctx, "training.checkpoint.version", 1);
-        gguf_set_val_str(gctx, "training.checkpoint.mode", checkpoint->mode.c_str());
-        gguf_set_val_i64(gctx, "training.checkpoint.epoch", checkpoint->epoch);
-        gguf_set_val_i64(gctx, "training.checkpoint.window", checkpoint->window);
-        gguf_set_val_i64(gctx, "training.checkpoint.step", checkpoint->step);
-        gguf_set_val_i64(gctx, "training.dataset.windows", checkpoint->dataset_windows);
-        gguf_set_val_i64(gctx, "training.context_length", checkpoint->context_length);
-        gguf_set_val_bool(gctx, "training.dataset.shuffle", checkpoint->shuffle);
-        gguf_set_val_i64(gctx, "training.scheduler.step", checkpoint->schedule_step);
-    }
-
-    // Register tensors
-    for (const auto & kv : lt.ab) {
-        gguf_add_tensor(gctx, kv.second.first);   // lora_a
-        gguf_add_tensor(gctx, kv.second.second);  // lora_b
-    }
-
-    // Write: meta placeholder → tensor data → rewrite meta
-    std::ofstream fout(out_path, std::ios::binary);
-    if (!fout.is_open()) {
-        LOG_ERR("%s: cannot open %s for writing\n", __func__, out_path.c_str());
-        gguf_free(gctx);
-        return;
-    }
-
-    // Write meta placeholder
-    const size_t      meta_size = gguf_get_meta_size(gctx);
-    std::vector<char> zeros_buf(meta_size, 0);
-    fout.write(zeros_buf.data(), meta_size);
-
-    // Write tensor data — copy to CPU first in case tensors live on GPU
-    for (const auto & kv : lt.ab) {
-        for (ggml_tensor * t : { kv.second.first, kv.second.second }) {
-            const size_t      nb = ggml_nbytes(t);
-            std::vector<char> cpu_buf(nb);
-            ggml_backend_tensor_get(t, cpu_buf.data(), 0, nb);
-            fout.write(cpu_buf.data(), nb);
-            // GGUF tensors are 32-byte aligned
-            const size_t pad = GGML_PAD(nb, 32) - nb;
-            if (pad > 0) {
-                std::vector<char> pad_buf(pad, 0);
-                fout.write(pad_buf.data(), pad);
-            }
-        }
-    }
-
-    // Re-write metadata at offset 0
-    std::vector<uint8_t> meta(meta_size);
-    gguf_get_meta_data(gctx, meta.data());
-    fout.seekp(0);
-    fout.write((const char *) meta.data(), meta_size);
-
-    fout.close();
-    gguf_free(gctx);
-
-    LOG_INF("%s: adapter saved to %s\n", __func__, out_path.c_str());
 }
 
 // ---------------------------------------------------------------------------
@@ -1157,6 +222,13 @@ static void save_every_callback(bool               train,
     }
 }
 
+static void log_epoch_loss(int epoch, int total_epochs, ggml_opt_result_t train_result) {
+    double train_loss  = 0.0;
+    double uncertainty = 0.0;
+    ggml_opt_result_loss(train_result, &train_loss, &uncertainty);
+    LOG_INF("epoch %d/%d: train_loss=%.4f ± %.4f\n", epoch, total_epochs, train_loss, uncertainty);
+}
+
 // ---------------------------------------------------------------------------
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
@@ -1191,9 +263,9 @@ int main(int argc, char ** argv) {
     }
 
     // Force settings required for training
-    params.load_mode    = LLAMA_LOAD_MODE_NONE;
-    params.cache_type_k = GGML_TYPE_F32;
-    params.cache_type_v = GGML_TYPE_F32;
+    params.load_mode       = LLAMA_LOAD_MODE_NONE;
+    params.cache_type_k    = GGML_TYPE_F32;
+    params.cache_type_v    = GGML_TYPE_F32;
     // Warmup runs inference with PARAM-flagged tensors which causes a segfault;
     // training never benefits from warmup, so disable it unconditionally.
     params.warmup          = false;
@@ -1311,7 +383,7 @@ int main(int argc, char ** argv) {
     // --- Step 5: Load dataset ---
     auto                tmpls   = common_chat_templates_init(model, "");
     const llama_vocab * vocab   = llama_model_get_vocab(model);
-    auto                samples = load_jsonl(params.train_file, model, vocab, tmpls.get(), params.dataset_threads);
+    auto                samples = load_jsonl(params.train_file, vocab, tmpls.get());
     if (samples.empty()) {
         LOG_ERR("%s: no training samples loaded\n", __func__);
         return 1;
@@ -1334,7 +406,6 @@ int main(int argc, char ** argv) {
         /*.get_opt_pars             =*/qlora_opt_lr_pars,
         /*.get_opt_pars_ud          =*/&schedule,
         /*.optimizer_type           =*/params.optimizer,
-        /*.grad_checkpoint_interval =*/params.grad_checkpoint_interval,
     };
     llama_opt_init(ctx, model, lopt_params);
 
@@ -1480,24 +551,10 @@ int main(int argc, char ** argv) {
                               ggml_opt_epoch_callback_progress_bar, params.shuffle_dataset);
         fprintf(stderr, "\n");
 
-        // Per-epoch loss summary
-        {
-            double train_loss = 0.0, train_unc = 0.0;
-            ggml_opt_result_loss(result_train, &train_loss, &train_unc);
-            if (idata_split < ggml_opt_dataset_ndata(dataset)) {
-                double val_loss = 0.0, val_unc = 0.0;
-                ggml_opt_result_loss(result_eval, &val_loss, &val_unc);
-                LOG_INF("epoch %d/%d: train_loss=%.4f ± %.4f  val_loss=%.4f ± %.4f\n", params.lr.epoch + 1,
-                        params.lr.epochs, train_loss, train_unc, val_loss, val_unc);
-            } else {
-                LOG_INF("epoch %d/%d: train_loss=%.4f ± %.4f\n", params.lr.epoch + 1, params.lr.epochs, train_loss,
-                        train_unc);
-            }
-        }
+        log_epoch_loss(params.lr.epoch + 1, params.lr.epochs, result_train);
 
         ggml_opt_result_reset(result_train);
         ggml_opt_result_reset(result_eval);
-
     }
 
     ggml_opt_result_free(result_train);

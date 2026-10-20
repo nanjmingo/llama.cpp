@@ -72,7 +72,6 @@ Trains LoRA adapters on a quantized GGUF model.
 |---|---|---|
 | `--model` | *(required)* | Path to quantized GGUF model |
 | `--train-file` | *(required)* | JSONL training dataset |
-| `-dthr` / `--dataset-threads` | physical CPU cores | JSONL parse, template, and tokenization worker threads |
 | `--lora-rank` | `16` | LoRA rank r |
 | `--lora-alpha` | `0` (= rank) | LoRA alpha; effective scale = alpha/rank |
 | `--lora-targets` | see below | Comma-separated internal tensor name substrings |
@@ -80,7 +79,6 @@ Trains LoRA adapters on a quantized GGUF model.
 | `--resume` | *(none)* | Resume weights and training position from a `--save-every` checkpoint |
 | `--save-every` | `0` | Save checkpoint every N dataset windows (0 = end only) |
 | `--freeze-layers` | `0` | Skip LoRA on first N transformer layers (blk.0..N-1); backward already pruned automatically |
-| `--grad-checkpoint` | `0` | Mark every Nth forward node persistent to reduce activation VRAM; good values: 32–64 |
 | `--shuffle-dataset` | off | Shuffle dataset windows at the start of each epoch |
 | `-epochs` / `--epochs` | `3` | Training epochs |
 | `-c` / `--ctx-size` | `512` | Training context window (tokens) |
@@ -200,8 +198,8 @@ llama.cpp uses **internal GGUF tensor names**, not HuggingFace names:
 **1. Full backprop through frozen quantized layers**
 Every backward step dequantizes all frozen Q4_K_M weight tensors to compute activation gradients (needed to propagate loss from the output back to each LoRA layer). For a 28-layer 1.7B model at `-ub 512`, this is ~280 dequantizing matmuls per step → step time is 3–5× slower than inference.
 
-**2. Activation VRAM** *(partially addressed by `--grad-checkpoint`)*
-All forward activations are kept in VRAM throughout the backward pass. VRAM ≈ `model + KV + n_layers × hidden × n_ubatch × 10 × 4B + 2 × lora_params × 4B`. Reducing `-ub` reduces VRAM linearly. Use `--grad-checkpoint 48` to prevent the allocator from reusing intermediate activation buffers during backward, which cuts peak activation VRAM at near-zero compute cost.
+**2. Activation VRAM**
+All forward activations are kept in VRAM throughout the backward pass. VRAM ≈ `model + KV + n_layers × hidden × n_ubatch × 10 × 4B + 2 × lora_params × 4B`. Reducing `-ub` reduces VRAM linearly.
 
 **3. Full backprop through all layers** *(partially addressed by `--freeze-layers`)*
 Gradients propagate through all layers that have LoRA adapters. Use `--freeze-layers N` to skip LoRA allocation for blk.0..N-1 — those layers receive no gradient (the `grads_needed` pruner already skips their backward ops automatically). Only the top (total_layers - N) layers are trained.
@@ -211,7 +209,7 @@ Gradients propagate through all layers that have LoRA adapters. Use `--freeze-la
 | Priority | Optimization | Expected gain | Status |
 |---|---|---|---|
 | ✅ Done | **`--freeze-layers N`** — no LoRA on first N layers; backward auto-pruned | Proportional to N/total | Implemented |
-| ✅ Done | **`--grad-checkpoint N`** — keep every Nth activation alive through backward | Reduces peak activation VRAM | Implemented |
+Implemented |
 | ✅ Done | **`--shuffle-dataset`** — shuffle windows each epoch | Better convergence | Implemented |
 | ✅ Done | **BOS separators** — insert BOS between concatenated samples | Correct cross-sample boundaries | Implemented |
 | ✅ Done | **Per-epoch loss summary** — log train loss after each epoch | Observability | Implemented |
@@ -233,13 +231,11 @@ Gradients propagate through all layers that have LoRA adapters. Use `--freeze-la
 | `ggml/src/ggml.c` | Backward graph fixes: `GET_ROWS` 3D, `SET_ROWS`, `MUL_MAT_ID`, `SSM_SCAN/CONV`, `FLASH_ATTN_EXT` all stop gradient; inplace-op assert → warn+skip |
 | `src/llama-context.cpp` | `opt_init`: scheduler and graph sized with inflated capacity before `ggml_opt_init`; `opt_epoch_iter`: per-ubatch timing instrumentation |
 | `src/llama-adapter.cpp` | Repack-buft fallback for LoRA tensors: tries device-native buft before CPU |
-| `common/common.h` | Added `save_every`, `lora_resume`, `lora_freeze_layers`, `grad_checkpoint_interval`, `shuffle_dataset` fields |
-| `common/arg.cpp` | Added `--save-every`, `--resume`, `--freeze-layers`, `--grad-checkpoint`, `--shuffle-dataset` arguments |
-| `include/llama.h` | Added `llama_opt_epoch_range()`; `grad_checkpoint_interval` in `llama_opt_params`; `shuffle` param in `llama_opt_epoch` |
+| `common/common.h` | Added `save_every`, `lora_resume`, `lora_freeze_layers`, `shuffle_dataset` fields |
+| `common/arg.cpp` | Added `--save-every`, `--resume`, `--freeze-layers`, `--shuffle-dataset` arguments |
+| `include/llama.h` | Added `llama_opt_epoch_range()`; `shuffle` param in `llama_opt_epoch` |
 | `ggml/src/ggml-cuda/out-prod.cu` | Shared CUDA/HIP `OUT_PROD` with quantized src0 (dequantize on GPU + cuBLAS/hipBLAS); `OUT_PROD_ID` for MoE backward |
 | `ggml/src/ggml-cuda/ggml-cuda.cu` | `supports_op` for quantized `OUT_PROD` and `OUT_PROD_ID`; CPU-resident ids fix in `mul_mat_id` |
-| `ggml/include/ggml-opt.h` | Added `grad_checkpoint_interval` to `ggml_opt_params` |
-| `ggml/src/ggml-opt.cpp` | Gradient checkpointing: marks every Nth forward node `GGML_TENSOR_FLAG_OUTPUT` before backward build |
 
 ### Key invariants
 
