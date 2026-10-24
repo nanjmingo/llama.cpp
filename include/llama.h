@@ -1729,12 +1729,31 @@ extern "C" {
     };
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
+    // When recreate is true, drop optimizer state while preserving model weights.
+    LLAMA_API void llama_opt_reset(struct llama_context * lctx, bool recreate);
+
+    // Shuffle the first idata dataset entries with the optimizer RNG, or all entries if idata is negative.
+    LLAMA_API void llama_opt_dataset_shuffle(
+            struct llama_context * lctx,
+            ggml_opt_dataset_t     dataset,
+            int64_t                idata);
 
     LLAMA_API void llama_opt_epoch(
             struct llama_context    * lctx,
             ggml_opt_dataset_t        dataset,
             ggml_opt_result_t         result_train,
             ggml_opt_result_t         result_eval,
+            int64_t                   idata_split,
+            ggml_opt_epoch_callback   callback_train,
+            ggml_opt_epoch_callback   callback_eval);
+
+    // Train on [idata_start, idata_split), then evaluate on [idata_split, ndata).
+    LLAMA_API void llama_opt_epoch_range(
+            struct llama_context    * lctx,
+            ggml_opt_dataset_t        dataset,
+            ggml_opt_result_t         result_train,
+            ggml_opt_result_t         result_eval,
+            int64_t                   idata_start,
             int64_t                   idata_split,
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);

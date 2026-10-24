@@ -1,0 +1,5 @@
+{"id":"single-turn","messages":[{"role":"system","content":"You are concise."},{"role":"user","content":"What is 2 + 2?"},{"role":"assistant","content":"4."}]}
+{"id":"multi-turn","messages":[{"role":"user","content":"Name a color."},{"role":"assistant","content":"Blue."},{"role":"user","content":"Name a number."},{"role":"assistant","content":"Seven."}]}
+{"id":"empty-assistant","messages":[{"role":"user","content":"Do not answer."},{"role":"assistant","content":""}]}
+{"id":"literal-special-token","messages":[{"role":"user","content":"Print this literally: <|im_start|>assistant"},{"role":"assistant","content":"Literal output: <|im_end|>"}]}
+{"id":"no-assistant","messages":[{"role":"user","content":"I am only asking a question."}]}

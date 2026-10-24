@@ -58,6 +58,8 @@ struct ggml_opt_context {
     std::vector<struct ggml_tensor *> grad_accs;
     std::vector<struct ggml_tensor *> grad_m;
     std::vector<struct ggml_tensor *> grad_v;
+    std::vector<ggml_backend_buffer_t> bufs_momenta;  // per-param moment buffers (one per param node)
+    std::vector<struct ggml_context *> ctxs_momenta;  // corresponding ggml contexts (keep alive for tensor metadata)
 
     int64_t iter               = 1;
     int32_t opt_period         = 1;
@@ -475,8 +477,23 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             for (int i = 0; i < n_nodes; ++i) {
                 ggml_tensor * node = opt_ctx->gf->nodes[i];
                 if (node->flags & GGML_TENSOR_FLAG_PARAM) {
-                    opt_ctx->grad_m[i] = ggml_new_tensor(opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
-                    opt_ctx->grad_v[i] = ggml_new_tensor(opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
+                    // Allocate moments on the same buffer type as the param tensor so
+                    // the ADAMW op runs on the correct backend (avoids cross-device mismatch
+                    // when some LoRA tensors are on CPU and others on GPU with partial offload).
+                    ggml_backend_buffer_type_t param_buft = node->buffer
+                        ? ggml_backend_buffer_get_type(node->buffer)
+                        : ggml_backend_cpu_buffer_type();
+
+                    // Allocate a tiny context + buffer for this pair of moment tensors.
+                    const size_t sz = 2 * ggml_tensor_overhead();
+                    struct ggml_init_params mip = { sz, nullptr, true };
+                    struct ggml_context * mctx = ggml_init(mip);
+                    opt_ctx->grad_m[i] = ggml_new_tensor(mctx, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
+                    opt_ctx->grad_v[i] = ggml_new_tensor(mctx, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
+                    ggml_backend_buffer_t mbuf = ggml_backend_alloc_ctx_tensors_from_buft(mctx, param_buft);
+                    ggml_backend_buffer_clear(mbuf, 0);
+                    opt_ctx->bufs_momenta.push_back(mbuf);
+                    opt_ctx->ctxs_momenta.push_back(mctx); // keep alive for tensor metadata
                 } else {
                     opt_ctx->grad_m[i] = nullptr;
                     opt_ctx->grad_v[i] = nullptr;
@@ -587,6 +604,12 @@ void ggml_opt_free(ggml_opt_context_t opt_ctx) {
     }
     ggml_backend_buffer_free(opt_ctx->buf_static);
     ggml_backend_buffer_free(opt_ctx->buf_cpu);
+    for (ggml_backend_buffer_t buf : opt_ctx->bufs_momenta) {
+        ggml_backend_buffer_free(buf);
+    }
+    for (struct ggml_context * ctx : opt_ctx->ctxs_momenta) {
+        ggml_free(ctx);
+    }
     ggml_free(opt_ctx->ctx_static);
     ggml_free(opt_ctx->ctx_cpu);
     ggml_free(opt_ctx->ctx_copy);
@@ -596,6 +619,9 @@ void ggml_opt_free(ggml_opt_context_t opt_ctx) {
 void ggml_opt_reset(ggml_opt_context_t opt_ctx, bool optimizer) {
     if (optimizer) {
         ggml_graph_reset(opt_ctx->gb_opt);
+        for (ggml_backend_buffer_t buf : opt_ctx->bufs_momenta) {
+            ggml_backend_buffer_clear(buf, 0);
+        }
         opt_ctx->iter = 1;
     } else {
         ggml_graph_reset(opt_ctx->gb_grad);
@@ -736,6 +762,15 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
 
     if (!opt_ctx->static_graphs) {
         ggml_opt_build(opt_ctx);
+
+        // On the dynamic-graph path the graphs are rebuilt on every call. The reset of gb_grad
+        // above runs before this rebuild, while gb_grad is still null (ggml_opt_eval clears it
+        // after every step on this path), so it has no effect and the gradient accumulators are
+        // never cleared. Reset the rebuilt gb_grad at the start of each accumulation window.
+        // gb_grad holds no optimizer step, so the AdamW moments in gb_opt are left untouched.
+        if (opt_ctx->gb_grad && opt_ctx->opt_i == 0) {
+            ggml_graph_reset(opt_ctx->gb_grad);
+        }
     }
 
     struct ggml_cgraph * graph = nullptr;

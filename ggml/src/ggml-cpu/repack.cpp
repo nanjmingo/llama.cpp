@@ -8,6 +8,7 @@
 #include "ggml-cpu-impl.h"
 #include "simd-mappings.h"
 #include "traits.h"
+#include "vec.h"
 
 #include "arch-fallback.h"
 
@@ -15,6 +16,7 @@
 #include <cstring>
 #include <cassert>
 #include <cstdio>  // for GGML_ASSERT
+#include <type_traits>
 
 #include "repack.h"
 
@@ -4554,7 +4556,7 @@ class tensor_traits_base : public ggml::cpu::tensor_traits {
 
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE> class tensor_traits : public tensor_traits_base {
 
-    bool work_size(int /* n_threads */, const struct ggml_tensor * op, size_t & size) override {
+    bool work_size(int n_threads, const struct ggml_tensor * op, size_t & size) override {
         // not realy a GGML_TYPE_Q8_0 but same size.
         switch (op->op) {
             case GGML_OP_MUL_MAT:
@@ -4576,6 +4578,15 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
                     return true;
                 }
+            case GGML_OP_OUT_PROD:
+                if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> ||
+                              std::is_same_v<BLOC_TYPE, block_q8_0>) {
+                    // One F32 row per packed row in the repack group, per thread.
+                    const size_t row_size = GGML_PAD((size_t) op->src[0]->ne[0] * sizeof(float), 64);
+                    size = row_size * NB_COLS * n_threads;
+                    return true;
+                }
+                break;
             default:
                 // GGML_ABORT("fatal error");
                 break;
@@ -4591,11 +4602,124 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             case GGML_OP_MUL_MAT_ID:
                 forward_mul_mat_id(params, op);
                 return true;
+            case GGML_OP_OUT_PROD:
+                if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> ||
+                              std::is_same_v<BLOC_TYPE, block_q8_0>) {
+                    forward_out_prod(params, op);
+                    return true;
+                }
+                break;
             default:
                 // GGML_ABORT("fatal error");
                 break;
         }
         return false;
+    }
+
+    void forward_out_prod(ggml_compute_params * params, ggml_tensor * op) {
+        if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> ||
+                      std::is_same_v<BLOC_TYPE, block_q8_0>) {
+            const ggml_tensor * src0 = op->src[0];
+            const ggml_tensor * src1 = op->src[1];
+            ggml_tensor *       dst  = op;
+
+            GGML_TENSOR_BINARY_OP_LOCALS
+
+            constexpr bool is_q4 = std::is_same_v<BLOC_TYPE, block_q4_0>;
+            constexpr int  nbits = is_q4 ? 4 : 8;
+            constexpr int  qk    = QK_0<nbits>();
+            using packed_block = block<nbits, NB_COLS>;
+            const ggml_type expected_type = is_q4 ? GGML_TYPE_Q4_0 : GGML_TYPE_Q8_0;
+
+            GGML_ASSERT(src0->type == expected_type);
+            GGML_ASSERT(src1->type == GGML_TYPE_F32);
+            GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+            GGML_ASSERT(ggml_n_dims(src0) == 2);
+            GGML_ASSERT(ne0 == ne00);
+            GGML_ASSERT(ne1 == ne10);
+            GGML_ASSERT(ne2 == ne12);
+            GGML_ASSERT(ne3 == ne13);
+            GGML_ASSERT(ne2 % ne02 == 0);
+            GGML_ASSERT(ne3 % ne03 == 0);
+            GGML_ASSERT(ne00 % qk == 0);
+            GGML_ASSERT(ne01 % NB_COLS == 0);
+            GGML_ASSERT(nb00 == ggml_type_size(expected_type));
+            GGML_ASSERT(nb0 == sizeof(float));
+
+            const int ith = params->ith;
+            const int nth = params->nth;
+            const int64_t nr = ne1 * ne2 * ne3;
+            const int64_t dr = (nr + nth - 1) / nth;
+            const int64_t ir0 = dr * ith;
+            const int64_t ir1 = MIN(ir0 + dr, nr);
+            if (ir0 >= ir1) {
+                return;
+            }
+
+            const size_t scratch_row_size = GGML_PAD((size_t) ne00 * sizeof(float), 64);
+            float * wdata = (float *) params->wdata + (scratch_row_size / sizeof(float)) * NB_COLS * ith;
+            const int64_t nblocks = ne00 / qk;
+            const size_t repacked_row_group_stride = nb01 * NB_COLS;
+
+            // Each thread owns output rows. Dequantize one repack group at a time,
+            // then reuse its rows for all output rows owned by this thread.
+            for (int64_t ir = ir0; ir < ir1; ++ir) {
+                const int64_t i3 = ir / (ne2 * ne1);
+                const int64_t i2 = (ir - i3 * ne2 * ne1) / ne1;
+                const int64_t i1 = ir - i3 * ne2 * ne1 - i2 * ne1;
+                float * d = (float *) ((char *) dst->data + i1 * nb1 + i2 * nb2 + i3 * nb3);
+                ggml_vec_set_f32(ne0, d, 0.0f);
+            }
+
+            for (int64_t group = 0; group < ne01 / NB_COLS; ++group) {
+                const char * group_data = (const char *) src0->data + group * repacked_row_group_stride;
+                const packed_block * blocks = (const packed_block *) group_data;
+
+                for (int64_t p = 0; p < NB_COLS; ++p) {
+                    float * row = (float *) ((char *) wdata + p * scratch_row_size);
+                    for (int64_t b = 0; b < nblocks; ++b) {
+                        const float scale = GGML_CPU_FP16_TO_FP32(blocks[b].d[p]);
+                        if constexpr (is_q4) {
+                            for (int j = 0; j < qk; ++j) {
+                                const int source_byte = j % (qk / 2);
+                                const int byte_group = source_byte / INTER_SIZE;
+                                const int byte_offset = source_byte % INTER_SIZE;
+                                const int byte_idx = byte_group * (NB_COLS * INTER_SIZE) + p * INTER_SIZE + byte_offset;
+                                const uint8_t byte_value = ((const uint8_t *) blocks[b].qs)[byte_idx];
+                                const uint8_t nibble = (j < qk / 2) ? (byte_value & 0x0F) : (byte_value >> 4);
+                                // Q4_0 repacking XORs each nibble with 8, encoding signed int4 values.
+                                const int8_t q = nibble < 8 ? (int8_t) nibble : (int8_t) nibble - 16;
+                                row[b * qk + j] = (float) q * scale;
+                            }
+                        } else {
+                            for (int j = 0; j < qk; ++j) {
+                                const int quant_group = j / INTER_SIZE;
+                                const int quant_offset = j % INTER_SIZE;
+                                const int quant_idx = quant_group * (NB_COLS * INTER_SIZE) + p * INTER_SIZE + quant_offset;
+                                const int8_t q = blocks[b].qs[quant_idx];
+                                row[b * qk + j] = (float) q * scale;
+                            }
+                        }
+                    }
+                }
+
+                for (int64_t ir = ir0; ir < ir1; ++ir) {
+                    const int64_t i3 = ir / (ne2 * ne1);
+                    const int64_t i2 = (ir - i3 * ne2 * ne1) / ne1;
+                    const int64_t i1 = ir - i3 * ne2 * ne1 - i2 * ne1;
+                    float * d = (float *) ((char *) dst->data + i1 * nb1 + i2 * nb2 + i3 * nb3);
+                    for (int64_t p = 0; p < NB_COLS; ++p) {
+                        const int64_t i01 = group * NB_COLS + p;
+                        const float * s1 = (const float *) ((const char *) src1->data + i1 * nb10 + i01 * nb11 + i2 * nb12 + i3 * nb13);
+                        const float * row = (const float *) ((const char *) wdata + p * scratch_row_size);
+                        ggml_vec_mad_f32(ne0, d, row, *s1);
+                    }
+                }
+            }
+        } else {
+            GGML_UNUSED(params);
+            GGML_UNUSED(op);
+        }
     }
 
     void forward_mul_mat_one_chunk(ggml_compute_params * params,
@@ -5225,12 +5349,22 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
             //if (op->src[1]->type == GGML_TYPE_Q8_0) {
             //    return true;
             //}
+        } else if (op->op == GGML_OP_OUT_PROD
+                && (op->src[0]->type == GGML_TYPE_Q4_0 || op->src[0]->type == GGML_TYPE_Q8_0)
+                && op->src[0]->buffer
+                && (ggml_n_dims(op->src[0]) == 2)
+                && op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type()
+                && ggml_repack_get_optimal_repack_type(op->src[0])) {
+            if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
+                return false;
+            }
+            return op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         }
         return false;
     }
 
     ggml::cpu::tensor_traits * get_tensor_traits(const struct ggml_tensor * op) override {
-        if (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) {
+        if (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID || op->op == GGML_OP_OUT_PROD) {
             if (op->src[0]->buffer && op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type()) {
                 return (ggml::cpu::tensor_traits *) op->src[0]->extra;
             }

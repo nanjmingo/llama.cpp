@@ -1162,6 +1162,112 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2, 
 
 // ggml_compute_forward_mul_mat
 
+static bool ggml_cpu_mul_mat_use_fp32_dot_src1(const struct ggml_tensor * dst) {
+    if (!dst->src[0] || !dst->src[1] ||
+        !ggml_is_quantized(dst->src[0]->type) ||
+        dst->src[1]->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const enum ggml_prec prec = ggml_prec_get_src(dst, 1);
+    return prec == GGML_PREC_F32 || prec == GGML_PREC_F16 || prec == GGML_PREC_BF16;
+}
+
+static void ggml_compute_forward_mul_mat_quantized_fp32_dot_src1(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const enum ggml_prec activation_prec = ggml_prec_get_src(dst, 1);
+
+    GGML_ASSERT(ggml_is_quantized(src0->type));
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(activation_prec == GGML_PREC_F32 ||
+                activation_prec == GGML_PREC_F16 ||
+                activation_prec == GGML_PREC_BF16);
+    GGML_ASSERT(ne0 == ne01);
+    GGML_ASSERT(ne00 == ne10);
+    GGML_ASSERT(ne1 == ne11);
+    GGML_ASSERT(ne2 == ne12);
+    GGML_ASSERT(ne3 == ne13);
+    GGML_ASSERT(nb00 == ggml_type_size(src0->type));
+    GGML_ASSERT(nb10 == sizeof(float));
+    GGML_ASSERT(nb0 == sizeof(float));
+
+    const struct ggml_type_traits * traits = ggml_get_type_traits(src0->type);
+    GGML_ASSERT(traits->to_float != NULL);
+
+    const int64_t r2 = ne12 / ne02;
+    const int64_t r3 = ne13 / ne03;
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const size_t row_size = GGML_PAD(ggml_row_size(GGML_TYPE_F32, ne00), 64);
+    const size_t activation_data_size = activation_prec == GGML_PREC_F32
+        ? 0
+        : ggml_nelements(src1) * sizeof(float);
+    const size_t row_workspace_offset = GGML_PAD(activation_data_size, 64);
+    float * activation_data = activation_prec == GGML_PREC_F32
+        ? NULL
+        : (float *) params->wdata;
+    float * row_f32 = (float *) ((char *) params->wdata + row_workspace_offset + ith * row_size);
+
+    GGML_ASSERT(ne12 % ne02 == 0);
+    GGML_ASSERT(ne13 % ne03 == 0);
+
+    if (activation_prec != GGML_PREC_F32) {
+        const int64_t n_activation_rows = ne11 * ne12 * ne13;
+        for (int64_t row = ith; row < n_activation_rows; row += nth) {
+            const int64_t i11 = row % ne11;
+            const int64_t i12 = (row / ne11) % ne12;
+            const int64_t i13 = row / (ne11 * ne12);
+            const float * src1_row = (const float *) (
+                (const char *) src1->data + i11 * nb11 + i12 * nb12 + i13 * nb13);
+            float * dst_row = activation_data + row * ne10;
+
+            if (activation_prec == GGML_PREC_F16) {
+                for (int64_t i00 = 0; i00 < ne10; ++i00) {
+                    dst_row[i00] = ggml_fp16_to_fp32(ggml_fp32_to_fp16(src1_row[i00]));
+                }
+            } else {
+                GGML_ASSERT(activation_prec == GGML_PREC_BF16);
+                for (int64_t i00 = 0; i00 < ne10; ++i00) {
+                    dst_row[i00] = ggml_bf16_to_fp32(ggml_fp32_to_bf16(src1_row[i00]));
+                }
+            }
+        }
+        ggml_barrier(params->threadpool);
+    }
+
+    for (int64_t i13 = 0; i13 < ne13; ++i13) {
+        for (int64_t i12 = 0; i12 < ne12; ++i12) {
+            const int64_t i03 = i13 / r3;
+            const int64_t i02 = i12 / r2;
+            const char * src0_batch = (const char *) src0->data + i02*nb02 + i03*nb03;
+            const char * src1_batch = (const char *) src1->data + i12*nb12 + i13*nb13;
+            char * dst_batch = (char *) dst->data + i12*nb2 + i13*nb3;
+
+            for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
+                const void * src0_row = src0_batch + i01*nb01;
+                traits->to_float(src0_row, row_f32, ne00);
+
+                for (int64_t i11 = 0; i11 < ne11; ++i11) {
+                    const float * src1_row = activation_prec == GGML_PREC_F32
+                        ? (const float *) (src1_batch + i11*nb11)
+                        : activation_data + ((i13 * ne12 + i12) * ne11 + i11) * ne10;
+
+                    float sum = 0.0f;
+                    ggml_vec_dot_f32(ne00, &sum, 0, row_f32, 0, src1_row, 0, 1);
+                    float * dst_value = (float *) (dst_batch + i11*nb1 + i01*nb0);
+                    *dst_value = sum;
+                }
+            }
+        }
+    }
+}
+
 static void ggml_compute_forward_mul_mat_one_chunk(
     const struct ggml_compute_params * params,
     struct ggml_tensor * dst,
@@ -1262,6 +1368,11 @@ void ggml_compute_forward_mul_mat(
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && !params->use_ref) {
         ggml_compute_forward_fwht(params, dst);
+        return;
+    }
+
+    if (ggml_cpu_mul_mat_use_fp32_dot_src1(dst)) {
+        ggml_compute_forward_mul_mat_quantized_fp32_dot_src1(params, dst);
         return;
     }
 
@@ -1879,6 +1990,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_out_prod(params, tensor);
             } break;
+        case GGML_OP_OUT_PROD_ID:
+            {
+                ggml_compute_forward_out_prod_id(params, tensor);
+            } break;
         case GGML_OP_SCALE:
             {
                 ggml_compute_forward_scale(params, tensor);
@@ -2094,6 +2209,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_gated_delta_net(params, tensor);
             } break;
+        case GGML_OP_GATED_DELTA_NET_BACK:
+            {
+                ggml_compute_forward_gated_delta_net_back(params, tensor);
+            } break;
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 ggml_compute_forward_lightning_indexer(params, tensor);
@@ -2294,6 +2413,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_GATED_DELTA_NET_BACK:
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
@@ -2370,6 +2490,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_OUT_PROD:
+        case GGML_OP_OUT_PROD_ID:
         case GGML_OP_SET_ROWS:
             {
                 n_tasks = n_threads;
@@ -2892,13 +3013,24 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_MUL_MAT:
                     {
-                        const enum ggml_type vec_dot_type = type_traits_cpu[node->src[0]->type].vec_dot_type;
-                        if (node->src[1]->type != vec_dot_type) {
-                            cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
+                        const struct ggml_tensor * src0 = node->src[0];
+                        const struct ggml_tensor * src1 = node->src[1];
+                        if (ggml_cpu_mul_mat_use_fp32_dot_src1(node)) {
+                            const enum ggml_prec activation_prec = ggml_prec_get_src(node, 1);
+                            const size_t activation_data_size = activation_prec == GGML_PREC_F32
+                                ? 0
+                                : ggml_nelements(src1) * sizeof(float);
+                            cur = GGML_PAD(activation_data_size, 64);
+                            cur += GGML_PAD(ggml_row_size(GGML_TYPE_F32, src0->ne[0]), 64) * n_tasks;
+                        } else {
+                            const enum ggml_type vec_dot_type = type_traits_cpu[src0->type].vec_dot_type;
+                            if (src1->type != vec_dot_type) {
+                                cur = ggml_row_size(vec_dot_type, ggml_nelements(src1));
+                            }
+                            // Workspace for tiled (see tiled.h)
+                            cur = GGML_PAD(cur, 64);
+                            cur += ggml_tiled_wdata_size(n_tasks, node);
                         }
-                        // Workspace for tiled (see tiled.h)
-                        cur = GGML_PAD(cur, 64);
-                        cur += ggml_tiled_wdata_size(n_tasks, node);
                     } break;
                 case GGML_OP_MUL_MAT_ID:
                     {
@@ -3037,6 +3169,13 @@ struct ggml_cplan ggml_graph_plan(
                         const int64_t S_v = node->src[2]->ne[0];
                         const int64_t K   = ggml_get_op_params_i32(node, 0);
                         const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
+                        cur = per_thread * sizeof(float) * n_tasks;
+                    } break;
+                case GGML_OP_GATED_DELTA_NET_BACK:
+                    {
+                        const int64_t S_v      = node->src[2]->ne[0];
+                        const int64_t n_tokens = node->src[2]->ne[2];
+                        const int64_t per_thread = CACHE_LINE_SIZE_F32 + (n_tokens + 2) * S_v * S_v + 8 * S_v;
                         cur = per_thread * sizeof(float) * n_tasks;
                     } break;
                 case GGML_OP_COUNT:
