@@ -111,10 +111,13 @@ These are shared llama.cpp model and execution parameters.
 | `--shuffle-dataset` | off | Shuffle dataset windows at the start of each epoch |
 | `-epochs` / `--epochs` | `3` | Training epochs |
 | `-lr` / `--learning-rate` | `1e-5` | AdamW learning rate |
+| `-wd` / `--weight-decay` | `0` | AdamW or SGD weight decay applied to trainable LoRA tensors; `0` disables weight decay |
+| `-opt` / `--optimizer` | `adamw` | Optimizer used to update LoRA tensors: `adamw` or `sgd` |
 | `--lr-scheduler` | `constant` | Learning-rate schedule: `constant` or `cosine` |
 | `--warmup-steps` | `0` | Linear warmup over N optimizer updates |
 | `--warmup-init-ratio` | `0.1` | Initial warmup LR as a fraction of peak LR; must be in `(0, 1]` |
 | `-lr-min` / `--learning-rate-min` | `-1` | Cosine floor; values below 0 use 0 |
+| `-decay-epochs` / `--learning-rate-decay-epochs` | `-1` | For the constant scheduler, decay toward `--learning-rate-min` over N epochs; takes effect when the minimum is positive and below the base learning rate; ignored by the cosine scheduler |
 | `--seed` | `42` | Random seed for LoRA initialization |
 
 #### Output params
