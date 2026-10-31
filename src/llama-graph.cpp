@@ -630,8 +630,8 @@ bool llm_graph_input_attn_kv_msa::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_attn_k_dsa::set_input(const llama_ubatch * ubatch) {
     mctx->get_mla()->set_input_k_idxs(self_k_idxs_mla, ubatch);
 
-    // leave unallocated when the top-k layers use the indexer mask
-    if (self_kq_mask_mla->buffer) {
+    // Leave the MLA mask unallocated when the top-k layers use the indexer mask.
+    if (self_kq_mask_mla && self_kq_mask_mla->buffer) {
         mctx->get_mla()->set_input_kq_mask(self_kq_mask_mla, ubatch, cparams.causal_attn);
     }
 
@@ -1115,17 +1115,23 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
-    mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
-    mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+    const auto * attn_ctx = mctx->get_attn();
 
+    // Inputs that are not used by the allocated graph have no buffer (e.g. during training).
+    if (inp_attn->self_k_idxs && inp_attn->self_k_idxs->buffer) {
+        attn_ctx->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
+    }
+    if (inp_attn->self_v_idxs && inp_attn->self_v_idxs->buffer) {
+        attn_ctx->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+    }
     // leave the mask unallocated if all attention layers have their own (e.g. qwen4exp QSA)
-    if (inp_attn->self_kq_mask->buffer) {
-        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    if (inp_attn->self_kq_mask && inp_attn->self_kq_mask->buffer) {
+        attn_ctx->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -1162,16 +1168,19 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 // Instead of creating a hybrid input, the graph can simply create 2 separate inputs.
 // Refactoring is required in the future.
 void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
-    mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
+    const auto * attn_ctx = mctx->get_attn();
 
-    // leave the mask unallocated if all attention layers have their own (e.g. glm5-next DSA)
-    if (inp_attn->self_kq_mask->buffer) {
-        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    // Inputs that are not used by the allocated graph have no buffer (e.g. during training).
+    if (inp_attn->self_k_idxs && inp_attn->self_k_idxs->buffer) {
+        attn_ctx->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
+    }
+    if (inp_attn->self_kq_mask && inp_attn->self_kq_mask->buffer) {
+        attn_ctx->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -1473,6 +1482,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     arch             (params.arch),
     hparams          (params.hparams),
     cparams          (params.cparams),
+    training_graph   (params.training_graph),
     ubatch           (params.ubatch),
     n_embd           (hparams.n_embd),
     n_layer          (hparams.n_layer()),
@@ -1570,8 +1580,10 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur_mm);
 
-    if (prec_policy) {
-        prec_policy->apply(res);
+    const bool has_src1_prec_policy = prec_policy && prec_policy->apply(res);
+
+    if (training_graph && ggml_is_quantized(w->type) && !has_src1_prec_policy) {
+        ggml_prec_set_src(res, GGML_PREC_F32, 1);
     }
 
     if (w->type == GGML_TYPE_NVFP4) {
@@ -3486,7 +3498,7 @@ ggml_tensor * llm_graph_context::build_attn(
         GGML_ASSERT(mctx_cur->get_n_kv() == n_tokens);
     }
 
-    const bool store_kv = !use_kv_cur || hparams.n_layer_kv_from_start >= 0;
+    const bool store_kv = !use_kv_cur || hparams.has_shared_kv();
 
     // optionally store to KV cache
     if (store_kv && k_cur) {

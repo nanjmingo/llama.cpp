@@ -343,6 +343,20 @@ uint32_t llama_hparams::kv_source(uint32_t il) const {
     GGML_ABORT("%s: il (%u) out of bounds (n_layer_all: %u)\n", __func__, il, n_layer_all);
 }
 
+bool llama_hparams::has_shared_kv() const {
+    if (n_layer_kv_from_start >= 0 && static_cast<uint32_t>(n_layer_kv_from_start) < n_layer_all) {
+        return true;
+    }
+
+    for (uint32_t il = 0; il < n_layer_all; ++il) {
+        if (kv_source(il) != il) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 bool llama_hparams::has_rope(uint32_t il) const {
     // the router layer stores adapter routing signal, not positional info,
     // so it must not be RoPE-shifted

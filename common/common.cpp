@@ -1779,6 +1779,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
+    cparams.no_alloc_kv_cache = params.no_alloc_kv_cache;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
@@ -2192,10 +2193,16 @@ void lr_opt::init() {
 }
 
 float lr_opt::get_lr(float epoch) const {
+    return get_lr(epoch, true);
+}
+
+float lr_opt::get_lr(float epoch, bool log) const {
     float r = lr_min <= 0 ? lr0 :
         epoch >= decay_epochs ? lr_min :
         lr0 * std::pow(0.5f, epoch * scale_epoch);
-    LOG_INF("epoch %.2g lr=%.2g\n", epoch, r);
+    if (log) {
+        LOG_INF("epoch %.2g lr=%.2g\n", epoch, r);
+    }
     return r;
 }
 

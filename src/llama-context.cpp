@@ -483,13 +483,20 @@ llama_context::llama_context(
 
     // init the memory module
     if (!hparams.vocab_only) {
+        const bool has_shared_kv = hparams.has_shared_kv();
+
+        const bool no_alloc_kv_cache = params.no_alloc_kv_cache &&
+            cparams.n_ubatch == cparams.n_ctx && cparams.n_batch >= cparams.n_ctx &&
+            !has_shared_kv && cparams.ctx_other == nullptr;
+
         llama_memory_params params_mem = {
-            /*.type_k    =*/ params.type_k,
-            /*.type_v    =*/ params.type_v,
-            /*.swa_full  =*/ params.swa_full,
-            /*.ctx_type  =*/ cparams.ctx_type,
-            /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
-            /*.no_alloc  =*/ model.no_alloc(),
+            /*.type_k           =*/ params.type_k,
+            /*.type_v           =*/ params.type_v,
+            /*.swa_full         =*/ params.swa_full,
+            /*.ctx_type         =*/ cparams.ctx_type,
+            /*.mem_other        =*/ llama_get_memory(cparams.ctx_other),
+            /*.no_alloc         =*/ model.no_alloc(),
+            /*.no_alloc_kv_cache=*/ no_alloc_kv_cache,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -2709,13 +2716,15 @@ llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const {
+                          llm_graph_type   gtype,
+                                  bool     training_graph) const {
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
         /*.ubatch      =*/ ubatch,
         /*.gtype       =*/ gtype,
+        /*.training_graph =*/ training_graph,
         /*.sched       =*/ sched.get(),
         /*.backend_cpu =*/ backend_cpu,
         /*.cvec        =*/ cvec.get(),
@@ -3816,23 +3825,87 @@ static void llama_set_param(struct ggml_tensor * tensor, llama_opt_param_filter 
     ggml_set_param(tensor);
 }
 
+static void llama_warn_shared_kv_lora_gradients(const llama_model & model, const llama_adapter_loras * loras) {
+    if (!loras || loras->empty()) {
+        return;
+    }
+
+    const llama_hparams & hparams = model.hparams;
+    const uint32_t n_layers = std::min<uint32_t>(hparams.n_layer(), static_cast<uint32_t>(model.layers.size()));
+    std::vector<uint32_t> shared_kv_consumers(n_layers, 0);
+
+    const bool has_prefix_shared_kv = model.arch == LLM_ARCH_GEMMA3N || model.arch == LLM_ARCH_GEMMA4;
+    const int32_t n_layer_kv_from_start = hparams.n_layer_kv_from_start;
+
+    for (uint32_t il = 0; il < n_layers; ++il) {
+        uint32_t kv_source = hparams.kv_source(il);
+        if (has_prefix_shared_kv && n_layer_kv_from_start >= 2 &&
+            il >= static_cast<uint32_t>(n_layer_kv_from_start)) {
+            kv_source = static_cast<uint32_t>(n_layer_kv_from_start) - (hparams.is_swa(il) ? 2u : 1u);
+        }
+        if (kv_source < n_layers && kv_source != il) {
+            ++shared_kv_consumers[kv_source];
+        }
+    }
+
+    auto warn_if_trainable = [&](const ggml_tensor * base_weight, uint32_t n_consumers) {
+        if (!base_weight) {
+            return;
+        }
+
+        for (const auto & [adapter, scale] : *loras) {
+            if (!adapter || scale == 0.0f) {
+                continue;
+            }
+            const auto it = adapter->ab_map.find(base_weight->name);
+            if (it == adapter->ab_map.end()) {
+                continue;
+            }
+
+            const llama_adapter_lora_weight & weight = it->second;
+            const bool train_a = weight.a && (weight.a->flags & GGML_TENSOR_FLAG_PARAM);
+            const bool train_b = weight.b && (weight.b->flags & GGML_TENSOR_FLAG_PARAM);
+            if (!train_a && !train_b) {
+                continue;
+            }
+
+            LLAMA_LOG_WARN("%s: LoRA target '%s' is a shared KV source for %u attention layer(s); "
+                           "gradients from those consumer layers cannot flow back through the KV cache, "
+                           "so this target receives incomplete gradients\n",
+                           __func__, base_weight->name, n_consumers);
+            break;
+        }
+    };
+
+    for (uint32_t il = 0; il < n_layers; ++il) {
+        const uint32_t n_consumers = shared_kv_consumers[il];
+        if (n_consumers == 0) {
+            continue;
+        }
+
+        const llama_layer & layer = model.layers[il];
+        warn_if_trainable(layer.wk, n_consumers);
+        warn_if_trainable(layer.wv, n_consumers);
+    }
+}
+
 void llama_context::opt_init(struct llama_model * model, struct llama_opt_params lopt_params) {
     GGML_ASSERT(!opt_ctx);
+    opt_lora_grad_warned.clear();
+    opt_model  = model;
+    opt_params = lopt_params;
+    cparams.pipeline_parallel = false;
     model->hparams.n_ctx_train = lopt_params.n_ctx_train > 0 ? lopt_params.n_ctx_train : n_ctx();
     const uint32_t n_batch     = std::min(this->n_batch(),  model->hparams.n_ctx_train);
     const uint32_t n_ubatch    = std::min(this->n_ubatch(), n_batch);
     GGML_ASSERT(model->hparams.n_ctx_train % n_batch  == 0);
     GGML_ASSERT(n_batch                    % n_ubatch == 0);
 
-    if (cparams.flash_attn) {
-        LLAMA_LOG_INFO("%s: disabling flash attention, FLASH_ATTN_EXT has no backward pass\n", __func__);
-        cparams.flash_attn = false;
-    }
-
     // gradients cannot flow through the KV cache, so the attention reads the K and V of the current ubatch directly
     if (n_ubatch == cparams.n_ctx) {
         cparams.training = true;
     } else {
+        cparams.training = false;
         LLAMA_LOG_WARN("%s: n_ubatch (%u) != n_ctx (%u), the K and V projections will not receive gradients\n", __func__, n_ubatch, cparams.n_ctx);
     }
 
@@ -3840,12 +3913,63 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     sched_need_reserve = true;
     sched_reserve();
 
+    // Size the scheduler for the forward, backward, and optimizer graphs before opt_ctx stores its pointer.
+    {
+        uint32_t train_fwd_nodes = 0;
+
+        // Measure a training graph without reallocating compute buffers.
+        if (memory) {
+            auto mctx_tmp = memory->init_full();
+            if (mctx_tmp) {
+                // Both graph results must hold the temporary graph.
+                const uint32_t tmp_cap = std::max<uint32_t>(4096u, 16u * model->n_tensors());
+                for (auto & res : gf_res_prev) {
+                    res.reset(new llm_graph_result(tmp_cap));
+                }
+                gf_res_reserve.reset(new llm_graph_result(tmp_cap));
+                gf_res_prev_active = nullptr;
+                auto * gf_train = graph_reserve(n_ubatch, 1, n_ubatch, mctx_tmp.get(), /*split_only=*/true);
+                if (gf_train) {
+                    train_fwd_nodes = (uint32_t)ggml_graph_n_nodes(gf_train);
+                    LLAMA_LOG_INFO("%s: measured training graph nodes = %u (n_ubatch=%u)\n",
+                                   __func__, train_fwd_nodes, n_ubatch);
+                }
+            }
+        }
+
+        if (train_fwd_nodes == 0) {
+            train_fwd_nodes = std::max<uint32_t>(1024u, 8u * model->n_tensors());
+            LLAMA_LOG_WARN("%s: could not measure training graph, using fallback nodes=%u\n",
+                           __func__, train_fwd_nodes);
+        }
+
+        // Allow four forward graphs and both nodes and leafs.
+        const int64_t inflated   = (int64_t)std::max<uint32_t>(train_fwd_nodes, 1024u) * 4;
+        const int64_t sched_size = inflated * 2;
+        // Both graph results can build the backward graph.
+        for (auto & res : gf_res_prev) {
+            res.reset(new llm_graph_result(inflated));
+        }
+        gf_res_reserve.reset(new llm_graph_result(inflated));
+        gf_res_prev_active = nullptr;
+        sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                                           sched_size, cparams.pipeline_parallel, cparams.op_offload));
+        // Keep the scheduler pointer stored by opt_ctx valid.
+        sched_need_reserve = false;
+        LLAMA_LOG_INFO("%s: training graph capacity = %lld (train_fwd_nodes=%u x4)\n",
+                       __func__, (long long)inflated, train_fwd_nodes);
+    }
+
     ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
     opt_params.opt_period      = n_batch / n_ubatch;
     opt_params.get_opt_pars    = lopt_params.get_opt_pars;
     opt_params.get_opt_pars_ud = lopt_params.get_opt_pars_ud;
     opt_params.optimizer       = lopt_params.optimizer_type;
+    opt_params.optimizer_state_type = lopt_params.optimizer_state_type;
     opt_ctx = ggml_opt_init(opt_params);
+    if (opt_accumulation_period > 0) {
+        ggml_opt_set_opt_period(opt_ctx, opt_accumulation_period);
+    }
 
     llama_opt_param_filter param_filter = lopt_params.param_filter;
     void * param_filter_ud              = lopt_params.param_filter_ud;
@@ -3871,6 +3995,47 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
             llama_set_param(reinterpret_cast<struct ggml_tensor **>(&layer)[i], param_filter, param_filter_ud);
         }
     }
+
+    llama_warn_shared_kv_lora_gradients(*model, loras.get());
+}
+
+size_t llama_context::opt_state_size() const {
+    return opt_ctx ? ggml_opt_state_size(opt_ctx) : 0;
+}
+
+bool llama_context::opt_state_export(void * data, size_t size) const {
+    return opt_ctx && ggml_opt_state_export(opt_ctx, data, size);
+}
+
+bool llama_context::opt_state_import(const void * data, size_t size) {
+    return opt_ctx && ggml_opt_state_import(opt_ctx, data, size);
+}
+
+void llama_context::opt_set_opt_period(int32_t opt_period) {
+    GGML_ASSERT(opt_ctx);
+    GGML_ASSERT(opt_period >= 1);
+    const uint32_t n_batch = std::min(this->n_batch(), this->n_ctx());
+    const uint32_t n_ubatch = std::min(this->n_ubatch(), n_batch);
+    GGML_ASSERT(n_ubatch == this->n_ctx() && "accumulation period counts full-context windows");
+    ggml_opt_set_opt_period(opt_ctx, opt_period);
+    opt_accumulation_period = opt_period;
+}
+
+void llama_context::opt_reset(bool recreate) {
+    GGML_ASSERT(opt_ctx);
+    if (recreate) {
+        GGML_ASSERT(opt_model);
+        ggml_opt_free(opt_ctx);
+        opt_ctx = nullptr;
+        opt_init(opt_model, opt_params);
+    } else {
+        ggml_opt_reset(opt_ctx, recreate);
+    }
+}
+
+void llama_context::opt_dataset_shuffle(ggml_opt_dataset_t dataset, int64_t idata) {
+    GGML_ASSERT(opt_ctx);
+    ggml_opt_dataset_shuffle(opt_ctx, dataset, idata);
 }
 
 void llama_context::opt_epoch_iter(
@@ -3878,14 +4043,17 @@ void llama_context::opt_epoch_iter(
         ggml_opt_result_t                result,
         const std::vector<llama_token> & tokens,
         const std::vector<llama_token> & labels_sparse,
+        const std::vector<float>       & label_weights,
         llama_batch                    & batch,
         ggml_opt_epoch_callback          callback,
         bool                             train,
         int64_t                          idata_in_loop,
         int64_t                          ndata_in_loop,
-        int64_t                          t_loop_start) {
+        int64_t                          t_loop_start,
+        std::unordered_set<const ggml_tensor *> & lora_grad_seen,
+        int64_t & n_train_graphs) {
     GGML_ASSERT(opt_ctx);
-    const uint32_t n_ctx    = llama_model_n_ctx_train(&model);
+    const uint32_t n_ctx    = (uint32_t)tokens.size();
     const uint32_t n_batch  = std::min(this->n_batch(),  n_ctx);
     const uint32_t n_ubatch = std::min(this->n_ubatch(), n_batch);
 
@@ -3931,6 +4099,8 @@ void llama_context::opt_epoch_iter(
         };
 
         uint32_t pos_batch = 0;
+        static bool timings_printed = false;  // print per-ubatch timings only for the first window
+        struct ggml_context * ctx_compute_opt = nullptr;
         do {
             const auto & ubatch = mctx->get_ubatch();
 
@@ -3943,7 +4113,8 @@ void llama_context::opt_epoch_iter(
 
             auto * res = get_gf_res_prev();
 
-            const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
+            const int64_t t0_build = ggml_time_ms();
+            const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type), true);
 
             // the optimizer graph is allocated outside sched, so the next decode must rebuild
             gf_res_prev_active = nullptr;
@@ -3951,41 +4122,106 @@ void llama_context::opt_epoch_iter(
 
             auto * gf = model.build_graph(gparams);
 
-            struct ggml_context * ctx_compute_opt;
-            {
+            // Allocate the tensor metadata context once, then reset it each iteration.
+            // ggml_reset() is much cheaper than ggml_free()+ggml_init() — it just resets the
+            // allocation pointer without freeing/reallocating the backing memory buffer.
+            if (!ctx_compute_opt) {
                 const size_t size_gf = ggml_graph_size(gf);
-                const size_t size_meta = 4*size_gf*ggml_tensor_overhead() + 2*ggml_graph_overhead_custom(size_gf, /*grads = */ true);
+                const size_t size_meta = 4*size_gf*ggml_tensor_overhead() + 3*ggml_graph_overhead_custom(size_gf, /*grads = */ true);
                 struct ggml_init_params params = {
                     /*.mem_size   =*/ size_meta,
                     /*.mem_buffer =*/ nullptr,
                     /*.no_alloc   =*/ true,
                 };
                 ctx_compute_opt = ggml_init(params);
+                if (!timings_printed) {
+                    LLAMA_LOG_INFO("%s: [timing] graph capacity=%zu n_nodes=%d size_meta=%.1fMB\n", __func__,
+                            size_gf, ggml_graph_n_nodes(gf), (double)size_meta / (1024*1024));
+                }
+            } else {
+                ggml_reset(ctx_compute_opt);
             }
+
+            const int64_t t1_alloc = ggml_time_ms();
             ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
             ggml_opt_alloc(opt_ctx, train);
+            if (train) {
+                ++n_train_graphs;
+                if (loras) {
+                    for (const auto & [adapter, scale] : *loras) {
+                        (void) scale;
+                        for (const auto & [name, weight] : adapter->ab_map) {
+                            (void) name;
+                            if (weight.a && (weight.a->flags & GGML_TENSOR_FLAG_PARAM) &&
+                                ggml_opt_has_grad(opt_ctx, weight.a)) {
+                                lora_grad_seen.insert(weight.a);
+                            }
+                            if (weight.b && (weight.b->flags & GGML_TENSOR_FLAG_PARAM) &&
+                                ggml_opt_has_grad(opt_ctx, weight.b)) {
+                                lora_grad_seen.insert(weight.b);
+                            }
+                        }
+                    }
+                }
+            }
 
+            const int64_t t2_inputs = ggml_time_ms();
             res->set_inputs(&ubatch);
             {
                 struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
                 GGML_ASSERT(labels->ne[1] == n_ubatch);
                 ggml_set_zero(labels);
-                const float onef = 1.0f;
+
+                const bool labels_host = ggml_backend_buffer_is_host(labels->buffer);
+                ggml_backend_t labels_backend = nullptr;
+                if (!labels_host) {
+                    labels_backend = ggml_backend_sched_get_tensor_backend(sched.get(), labels);
+                    GGML_ASSERT(labels_backend);
+                }
+
                 for (uint32_t pos_ubatch = 0; pos_ubatch < n_ubatch; ++pos_ubatch) {
                     const uint32_t ilabel = pos_ctx + pos_batch + pos_ubatch;
+                    const float weight = label_weights[ilabel];
+                    GGML_ASSERT(std::isfinite(weight) && weight >= 0.0f && weight <= 1.0f);
+                    if (labels_sparse[ilabel] < 0 || weight <= 0.0f) continue;
                     GGML_ASSERT(labels_sparse[ilabel] < labels->ne[0]);
-                    ggml_backend_tensor_set(labels, &onef, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
+                    const size_t offset = (static_cast<size_t>(pos_ubatch) * labels->ne[0] +
+                        static_cast<size_t>(labels_sparse[ilabel])) * sizeof(float);
+                    if (labels_host) {
+                        static_cast<float *>(labels->data)[offset / sizeof(float)] = weight;
+                    } else {
+                        ggml_backend_tensor_set_async(labels_backend, labels, &label_weights[ilabel], offset, sizeof(float));
+                    }
+                }
+                if (!labels_host) {
+                    ggml_backend_synchronize(labels_backend);
                 }
             }
+
             copy_experts.reset();
+
+            const int64_t t3_eval = ggml_time_ms();
             ggml_opt_eval(opt_ctx, result);
+
+            const int64_t t4_done = ggml_time_ms();
+            if (!timings_printed) {
+                LLAMA_LOG_INFO("%s: [timing] build=%" PRId64 "ms alloc=%" PRId64 "ms inputs=%" PRId64 "ms eval=%" PRId64 "ms total=%" PRId64 "ms\n",
+                        __func__,
+                        t1_alloc - t0_build,
+                        t2_inputs - t1_alloc,
+                        t3_eval - t2_inputs,
+                        t4_done - t3_eval,
+                        t4_done - t0_build);
+                timings_printed = true;
+            }
+
             if (callback) {
                 callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_ubatch + 1, ndata_in_loop, t_loop_start);
             }
-            ggml_free(ctx_compute_opt);
 
             pos_batch += ubatch.n_tokens;
         } while (mctx->next());
+        ggml_free(ctx_compute_opt);
     }
 }
 
@@ -3993,7 +4229,9 @@ void llama_context::opt_epoch(
         ggml_opt_dataset_t        dataset,
         ggml_opt_result_t         result_train,
         ggml_opt_result_t         result_eval,
+        int64_t                   idata_start,
         int64_t                   idata_split,
+        int64_t                   idata_eval_end,
         ggml_opt_epoch_callback   callback_train,
         ggml_opt_epoch_callback   callback_eval) {
     const uint32_t n_ctx    = this->n_ctx();
@@ -4001,37 +4239,91 @@ void llama_context::opt_epoch(
     const uint32_t n_ubatch = std::min(cparams.n_ubatch, n_batch);
     const  int64_t ndata    = ggml_opt_dataset_ndata(dataset);
 
-    GGML_ASSERT(idata_split >= 0);
-    GGML_ASSERT(idata_split <= ndata);
+    GGML_ASSERT(idata_start >= 0);
+    GGML_ASSERT(idata_start <= idata_split);
+    GGML_ASSERT(idata_split <= idata_eval_end);
+    GGML_ASSERT(idata_eval_end <= ndata);
 
     const uint32_t ubatch_per_ctx = n_ctx / n_ubatch;
 
     struct llama_batch batch = llama_batch_init(n_batch, 0, 1);
     std::vector<llama_token>        tokens(n_ctx);
     std::vector<llama_token> labels_sparse(n_ctx);
+    std::vector<float> label_weights(n_ctx, 1.0f);
+    struct ggml_tensor * dataset_weights = ggml_opt_dataset_weights(dataset);
+    if (dataset_weights) {
+        GGML_ASSERT(dataset_weights->type == GGML_TYPE_F32);
+        GGML_ASSERT(dataset_weights->ne[0] == n_ctx);
+    }
 
-    int64_t idata = 0;
+    int64_t idata = idata_start;
 
     int64_t t_loop_start = ggml_time_us();
-    int64_t ndata_in_loop = idata_split*ubatch_per_ctx;
+    int64_t ndata_in_loop = (idata_split - idata_start)*ubatch_per_ctx;
+    std::unordered_set<const ggml_tensor *> lora_grad_seen;
+    int64_t n_train_graphs = 0;
     for (; idata < idata_split; ++idata) {
         constexpr bool train = true;
-        const int64_t idata_in_loop = idata*ubatch_per_ctx;
+        const int64_t train_index = idata - idata_start;
+        const int64_t idata_in_loop = train_index*ubatch_per_ctx;
 
-        ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), idata);
-        opt_epoch_iter(dataset, result_train, tokens, labels_sparse, batch,
-            callback_train, train, idata_in_loop, ndata_in_loop, t_loop_start);
+        // QLoRA supplies an explicit period to accumulate full windows. Shorten only the
+        // final group of each epoch so its remaining windows still produce an optimizer step.
+        if (opt_accumulation_period > 0 && ubatch_per_ctx == 1 &&
+            train_index % opt_accumulation_period == 0) {
+            const int64_t remaining = idata_split - idata;
+            const int32_t period = static_cast<int32_t>(std::min<int64_t>(opt_accumulation_period, remaining));
+            ggml_opt_set_opt_period(opt_ctx, period);
+        }
+
+        if (dataset_weights) {
+            ggml_opt_dataset_get_batch_host_with_weights(dataset, tokens.data(), n_ctx*sizeof(llama_token),
+                    labels_sparse.data(), label_weights.data(), label_weights.size()*sizeof(float), idata);
+        } else {
+            ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), idata);
+            std::fill(label_weights.begin(), label_weights.end(), 1.0f);
+        }
+        opt_epoch_iter(dataset, result_train, tokens, labels_sparse, label_weights, batch,
+            callback_train, train, idata_in_loop, ndata_in_loop, t_loop_start, lora_grad_seen, n_train_graphs);
+    }
+
+    if (n_train_graphs > 0 && loras) {
+        for (const auto & [adapter, scale] : *loras) {
+            (void) scale;
+            for (const auto & [name, weight] : adapter->ab_map) {
+                const auto warn_missing_gradient = [&](const ggml_tensor * tensor, const char * component) {
+                    if (!tensor || !(tensor->flags & GGML_TENSOR_FLAG_PARAM) ||
+                        lora_grad_seen.count(tensor) || !opt_lora_grad_warned.insert(tensor).second) {
+                        return;
+                    }
+                    LLAMA_LOG_WARN("%s: LoRA target '%s' (%s) has no backward gradient path in any training batch of this epoch\n",
+                            __func__, name.c_str(), component);
+                };
+                warn_missing_gradient(weight.a, "lora_a");
+                warn_missing_gradient(weight.b, "lora_b");
+            }
+        }
+    }
+
+    if (opt_accumulation_period > 0 && ubatch_per_ctx == 1) {
+        ggml_opt_set_opt_period(opt_ctx, 1);
     }
 
     t_loop_start = ggml_time_us();
-    ndata_in_loop = (ndata - idata_split)*ubatch_per_ctx;
-    for (; idata < ndata; ++idata) {
+    ndata_in_loop = (idata_eval_end - idata_split)*ubatch_per_ctx;
+    for (; idata < idata_eval_end; ++idata) {
         constexpr bool train = false;
         const int64_t idata_in_loop = (idata - idata_split)*ubatch_per_ctx;
 
-        ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), idata);
-        opt_epoch_iter(dataset, result_eval, tokens, labels_sparse, batch,
-            callback_eval, train, idata_in_loop, ndata_in_loop, t_loop_start);
+        if (dataset_weights) {
+            ggml_opt_dataset_get_batch_host_with_weights(dataset, tokens.data(), n_ctx*sizeof(llama_token),
+                    labels_sparse.data(), label_weights.data(), label_weights.size()*sizeof(float), idata);
+        } else {
+            ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), idata);
+            std::fill(label_weights.begin(), label_weights.end(), 1.0f);
+        }
+        opt_epoch_iter(dataset, result_eval, tokens, labels_sparse, label_weights, batch,
+            callback_eval, train, idata_in_loop, ndata_in_loop, t_loop_start, lora_grad_seen, n_train_graphs);
     }
 
     llama_batch_free(batch);
@@ -4078,6 +4370,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.no_alloc_kv_cache           =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
@@ -4749,6 +5042,33 @@ void llama_opt_init(struct llama_context * ctx, struct llama_model * model, stru
     ctx->opt_init(model, lopt_params);
 }
 
+void llama_opt_set_opt_period(struct llama_context * ctx, int32_t opt_period) {
+    ctx->opt_set_opt_period(opt_period);
+}
+
+size_t llama_opt_state_size(const struct llama_context * ctx) {
+    return ctx ? ctx->opt_state_size() : 0;
+}
+
+bool llama_opt_state_export(const struct llama_context * ctx, void * data, size_t size) {
+    return ctx && ctx->opt_state_export(data, size);
+}
+
+bool llama_opt_state_import(struct llama_context * ctx, const void * data, size_t size) {
+    return ctx && ctx->opt_state_import(data, size);
+}
+
+void llama_opt_reset(struct llama_context * ctx, bool recreate) {
+    ctx->opt_reset(recreate);
+}
+
+void llama_opt_dataset_shuffle(
+        struct llama_context * ctx,
+        ggml_opt_dataset_t     dataset,
+        int64_t                idata) {
+    ctx->opt_dataset_shuffle(dataset, idata);
+}
+
 void llama_opt_epoch(
         struct llama_context    * ctx,
         ggml_opt_dataset_t        dataset,
@@ -4761,7 +5081,50 @@ void llama_opt_epoch(
         dataset,
         result_train,
         result_eval,
+        0,
         idata_split,
+        ggml_opt_dataset_ndata(dataset),
+        callback_train,
+        callback_eval);
+}
+
+void llama_opt_epoch_range(
+        struct llama_context    * ctx,
+        ggml_opt_dataset_t        dataset,
+        ggml_opt_result_t         result_train,
+        ggml_opt_result_t         result_eval,
+        int64_t                   idata_start,
+        int64_t                   idata_split,
+        ggml_opt_epoch_callback   callback_train,
+        ggml_opt_epoch_callback   callback_eval) {
+    ctx->opt_epoch(
+        dataset,
+        result_train,
+        result_eval,
+        idata_start,
+        idata_split,
+        ggml_opt_dataset_ndata(dataset),
+        callback_train,
+        callback_eval);
+}
+
+void llama_opt_epoch_range_with_eval_end(
+        struct llama_context    * ctx,
+        ggml_opt_dataset_t        dataset,
+        ggml_opt_result_t         result_train,
+        ggml_opt_result_t         result_eval,
+        int64_t                   idata_start,
+        int64_t                   idata_split,
+        int64_t                   idata_eval_end,
+        ggml_opt_epoch_callback   callback_train,
+        ggml_opt_epoch_callback   callback_eval) {
+    ctx->opt_epoch(
+        dataset,
+        result_train,
+        result_eval,
+        idata_start,
+        idata_split,
+        idata_eval_end,
         callback_train,
         callback_eval);
 }

@@ -20,7 +20,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <mutex>
+#include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #ifdef __APPLE__
@@ -1253,6 +1256,47 @@ struct ggml_backend_sched {
 #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
 #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
 
+static void ggml_backend_sched_log_op_backend(ggml_backend_t backend, struct ggml_tensor * node) {
+    if (!backend || !node || node->op == GGML_OP_NONE || node->op >= GGML_OP_COUNT ||
+        (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || ggml_is_view_op(node->op)) {
+        return;
+    }
+
+    const char * backend_name = ggml_backend_name(backend);
+    if (!backend_name || (strncmp(backend_name, "CPU", 3) != 0 && strncmp(backend_name, "CUDA", 4) != 0)) {
+        return;
+    }
+
+    std::string op_name = ggml_op_name(node->op);
+    if (node->op == GGML_OP_UNARY) {
+        const enum ggml_unary_op unary_op = ggml_get_unary_op(node);
+        if (unary_op < 0 || unary_op >= GGML_UNARY_OP_COUNT) {
+            return;
+        }
+        op_name += "(";
+        op_name += ggml_unary_op_name(unary_op);
+        op_name += ")";
+    } else if (node->op == GGML_OP_GLU) {
+        const enum ggml_glu_op glu_op = ggml_get_glu_op(node);
+        if (glu_op < 0 || glu_op >= GGML_GLU_OP_COUNT) {
+            return;
+        }
+        op_name += "(";
+        op_name += ggml_glu_op_name(glu_op);
+        op_name += ")";
+    }
+
+    static std::mutex log_mutex;
+    static std::unordered_set<std::string> logged;
+    const std::string key = std::string(backend_name) + "|" + op_name;
+    std::lock_guard<std::mutex> lock(log_mutex);
+    if (!logged.insert(key).second) {
+        return;
+    }
+
+    GGML_LOG_INFO("[op-backend-dispatch] backend=%s op=%s node=%s\n", backend_name, op_name.c_str(), node->name);
+}
+
 static void ggml_backend_sched_split_inputs_grow(struct ggml_backend_sched_split * split) {
     int new_cap = GGML_SCHED_MAX_SPLIT_INPUTS;
     if (split->inputs_capacity > 0) {
@@ -2141,6 +2185,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             } else {
                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
             }
+        }
+
+        for (int i = 0; i < split->graph.n_nodes; ++i) {
+            ggml_backend_sched_log_op_backend(split_backend, split->graph.nodes[i]);
         }
 
         // copy the input tensors to the split backend
