@@ -43,17 +43,19 @@ struct sourced_dataset_example {
 struct rendered_piece {
     std::string text;
     bool parse_special = true;
-    bool add_special = false;
     float loss_weight = 0.0f;
 };
 
 struct rendered_example {
     std::vector<rendered_piece> pieces;
+    bool add_special = false;
+    bool text_continuation = false;
 };
 
 struct training_sample {
     std::vector<llama_token> tokens;
     std::vector<float> weights;
+    bool text_continuation = false;
 };
 
 struct training_window {

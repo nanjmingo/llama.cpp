@@ -181,6 +181,11 @@ inline void check_case(const template_test_case & test_case,
             require(sample.tokens.size() == sample.weights.size(), case_id + ": token and weight lengths differ");
             require(std::any_of(sample.weights.begin(), sample.weights.end(), [](float weight) { return weight > 0.0f; }),
                     case_id + ": tokenized example has no supervised tokens");
+            const llama_token bos = llama_vocab_bos(vocab);
+            if (bos >= 0) {
+                const size_t bos_count = static_cast<size_t>(std::count(sample.tokens.begin(), sample.tokens.end(), bos));
+                require(bos_count <= 1, case_id + ": rendered chat sample contains duplicated BOS tokens");
+            }
         }
 #else
         (void) vocab;

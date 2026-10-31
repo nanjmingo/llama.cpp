@@ -1,4 +1,38 @@
-# QLoRA Precision Evaluation
+# QLoRA Evaluation Tools
+
+## Inspect rendered dataset samples
+
+`eval-qlora-dataset` reads one or more JSONL files using the training dataset
+reader, applies the model's embedded chat template using the training renderer,
+and tokenizes each rendered sample through the training tokenizer. It loads
+only model metadata and vocabulary (`vocab_only`); model weights and GPU layers
+are not loaded.
+
+The output file contains one section for each source record and rendered
+sample. It groups tokens into prompt/context and target-candidate sections,
+prints token IDs and sample-level supervision weights, and renders common
+special tokens as `<BOS>`, `<EOS>`, `<EOT>`, or `<SEP>`. Other control tokens use
+their vocabulary spelling. For `text` records, the first half of the first
+context window is shown as initial context; for prompt/completion and chat
+records, the token weights show the prompt/assistant-only mask used by training.
+The printed weights and roles are shown before overlap-window masking and
+per-window normalization.
+
+Build and run:
+
+```bash
+cmake --build build-qlora-test --target eval-qlora-dataset --parallel 2
+./build-qlora-test/bin/eval-qlora-dataset \
+  --model /path/to/model.gguf \
+  --input data/train.jsonl \
+  --input data/validation.jsonl \
+  --output data/rendered.txt \
+  --context-size 4096
+```
+
+The model argument is required because chat records use the template embedded
+in that GGUF. Non-chat records are rendered without a chat template, but still
+use the model vocabulary and tokenizer. `--input` may be repeated.
 
 ## Compare training activation precision
 

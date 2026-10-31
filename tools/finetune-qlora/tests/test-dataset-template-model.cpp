@@ -1,7 +1,48 @@
 #include "test-dataset-template-common.h"
 
+#include "dataset-tokenize.h"
+
 #include <exception>
 #include <memory>
+
+namespace {
+
+void check_sample_special_tokens(const llama_vocab * vocab, bool text_format) {
+    dataset_example example;
+    if (text_format) {
+        example = text_example{"A plain text sample."};
+    } else {
+        example = prompt_completion_example{"A prompt.", "A completion."};
+    }
+
+    const dataset_template_result rendered = render_dataset_example(example, nullptr);
+    qlora_template_test::require(rendered.examples.size() == 1,
+                                 "plain-text and prompt/completion records should render one sample");
+    training_sample sample;
+    std::string error;
+    qlora_template_test::require(
+        tokenize_rendered_example(vocab, rendered.examples.front(), sample, error),
+        "plain-text and prompt/completion tokenization failed: " + error);
+
+    const llama_token bos = llama_vocab_bos(vocab);
+    const std::vector<llama_token> automatic_special_tokens = common_tokenize(vocab, {}, true, false);
+    const size_t prefix_count = !automatic_special_tokens.empty() && automatic_special_tokens.front() == bos ? 1 : 0;
+    const auto suffix_begin = automatic_special_tokens.begin() + static_cast<std::ptrdiff_t>(prefix_count);
+    const size_t suffix_size = static_cast<size_t>(automatic_special_tokens.end() - suffix_begin);
+    const bool has_prefix = prefix_count == 0 || (!sample.tokens.empty() && sample.tokens.front() == bos);
+    const bool has_suffix = suffix_size == 0 ||
+        (sample.tokens.size() >= suffix_size &&
+         std::equal(suffix_begin, automatic_special_tokens.end(),
+                    sample.tokens.end() - static_cast<std::ptrdiff_t>(suffix_size)));
+    const size_t bos_count = static_cast<size_t>(std::count(sample.tokens.begin(), sample.tokens.end(), bos));
+    const size_t expected_bos_count = static_cast<size_t>(std::count(
+        automatic_special_tokens.begin(), automatic_special_tokens.end(), bos));
+    qlora_template_test::require(has_prefix && has_suffix && bos_count == expected_bos_count,
+                                 text_format ? "text tokenizer special tokens must wrap the sample exactly once" :
+                                               "prompt/completion tokenizer special tokens must wrap the sample exactly once");
+}
+
+}
 
 namespace {
 
@@ -47,8 +88,10 @@ int main(int argc, char ** argv) {
 
         std::cout << "Testing the model's embedded chat template with metadata and vocabulary only; model weights are not loaded.\n";
         common_chat_templates_ptr templates = common_chat_templates_init(model.get(), "");
-        return qlora_template_test::run_fixture_tests(
-            templates.get(), llama_model_get_vocab(model.get()), false);
+        const llama_vocab * vocab = llama_model_get_vocab(model.get());
+        check_sample_special_tokens(vocab, true);
+        check_sample_special_tokens(vocab, false);
+        return qlora_template_test::run_fixture_tests(templates.get(), vocab, false);
     } catch (const std::exception & error) {
         std::cerr << error.what() << '\n';
         return 1;

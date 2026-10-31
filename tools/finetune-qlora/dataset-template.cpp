@@ -61,14 +61,19 @@ std::vector<common_chat_msg> convert_messages(const std::vector<dataset_message>
 
 void append_chat_prompt(rendered_example & output, const common_chat_prompt & prompt, float loss_weight) {
     for (const common_chat_prompt_part & part : prompt.parts) {
-        output.pieces.push_back({part.text, !part.is_input, false, loss_weight});
+        output.pieces.push_back({part.text, !part.is_input, loss_weight});
     }
 }
 
 rendered_example render_prompt_response(const std::string & prompt, const std::string & response) {
     rendered_example output;
-    output.pieces.push_back({prompt, true, true, 0.0f});
-    output.pieces.push_back({response, true, false, 1.0f});
+    output.add_special = true;
+    if (prompt.empty()) {
+        output.pieces.push_back({response, true, 1.0f});
+    } else {
+        output.pieces.push_back({prompt, true, 0.0f});
+        output.pieces.push_back({response, true, 1.0f});
+    }
     return output;
 }
 
@@ -121,6 +126,8 @@ dataset_template_result render_dataset_example(const dataset_example & example,
         return result;
     }
     const auto & text = std::get<text_example>(example);
-    result.examples.push_back(render_prompt_response({}, text.text));
+    rendered_example rendered = render_prompt_response({}, text.text);
+    rendered.text_continuation = true;
+    result.examples.push_back(std::move(rendered));
     return result;
 }

@@ -78,6 +78,8 @@ After changing source code, repeat the aggregate build command and then the CTes
 
 The ordinary `test-qlora-dataset-template` test loads `data/templates/chatml.jinja` directly and passes it to llama.cpp's real chat-template engine. The `test-qlora-dataset-template-hf` test does the same for the checked-in Gemma 4 and Qwen templates, checking prompt/target boundaries without requiring model weights.
 
+The model-backed test also tokenizes plain-text and prompt/completion samples with the actual GGUF vocabulary and asserts that automatic tokenizer special tokens wrap the sample once, rather than being inserted at the prompt/completion boundary. It also checks that chat rendering does not produce duplicated BOS tokens. String-only template tests cannot observe these token-level boundaries.
+
 To additionally check the template stored in a real GGUF file, run the separate utility manually:
 
 ```bash
@@ -90,6 +92,8 @@ The utility uses only the template embedded in the GGUF metadata; it does not ac
 This utility enables `vocab_only`, so it loads model metadata and vocabulary but not the model weights. It uses the GGUF vocabulary to test tokenization and token/weight alignment. Build it directly with `cmake --build build-qlora-test --target test-qlora-dataset-template-model`; it is excluded from the default `all` and `qlora-tests` targets, included in `qlora-model-tests`, and not registered with CTest because it requires a user-supplied local model file.
 
 The model-backed utility prints a `[PASS]` line for each fixture. Its output can include metadata and vocabulary loading logs; use the model-free test when changing or debugging template rendering itself.
+
+For a complete JSONL inspection that uses the training reader, renderer, and tokenizer, build and run `eval-qlora-dataset` as documented in [`eval/README.md`](../eval/README.md). The tool writes decoded token pieces and visible special-token markers to a text file, making the exact per-record training sequence inspectable.
 
 
 ## Run the model-backed CPU training integration test

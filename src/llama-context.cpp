@@ -4182,7 +4182,7 @@ void llama_context::opt_epoch_iter(
                 for (uint32_t pos_ubatch = 0; pos_ubatch < n_ubatch; ++pos_ubatch) {
                     const uint32_t ilabel = pos_ctx + pos_batch + pos_ubatch;
                     const float weight = label_weights[ilabel];
-                    GGML_ASSERT(std::isfinite(weight) && weight >= 0.0f && weight <= 1.0f);
+                    GGML_ASSERT(std::isfinite(weight) && weight >= 0.0f);
                     if (labels_sparse[ilabel] < 0 || weight <= 0.0f) continue;
                     GGML_ASSERT(labels_sparse[ilabel] < labels->ne[0]);
                     const size_t offset = (static_cast<size_t>(pos_ubatch) * labels->ne[0] +

@@ -1026,7 +1026,7 @@ bool get_window_training_statistics(const save_context & state,
             continue;
         }
         const float weight = weight_data ? weight_data[i] : 1.0f;
-        if (!std::isfinite(weight) || weight < 0.0f || weight > 1.0f) {
+        if (!std::isfinite(weight) || weight < 0.0f) {
             return false;
         }
         if (weight > 0.0f) {

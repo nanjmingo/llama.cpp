@@ -364,12 +364,14 @@ default; `--fail-on-invalid-records` stops loading at the first such record.
 Template-rendering and tokenization failures are reported separately and are
 still skipped.
 
-Internally each token has a float weight. At this stage, weight `0` is converted
-to the existing `-1` label mask; any positive weight is treated as ordinary
-weight `1` by the current backend. Fractional weighted loss is reserved for a
-future backend change. Samples shorter than the context length are padded, and
-overlap labels are masked only where the target was already covered by an
-earlier window.
+Each token has a float supervision weight. A weight of `0` masks that token as
+a target; positive weights contribute to the loss. For each training window,
+positive weights are normalized so their sum equals the context length. This
+makes the existing cross-entropy reduction over all context positions equivalent
+to a mean over supervised target tokens, including assistant-only samples.
+Samples shorter than the context length and trailing partial windows are
+right-padded. Targets already covered by an earlier overlapping window are
+masked to avoid duplicate training.
 
 
 **Chat format** (each assistant turn is trained as its own sample; earlier conversation turns remain masked context):
@@ -382,9 +384,33 @@ earlier window.
 {"prompt": "What is the capital of France?", "completion": "Paris."}
 ```
 
-**Plain text** (all text tokens receive non-zero weight):
+**Plain text** (the first half of the first context window is context; the
+remaining tokens are prediction targets. Later windows train only targets not
+already covered by an earlier window):
 ```json
 {"text": "The quick brown fox."}
+```
+
+For `text` records, the initial context mask is applied only to the first
+window. For `prompt/completion` and chat records, the prompt or non-assistant
+content is masked and all completion or assistant-target tokens are trained;
+there is no additional first-half mask. Automatic tokenizer special tokens are
+added once per rendered sample, not once per prompt/completion piece.
+
+### Inspect rendered dataset samples
+
+`eval-qlora-dataset` uses the same JSONL reader, model chat-template renderer,
+and tokenizer functions as training. It loads model metadata and vocabulary
+only, then writes one rendered/tokenized sample per record to a text file.
+Special tokens such as BOS, EOS, and EOT are shown with readable markers.
+
+```bash
+cmake --build build-qlora-test --target eval-qlora-dataset --parallel 2
+./build-qlora-test/bin/eval-qlora-dataset \
+  --model /path/to/model.gguf \
+  --input data/train.jsonl \
+  --output data/train-rendered.txt \
+  --context-size 4096
 ```
 
 ### Verify and use the adapter
