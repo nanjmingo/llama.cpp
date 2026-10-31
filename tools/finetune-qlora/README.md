@@ -74,12 +74,12 @@ These are shared llama.cpp model and execution parameters.
 
 | Parameter | Default | Description |
 |---|---|---|
-| `--model` | *(required)* | Path to the quantized GGUF base model |
+| `-m` / `--model` | *(required)* | Path to the quantized GGUF base model |
 | `-t` / `--threads` | common default | CPU thread count; also used for JSONL parsing and tokenization |
 | `-c` / `--ctx-size` | `512` | Training context window (tokens) |
 | `-b` / `--batch-size` | `2048` | Must be at least `-c`; causal models clamp the effective batch size to `-c` |
 | `-ub` / `--ubatch-size` | `512` | Must equal `-c`; with causal attention, the effective sizes satisfy `n_ubatch == n_batch == n_ctx` |
-| `-ngl` | `999` | Number of GPU layers to offload |
+| `-ngl` / `--gpu-layers` / `--n-gpu-layers` | `999` | Number of GPU layers to offload |
 | `-ctk` / `--cache-type-k` | `f32` | K cache storage type; accepts the KV cache types supported by llama.cpp, including `q8_0` |
 | `-ctv` / `--cache-type-v` | `f32` | V cache storage type; accepts the KV cache types supported by llama.cpp, including `q8_0` |
 
@@ -118,7 +118,7 @@ These are shared llama.cpp model and execution parameters.
 | `--warmup-init-ratio` | `0.1` | Initial warmup LR as a fraction of peak LR; must be in `(0, 1]` |
 | `-lr-min` / `--learning-rate-min` | `-1` | Cosine floor; values below 0 use 0 |
 | `-decay-epochs` / `--learning-rate-decay-epochs` | `-1` | For the constant scheduler, decay toward `--learning-rate-min` over N epochs; takes effect when the minimum is positive and below the base learning rate; ignored by the cosine scheduler |
-| `--seed` | `42` | Random seed for LoRA initialization |
+| `-s` / `--seed` | `42` | Random seed for LoRA initialization |
 
 #### Output params
 
