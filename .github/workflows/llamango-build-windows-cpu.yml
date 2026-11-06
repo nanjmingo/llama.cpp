@@ -177,7 +177,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
           @(
             "CCACHE_DIR=$cacheDir"
-            "CCACHE_MAXSIZE=4G"
+            "CCACHE_MAXSIZE=2G"
             "CCACHE_BASEDIR=$env:GITHUB_WORKSPACE"
             "CCACHE_COMPILERCHECK=content"
           ) | ForEach-Object { Add-Content -Path $env:GITHUB_ENV -Value $_ }
