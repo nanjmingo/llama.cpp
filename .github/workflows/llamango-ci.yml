@@ -1,6 +1,6 @@
 name: Llamango CI & Prerelease
 
-run-name: CI | ${{ github.ref_name }} | ${{ github.event.head_commit.timestamp }}
+run-name: CI | ${{ github.event.head_commit.timestamp }} | ${{ github.ref_name }}
 
 on:
   push:
