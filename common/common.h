@@ -447,6 +447,7 @@ struct lr_opt {
     unsigned epoch; // set by optimizer outer (epochs) loop
     // learning rate decay - constant LR per epoch only for now
     float get_lr(float e) const;
+    float get_lr(float e, bool log) const;
     float get_lr() const { return get_lr(epoch); }
     // must call after arg parse, before get_lr
     void init();
@@ -580,6 +581,7 @@ struct common_params {
     bool ctx_shift         = false; // context shift on infinite text generation
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
+    bool no_alloc_kv_cache = false; // skip KV data buffer allocation for full-context training
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool verbose_prompt    = false; // print prompt tokens before generation

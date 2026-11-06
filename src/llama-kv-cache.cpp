@@ -79,10 +79,12 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-               const char * name_tag) :
+               const char * name_tag,
+               bool no_alloc_kv_cache) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_swa(n_swa),
-    attn_rot_bufs(no_alloc), swa_type(swa_type), ctxs_bufs(no_alloc),
+    attn_rot_bufs(no_alloc), swa_type(swa_type),
+    no_alloc_kv_cache_data(no_alloc_kv_cache), ctxs_bufs(no_alloc || no_alloc_kv_cache),
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl) {
@@ -279,7 +281,9 @@ llama_kv_cache::llama_kv_cache(
         LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
     }
 
-    {
+    if (no_alloc_kv_cache_data) {
+        LLAMA_LOG_INFO("%s: KV cache data allocation is disabled for training\n", __func__);
+    } else {
         const size_t memory_size_k = size_k_bytes();
         const size_t memory_size_v = size_v_bytes();
 
@@ -301,10 +305,12 @@ llama_kv_cache::llama_kv_cache(
         //   the model setting, for the contexts of one model - see llama_model_set_attn_rot
         const char * env_rot_disable = getenv("LLAMA_ATTN_ROT_DISABLE");
 
-        const bool attn_rot_disable = !model.attn_rot || (env_rot_disable != nullptr && atoi(env_rot_disable) != 0);
+        const bool attn_rot_disable = no_alloc_kv_cache_data || !model.attn_rot ||
+            (env_rot_disable != nullptr && atoi(env_rot_disable) != 0);
         if (attn_rot_disable) {
-            LLAMA_LOG_INFO("%s: attention rotation force disabled (%s)\n", __func__,
-                    model.attn_rot ? "LLAMA_ATTN_ROT_DISABLE" : "llama_model_set_attn_rot");
+            const char * reason = no_alloc_kv_cache_data ? "KV cache data allocation is disabled for training" :
+                model.attn_rot ? "LLAMA_ATTN_ROT_DISABLE" : "llama_model_set_attn_rot";
+            LLAMA_LOG_INFO("%s: attention rotation force disabled (%s)\n", __func__, reason);
         }
 
         bool attn_rot_k =
@@ -314,9 +320,10 @@ llama_kv_cache::llama_kv_cache(
             hparams.n_embd_head_k() % 64 == 0;
 
         // always create Hadamard rotation tensors for DeepSeek lightning indexers
-        if ((model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4 ||
-                model.arch == LLM_ARCH_GLM_DSA || model.arch == LLM_ARCH_DOTS3NOTE ||
-                model.arch == LLM_ARCH_MISTRAL_LARGE4) &&
+        if (!no_alloc_kv_cache_data &&
+                (model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4 ||
+                 model.arch == LLM_ARCH_GLM_DSA || model.arch == LLM_ARCH_DOTS3NOTE ||
+                 model.arch == LLM_ARCH_MISTRAL_LARGE4) &&
                 hparams.n_embd_head_k_full == hparams.indexer_head_size) {
             attn_rot_k = true;
         }
@@ -740,7 +747,9 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
-    auto ret = ctxs_bufs.memory_breakdown();
+    auto ret = no_alloc_kv_cache_data
+        ? std::map<ggml_backend_buffer_type_t, size_t>()
+        : ctxs_bufs.memory_breakdown();
 
     for (const auto & [buft, size] : attn_rot_bufs.memory_breakdown()) {
         ret[buft] += size;
