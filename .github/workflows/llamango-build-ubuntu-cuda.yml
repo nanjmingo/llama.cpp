@@ -75,7 +75,6 @@ jobs:
             -DLLAMA_BUILD_SERVER=ON
             -DLLAMA_BUILD_APP=ON
             -DLLAMA_FATAL_WARNINGS=ON
-            -DCMAKE_CUDA_ARCHITECTURES=89-real
             -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined
             -DGGML_NATIVE=OFF
             -DGGML_CPU=ON
