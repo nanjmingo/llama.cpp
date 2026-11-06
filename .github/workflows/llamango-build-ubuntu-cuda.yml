@@ -110,7 +110,6 @@ jobs:
           OS: Ubuntu 22.04
           CUDA Toolkit: ${CUDA_VERSION}
           CUDA Display Version: ${CUDA_DISPLAY_VERSION}
-          CUDA Architecture: 89
           Backend: CUDA
           Build scope: all default CMake targets plus llamango-tests
           Build type: Release
