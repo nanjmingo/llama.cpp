@@ -459,6 +459,21 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return src1->type == GGML_TYPE_F32 ||
                    src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type ||
                    (src1->type == GGML_TYPE_BF16 && ggml_get_type_traits_cpu(src0->type)->vec_dot_type == GGML_TYPE_F32);
+        case GGML_OP_MUL_MAT_ID: {
+            const enum ggml_prec src1_prec = ggml_prec_get_src(op, 1);
+            if (src1_prec != GGML_PREC_F32 && src1_prec != GGML_PREC_BF16) {
+                return true;
+            }
+
+            // The high-precision MUL_MAT_ID path dequantizes both rows to F32
+            // and uses the F32 dot kernel. Reject only types that cannot be
+            // represented by the generic row-to-F32 conversion API.
+            const bool src0_convertible =
+                src0->type == GGML_TYPE_F32 || ggml_get_type_traits(src0->type)->to_float != nullptr;
+            const bool src1_convertible =
+                src1->type == GGML_TYPE_F32 || ggml_get_type_traits(src1->type)->to_float != nullptr;
+            return src0_convertible && src1_convertible;
+        }
         case GGML_OP_SOFT_MAX_BACK: {
             if (op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32) {
                 return false;
@@ -477,6 +492,18 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return (src0->type == GGML_TYPE_F32 ||
                     ((src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && src0->ne[2] == src1->ne[2] && src0->ne[3] == src1->ne[3])) &&
                 src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+        case GGML_OP_OUT_PROD_ID:
+            return op->src[0] != nullptr && op->src[1] != nullptr && op->src[2] != nullptr
+                && op->type        == GGML_TYPE_F32
+                && op->src[0]->type == GGML_TYPE_F32
+                && op->src[1]->type == GGML_TYPE_F32
+                && op->src[2]->type == GGML_TYPE_I32;
+        case GGML_OP_MUL_MAT_ID_BACK:
+            return op->src[0] != nullptr && op->src[1] != nullptr && op->src[2] != nullptr && op->src[3] != nullptr
+                && op->type == GGML_TYPE_F32
+                && (op->src[0]->type == GGML_TYPE_F32 || ggml_get_type_traits(op->src[0]->type)->to_float != nullptr)
+                && op->src[1]->type == GGML_TYPE_F32
+                && op->src[2]->type == GGML_TYPE_I32;
         case GGML_OP_CONV_2D:
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_SSM_SCAN:
