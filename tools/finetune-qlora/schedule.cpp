@@ -13,7 +13,10 @@ float qlora_lr_schedule::get_lr() const {
     }
 
     if (type != "cosine" || total_steps <= warmup_steps) {
-        return lr->get_lr(lr->epoch, false);
+        const float epoch = static_cast<float>(lr->epoch);
+        return lr->lr_min <= 0.0f ? lr->lr0 :
+            epoch >= lr->decay_epochs ? lr->lr_min :
+            lr->lr0 * std::pow(0.5f, epoch * lr->scale_epoch);
     }
 
     const float min_lr = std::max(0.0f, lr->lr_min);
