@@ -244,6 +244,146 @@ jobs:
           $ninja = Get-Command ninja -ErrorAction Stop
           & $ninja.Source --version
 
+      - name: Prepare LLVM OpenMP runtime
+        shell: pwsh
+        env:
+          TARGET_ARCHITECTURE: ${{ inputs.architecture }}
+        run: |
+          $version = '20.1.8'
+          switch ($env:TARGET_ARCHITECTURE) {
+            'x64' {
+              $openmpArch = 'x64'
+              $installerSuffix = 'win64'
+              $installerSha256 = '3197846a2b19063687dd56e93e34cd941e3548d907f23a6131571321bdf9fe7b'
+            }
+            'arm64' {
+              $openmpArch = 'arm64'
+              $installerSuffix = 'woa64'
+              $installerSha256 = '7c4ac97eb2ae6b960ca5f9caf3ff6124c8d2a18cc07a7840a4d2ea15537bad8e'
+            }
+            default {
+              throw "Unsupported Windows architecture: $env:TARGET_ARCHITECTURE"
+            }
+          }
+
+          # GGML_OPENMP_FETCH looks for these files before attempting its own
+          # CMake file(DOWNLOAD). Pre-populate that directory and retry the
+          # GitHub asset request here, validating all downloaded content.
+          $root = Join-Path $env:GITHUB_WORKSPACE "build/_deps/llvm-openmp-$version-$openmpArch"
+          $libraryDir = Join-Path $root 'lib'
+          $runtimeDir = Join-Path $root 'bin'
+          $includeDir = Join-Path $root 'include'
+          $libraryPath = Join-Path $libraryDir 'libomp.lib'
+          $runtimePath = Join-Path $runtimeDir 'libomp.dll'
+          $headerPath = Join-Path $includeDir 'omp.h'
+
+          $runtimeFilesPresent = (Test-Path -LiteralPath $libraryPath) -and
+            (Test-Path -LiteralPath $runtimePath) -and
+            (Test-Path -LiteralPath $headerPath)
+
+          if (-not $runtimeFilesPresent) {
+            $installerName = "LLVM-$version-$installerSuffix.exe"
+            $installerPath = Join-Path $env:RUNNER_TEMP $installerName
+            $installerUrl = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/$installerName"
+            $downloadInstaller = $true
+
+            if (Test-Path -LiteralPath $installerPath) {
+              $existingHash = (Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+              if ($existingHash -eq $installerSha256) {
+                $downloadInstaller = $false
+              }
+            }
+
+            if ($downloadInstaller) {
+              Remove-Item -LiteralPath $installerPath -Force -ErrorAction SilentlyContinue
+              $downloaded = $false
+              for ($attempt = 1; $attempt -le 4; $attempt++) {
+                try {
+                  Write-Host "Downloading $installerName (attempt $attempt/4)"
+                  Invoke-WebRequest -Uri $installerUrl -OutFile $installerPath -MaximumRedirection 10 -TimeoutSec 1800
+                  $actualHash = (Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+                  if ($actualHash -ne $installerSha256) {
+                    throw "LLVM installer SHA-256 mismatch: $actualHash"
+                  }
+                  $downloaded = $true
+                  break
+                }
+                catch {
+                  Remove-Item -LiteralPath $installerPath -Force -ErrorAction SilentlyContinue
+                  if ($attempt -eq 4) {
+                    throw
+                  }
+                  Write-Warning "LLVM installer download failed: $_"
+                  Start-Sleep -Seconds (5 * $attempt)
+                }
+              }
+              if (-not $downloaded) {
+                throw "Failed to download and verify $installerName"
+              }
+            }
+
+            New-Item -ItemType Directory -Force -Path $libraryDir, $runtimeDir, $includeDir | Out-Null
+            $extractDir = Join-Path $root 'extract'
+            Remove-Item -LiteralPath $extractDir -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
+
+            $sevenZip = Get-Command 7z -CommandType Application -ErrorAction Stop
+            & $sevenZip.Source e -y "-o$extractDir" $installerPath -r libomp.lib libomp.dll omp.h
+            if ($LASTEXITCODE -ne 0) {
+              throw "Failed to extract LLVM OpenMP files (7-Zip exit code $LASTEXITCODE)"
+            }
+
+            foreach ($fileName in @('libomp.lib', 'libomp.dll', 'omp.h')) {
+              $extractedPath = Join-Path $extractDir $fileName
+              if (-not (Test-Path -LiteralPath $extractedPath -PathType Leaf)) {
+                throw "LLVM installer did not contain required OpenMP file: $fileName"
+              }
+            }
+
+            Copy-Item -LiteralPath (Join-Path $extractDir 'libomp.lib') -Destination $libraryPath -Force
+            Copy-Item -LiteralPath (Join-Path $extractDir 'libomp.dll') -Destination $runtimePath -Force
+            Copy-Item -LiteralPath (Join-Path $extractDir 'omp.h') -Destination $headerPath -Force
+            Remove-Item -LiteralPath $extractDir -Recurse -Force
+          }
+
+          # CMake also downloads this license when GGML_OPENMP_FETCH is enabled.
+          # Fetch it here through PowerShell and verify the upstream-pinned hash.
+          $licensePath = Join-Path $root 'LICENSE.TXT'
+          $licenseSha256 = 'fdad1758a9e1f9d5a81e18879b3406772115edc92c24bfa36b70c654f325e8e4'
+          $licenseValid = $false
+          if (Test-Path -LiteralPath $licensePath) {
+            $licenseHash = (Get-FileHash -LiteralPath $licensePath -Algorithm SHA256).Hash.ToLowerInvariant()
+            $licenseValid = $licenseHash -eq $licenseSha256
+          }
+          if (-not $licenseValid) {
+            $licenseUrl = "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-$version/openmp/LICENSE.TXT"
+            $licenseDownloaded = $false
+            for ($attempt = 1; $attempt -le 4; $attempt++) {
+              try {
+                Invoke-WebRequest -Uri $licenseUrl -OutFile $licensePath -MaximumRedirection 10 -TimeoutSec 120
+                $actualLicenseHash = (Get-FileHash -LiteralPath $licensePath -Algorithm SHA256).Hash.ToLowerInvariant()
+                if ($actualLicenseHash -ne $licenseSha256) {
+                  throw "LLVM OpenMP license SHA-256 mismatch: $actualLicenseHash"
+                }
+                $licenseDownloaded = $true
+                break
+              }
+              catch {
+                Remove-Item -LiteralPath $licensePath -Force -ErrorAction SilentlyContinue
+                if ($attempt -eq 4) {
+                  throw
+                }
+                Write-Warning "LLVM OpenMP license download failed: $_"
+                Start-Sleep -Seconds (5 * $attempt)
+              }
+            }
+            if (-not $licenseDownloaded) {
+              throw 'Failed to download and verify the LLVM OpenMP license'
+            }
+          }
+
+          Write-Host "Prepared LLVM OpenMP $version for $openmpArch"
+
       - name: Configure full CPU build
         shell: pwsh
         env:
