@@ -1489,7 +1489,7 @@ bool train_adapter(const qlora_params & qparams,
             window_end + std::min<int64_t>(qparams.val_windows, dataset_windows - window_end);
         save_state.validation_window_start = window_end;
         save_state.validation_progress_started = false;
-        llama_opt_epoch_range_with_eval_end(ctx, dataset.get(), result_train.get(), result_eval.get(),
+        llama_opt_epoch_range(ctx, dataset.get(), result_train.get(), result_eval.get(),
                                             window_start, window_end, eval_end,
                                             train_callback, qlora_epoch_callback_progress_line);
         std::fprintf(stderr, "\n");

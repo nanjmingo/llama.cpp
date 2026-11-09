@@ -446,8 +446,7 @@ struct lr_opt {
 
     unsigned epoch; // set by optimizer outer (epochs) loop
     // learning rate decay - constant LR per epoch only for now
-    float get_lr(float e) const;
-    float get_lr(float e, bool log) const;
+    float get_lr(float e, bool log = true) const;
     float get_lr() const { return get_lr(epoch); }
     // must call after arg parse, before get_lr
     void init();

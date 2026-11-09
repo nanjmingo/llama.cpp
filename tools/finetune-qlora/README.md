@@ -553,11 +553,11 @@ Development investigations are documented separately in [notes/](notes/), one re
 | File | Change |
 |---|---|
 | `ggml/src/ggml.c` | Backward graph fixes: `GET_ROWS` 3D, `SET_ROWS`, `MUL_MAT_ID`, `SSM_SCAN/CONV`, `FLASH_ATTN_EXT` now propagates gradients through Q/K/V and optional attention sinks; inplace-op assert → warn+skip |
-| `src/llama-context.cpp` | Preserves exact context capacity for full-context training; `opt_init`: scheduler and graph sizing, shared-KV LoRA gradient warning; `opt_epoch_iter`: per-window timing and accumulation-group selection |
+| `src/llama-context.cpp` | Preserves exact context capacity for full-context training; `opt_init`: scheduler and graph sizing, shared-KV LoRA gradient warning; `opt_epoch_iter`: metadata-context reuse and accumulation-group selection |
 | `src/llama-adapter.cpp` | Repack-buft fallback for LoRA tensors: tries device-native buft before CPU |
 | `common/common.h`, `common/arg.cpp` | Removed the old QLoRA-only parameter fields and CLI registrations; QLoRA options are now local to the example |
 | `tools/finetune-qlora/args.cpp` | Parses QLoRA-only CLI flags locally; no QLoRA option registration is needed in `common/arg.cpp` |
-| `include/llama.h` | Exposes `llama_opt_dataset_shuffle()` so callers control per-epoch shuffling; `llama_opt_epoch()` no longer owns shuffle policy; added `llama_opt_epoch_range()` |
+| `include/llama.h` | Exposes `llama_opt_dataset_shuffle()` so callers control per-epoch shuffling; `llama_opt_epoch()` no longer owns shuffle policy; added `llama_opt_epoch_range()` with an explicit evaluation-range end |
 | `ggml/src/ggml-cuda/out-prod.cu` | CUDA `OUT_PROD` with quantized src0 (dequantize on GPU + cuBLAS); `OUT_PROD_ID` for MoE backward |
 | `ggml/src/ggml-cuda/ggml-cuda.cu` | `supports_op` for quantized `OUT_PROD` and `OUT_PROD_ID`; CPU-resident ids fix in `mul_mat_id` |
 

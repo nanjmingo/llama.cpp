@@ -216,7 +216,6 @@ struct llama_context {
     size_t opt_state_size() const;
     bool opt_state_export(void * data, size_t size) const;
     bool opt_state_import(const void * data, size_t size);
-    void opt_reset(bool recreate);
     void opt_dataset_shuffle(ggml_opt_dataset_t dataset, int64_t idata);
 
     // TODO: more flexible combinations of logical/physical batch size and context size
@@ -425,9 +424,6 @@ private:
     ggml_opt_context_t opt_ctx = nullptr;
     int32_t opt_accumulation_period = 0;
     std::unordered_set<const ggml_tensor *> opt_lora_grad_warned;
-    // Saved init arguments used to recreate opt_ctx on optimizer reset.
-    struct llama_model * opt_model = nullptr;
-    struct llama_opt_params opt_params {};
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;

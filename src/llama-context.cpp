@@ -4100,9 +4100,6 @@ static void llama_warn_shared_kv_lora_gradients(const llama_model & model, const
 
 void llama_context::opt_init(struct llama_model * model, struct llama_opt_params lopt_params) {
     GGML_ASSERT(!opt_ctx);
-    opt_lora_grad_warned.clear();
-    opt_model  = model;
-    opt_params = lopt_params;
     cparams.pipeline_parallel = false;
     model->hparams.n_ctx_train = lopt_params.n_ctx_train > 0 ? lopt_params.n_ctx_train : n_ctx();
     const uint32_t n_batch     = std::min(this->n_batch(),  model->hparams.n_ctx_train);
@@ -4240,18 +4237,6 @@ void llama_context::opt_set_grad_stats_interval(int32_t interval) {
     ggml_opt_set_grad_stats_interval(opt_ctx, interval);
 }
 
-void llama_context::opt_reset(bool recreate) {
-    GGML_ASSERT(opt_ctx);
-    if (recreate) {
-        GGML_ASSERT(opt_model);
-        ggml_opt_free(opt_ctx);
-        opt_ctx = nullptr;
-        opt_init(opt_model, opt_params);
-    } else {
-        ggml_opt_reset(opt_ctx, recreate);
-    }
-}
-
 void llama_context::opt_dataset_shuffle(ggml_opt_dataset_t dataset, int64_t idata) {
     GGML_ASSERT(opt_ctx);
     ggml_opt_dataset_shuffle(opt_ctx, dataset, idata);
@@ -4318,7 +4303,6 @@ void llama_context::opt_epoch_iter(
         };
 
         uint32_t pos_batch = 0;
-        static bool timings_printed = false;  // print per-ubatch timings only for the first window
         struct ggml_context * ctx_compute_opt = nullptr;
         do {
             const auto & ubatch = mctx->get_ubatch();
@@ -4332,7 +4316,6 @@ void llama_context::opt_epoch_iter(
 
             auto * res = get_gf_res_prev();
 
-            const int64_t t0_build = ggml_time_ms();
             const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type), true);
 
             // the optimizer graph is allocated outside sched, so the next decode must rebuild
@@ -4353,15 +4336,10 @@ void llama_context::opt_epoch_iter(
                     /*.no_alloc   =*/ true,
                 };
                 ctx_compute_opt = ggml_init(params);
-                if (!timings_printed) {
-                    LLAMA_LOG_INFO("%s: [timing] graph capacity=%zu n_nodes=%d size_meta=%.1fMB\n", __func__,
-                            size_gf, ggml_graph_n_nodes(gf), (double)size_meta / (1024*1024));
-                }
             } else {
                 ggml_reset(ctx_compute_opt);
             }
 
-            const int64_t t1_alloc = ggml_time_ms();
             ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
             ggml_opt_alloc(opt_ctx, train);
             if (train) {
@@ -4384,7 +4362,6 @@ void llama_context::opt_epoch_iter(
                 }
             }
 
-            const int64_t t2_inputs = ggml_time_ms();
             res->set_inputs(&ubatch);
             {
                 struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
@@ -4419,20 +4396,7 @@ void llama_context::opt_epoch_iter(
 
             copy_experts.reset();
 
-            const int64_t t3_eval = ggml_time_ms();
             ggml_opt_eval(opt_ctx, result);
-
-            const int64_t t4_done = ggml_time_ms();
-            if (!timings_printed) {
-                LLAMA_LOG_INFO("%s: [timing] build=%" PRId64 "ms alloc=%" PRId64 "ms inputs=%" PRId64 "ms eval=%" PRId64 "ms total=%" PRId64 "ms\n",
-                        __func__,
-                        t1_alloc - t0_build,
-                        t2_inputs - t1_alloc,
-                        t3_eval - t2_inputs,
-                        t4_done - t3_eval,
-                        t4_done - t0_build);
-                timings_printed = true;
-            }
 
             if (callback) {
                 callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_ubatch + 1, ndata_in_loop, t_loop_start);
@@ -5320,10 +5284,6 @@ bool llama_opt_state_import(struct llama_context * ctx, const void * data, size_
     return ctx && ctx->opt_state_import(data, size);
 }
 
-void llama_opt_reset(struct llama_context * ctx, bool recreate) {
-    ctx->opt_reset(recreate);
-}
-
 void llama_opt_dataset_shuffle(
         struct llama_context * ctx,
         ggml_opt_dataset_t     dataset,
@@ -5351,26 +5311,6 @@ void llama_opt_epoch(
 }
 
 void llama_opt_epoch_range(
-        struct llama_context    * ctx,
-        ggml_opt_dataset_t        dataset,
-        ggml_opt_result_t         result_train,
-        ggml_opt_result_t         result_eval,
-        int64_t                   idata_start,
-        int64_t                   idata_split,
-        ggml_opt_epoch_callback   callback_train,
-        ggml_opt_epoch_callback   callback_eval) {
-    ctx->opt_epoch(
-        dataset,
-        result_train,
-        result_eval,
-        idata_start,
-        idata_split,
-        ggml_opt_dataset_ndata(dataset),
-        callback_train,
-        callback_eval);
-}
-
-void llama_opt_epoch_range_with_eval_end(
         struct llama_context    * ctx,
         ggml_opt_dataset_t        dataset,
         ggml_opt_result_t         result_train,

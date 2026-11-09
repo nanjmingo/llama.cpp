@@ -2168,10 +2168,6 @@ void lr_opt::init() {
     }
 }
 
-float lr_opt::get_lr(float epoch) const {
-    return get_lr(epoch, true);
-}
-
 float lr_opt::get_lr(float epoch, bool log) const {
     float r = lr_min <= 0 ? lr0 :
         epoch >= decay_epochs ? lr_min :
