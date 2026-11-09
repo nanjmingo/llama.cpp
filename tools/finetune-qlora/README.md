@@ -2,7 +2,7 @@
 
 Native QLoRA SFT training pipeline for quantized GGUF models.
 
-The base model weights remain **frozen** (quantized tensors are skipped by `llama_set_param` because they are not `GGML_TYPE_F32`). LoRA A/B tensors are stored in the selected type (`F32`, `F16`, or `BF16`) and updated with F32 gradients. The saved adapter GGUF is directly compatible with the existing `llama_adapter_lora_init` loader and `llama-export-lora` merge tool.
+The base model weights remain **frozen**; training updates only the LoRA adapter weights. LoRA A/B tensors can be stored as `F32`, `F16`, or `BF16` and are updated using F32 gradients. The saved adapter GGUF is compatible with the standard llama.cpp LoRA loader and `llama-export-lora` merge tool.
 
 **Status:** QLoRA SFT is implemented and functional. Training speed is currently limited by full backprop through quantized weights — see [Known Limitations](#known-limitations).
 
@@ -288,19 +288,8 @@ optimizer-update boundaries only; incomplete accumulated gradients are not
 serialized. Reduced-precision optimizer-state storage can change the optimizer's numeric
 trajectory and should be benchmarked against F32. F16 and BF16 use 16-bit values.
 
-The JSONL reader processes up to 128 records per batch. This is deliberately not
-one blocking `parallel_for()` call per record: the thread pool executes a single
-task synchronously, so one-record batches would usually remove parallelism from
-JSON parsing and tokenization while increasing synchronization overhead. Reducing
-memory further would require a bounded asynchronous pipeline rather than simply
-reducing the batch size to one.
-
-The QLoRA-specific command-line options are parsed in `args.cpp`, rather
-than registered in `common/arg.cpp`. JSONL parsing and tokenization use the
-shared `-t` / `--threads` setting and can run in parallel; chat-template
-rendering remains sequential. Chat records use the template embedded in the
-model metadata. If the model has no chat template, chat records cannot be
-rendered; no fallback template is applied.
+Chat records require a chat template in the model metadata. If the model does
+not provide one, chat records cannot be rendered; no fallback template is applied.
 
 ### Full-context memory requirements
 
@@ -492,84 +481,34 @@ vector.
 
 ---
 
-## Known Limitations & Optimization Roadmap
-
-### Current limitations
+## Known Limitations
 
 **1. Gemma 4 E2B/E4B Shared KV**
-QLoRA training is currently unsupported for Gemma 4 E2B/E4B models that use Shared KV. In
-`llm_graph_input_attn_kv_iswa`, a layer that produces K/V uses its current `k_cur` and
-`v_cur` tensors during training. A layer that reuses K/V has no such tensors and reads the
-KV-cache backing tensors through `ggml_view_4d()`. The cache is updated with
-`GGML_OP_SET_ROWS`, which writes the source K/V values into cache rows but has no backward
-path from the cache destination to those source values. The cache read is a view of the
-cache tensor, not a `GET_ROWS` operation whose backward pass could reconnect it to the
-`SET_ROWS` source. Consequently, gradients contributed by shared-KV attention layers do
-not reach the layer that produced those K/V tensors, and upstream trainable adapters can
-miss part of their gradient. The forward pass may run, but the resulting training graph
-has incomplete gradients and must be treated as unsupported. QLoRA detects trainable LoRA
-K/V projections used by shared attention layers during optimizer initialization and emits
-a warning for each affected projection. This warning is diagnostic only; it does not make
-the gradients complete. Using the full-context setting (`-ub == -c`) does not resolve this
-limitation.
 
-A correct fix must preserve the differentiable K/V dependency across layers. Simply
-retaining and reusing the producer tensors is not sufficient for layer-split multi-GPU
-execution, where producer and consumer layers may be placed on different devices. A
-backend-aware cross-device path has not been implemented or validated.
+QLoRA training is not supported for Gemma 4 E2B/E4B models that use Shared KV.
+The training graph does not currently propagate all gradients through shared K/V
+attention. Training may run, but the resulting adapter can be incorrect. A warning
+about affected LoRA projections is diagnostic only; it does not make this model
+configuration supported. Using full-context training (`-ub == -c`) does not remove
+this limitation.
 
-**2. Full backprop through frozen quantized layers**
-Every backward step dequantizes all frozen Q4_K_M weight tensors to compute activation gradients (needed to propagate loss from the output back to each LoRA layer). For a 28-layer 1.7B model at `-c 512`, this is ~280 dequantizing matmuls per update window → step time is 3–5× slower than inference.
+**2. Training speed**
 
-**3. Activation VRAM**
-All forward activations are kept in VRAM throughout the backward pass. VRAM ≈ `model + KV + n_layers × hidden × n_ctx × 10 × 4B + 2 × lora_params × 4B`. Reducing `-c` reduces activation memory; gradient accumulation does not lower the memory required by one window.
+Backward propagation must pass through frozen quantized model weights to calculate
+gradients for LoRA layers. This requires additional dequantizing matrix operations
+and can make training substantially slower than inference. The cost depends on the
+model, context length, and backend.
 
-**4. Full backprop through all layers** *(partially addressed by `--freeze-layers`)*
-Gradients propagate through all layers that have LoRA adapters. Use `--freeze-layers N` to skip LoRA allocation for blk.0..N-1 — those layers receive no gradient (the `grads_needed` pruner already skips their backward ops automatically). Only the top (total_layers - N) layers are trained.
+**3. Activation memory**
 
-### Optimization roadmap
+Forward activations are retained for the backward pass. Memory use increases with
+context length and model depth. Gradient accumulation reduces how often optimizer
+updates occur, but does not reduce the activation memory required by one training
+window. See [Full-context memory requirements](#full-context-memory-requirements).
 
-| Priority | Optimization | Expected gain | Status |
-|---|---|---|---|
-| ✅ Done | **`--freeze-layers N`** — no LoRA on first N layers; backward auto-pruned | Proportional to N/total | Implemented |
-| ✅ Done | **`--shuffle-dataset`** — shuffle windows each epoch | Better convergence | Implemented |
-| ✅ Done | **BOS separators** — insert BOS between concatenated samples | Correct cross-sample boundaries | Implemented |
-| ✅ Done | **Per-epoch loss summary** — log train loss after each epoch | Observability | Implemented |
-| ✅ Done | **`MUL_MAT_ID` / `OUT_PROD_ID` backward** — routed expert LoRA gradients | Enables explicit MoE expert targets | Implemented |
-| Done | **Quantized `OUT_PROD`** - dequantize on GPU + cuBLAS for backward matmul | Full GPU training (no CPU fallback) | Implemented |
-| ✅ Done | **Reuse `ctx_compute_opt`** — allocate tensor metadata context once, `ggml_reset()` across windows | Eliminate ~0.5 s/window overhead | Implemented |
-| ❌ Skip | **Static training graphs** — the current optimizer and training graph lifecycle rebuild the graph for each window | Would need a dedicated graph-lifecycle redesign | Not in scope |
-| Low | **`SSM_SCAN/CONV` backward** — enable LoRA on Mamba SSM layers | Unlocks NemotronH SSM layers | Planned |
-| Low | **GELU backward** — implement `ggml_gelu_back` kernel (UNARY + GLU) | Support GPT-2/Phi-style models | Planned (needs new CUDA/CPU kernels) |
+**4. Trainable layers**
 
----
+Gradients are calculated for layers with LoRA adapters. Use `--freeze-layers N`
+to omit adapters from the first N transformer layers; only the remaining layers
+are trained.
 
-## Implementation notes (for developers)
-
-Development investigations are documented separately in [notes/](notes/), one report per topic. See [Context Length Rounding to 256](notes/Context-Length-Rounding-to-256.md).
-
-### Modified llama.cpp files
-
-| File | Change |
-|---|---|
-| `ggml/src/ggml.c` | Backward graph fixes: `GET_ROWS` 3D, `SET_ROWS`, `MUL_MAT_ID`, `SSM_SCAN/CONV`, `FLASH_ATTN_EXT` now propagates gradients through Q/K/V and optional attention sinks; inplace-op assert → warn+skip |
-| `src/llama-context.cpp` | Preserves exact context capacity for full-context training; `opt_init`: scheduler and graph sizing, shared-KV LoRA gradient warning; `opt_epoch_iter`: metadata-context reuse and accumulation-group selection |
-| `src/llama-adapter.cpp` | Repack-buft fallback for LoRA tensors: tries device-native buft before CPU |
-| `common/common.h`, `common/arg.cpp` | Removed the old QLoRA-only parameter fields and CLI registrations; QLoRA options are now local to the example |
-| `tools/finetune-qlora/args.cpp` | Parses QLoRA-only CLI flags locally; no QLoRA option registration is needed in `common/arg.cpp` |
-| `include/llama.h` | Exposes `llama_opt_dataset_shuffle()` so callers control per-epoch shuffling; `llama_opt_epoch()` no longer owns shuffle policy; added `llama_opt_epoch_range()` with an explicit evaluation-range end |
-| `ggml/src/ggml-cuda/out-prod.cu` | CUDA `OUT_PROD` with quantized src0 (dequantize on GPU + cuBLAS); `OUT_PROD_ID` for MoE backward |
-| `ggml/src/ggml-cuda/ggml-cuda.cu` | `supports_op` for quantized `OUT_PROD` and `OUT_PROD_ID`; CPU-resident ids fix in `mul_mat_id` |
-
-### Key invariants
-
-- `params.use_mmap = false` — forced; mmap'd tensors can't have data written back
-- FlashAttention follows the common `--flash-attn` setting (default `AUTO`); CPU and CUDA backward implementations are available
-- `params.warmup = false` — warmup runs inference with PARAM tensors → segfault
-- QLoRA defaults `params.cache_type_k` and `params.cache_type_v` to F32 before common argument parsing; `--cache-type-k` and `--cache-type-v` override these defaults
-- LoRA A/B tensors are marked `PARAM` via `ggml_set_param` on the tensors loaded by `llama_adapter_lora_init`, not on the pre-init scratch tensors in `lt.buf`
-- The adapter GGUF is pre-saved and loaded via `params.lora_adapters` BEFORE `common_init_from_params` so that `sched_reserve` includes LoRA graph nodes in its sizing
-
-### Why opt_init inflation matters
-
-`ggml_opt_init` captures `sched.get()` at construction time. The backward graph (`gb_grad`, `gb_opt`) is ~3–5× larger than the forward graph in node count. If the scheduler hash_set is sized only for the forward graph, `ggml_backend_sched_alloc_graph` on the backward graph will overflow it. We recreate `sched` with `inflated = fwd_nodes × 4` slots BEFORE calling `ggml_opt_init`.

@@ -1,4 +1,4 @@
-# Thread Safety of `std::localtime()` in `common_chat_templates_apply()`
+# Thread Safety of Date and Time Formatting in Chat Templates
 
 ## Summary
 
@@ -8,17 +8,17 @@
 
 ## Call path
 
-1. [`apply_chat_template()` in `dataset-template.cpp`](https://github.com/nanjmingo/llama.cpp/blob/develop2/tools/finetune-qlora/dataset-template.cpp#L13-L25) calls `common_chat_templates_apply()`.
-2. [`common_chat_templates_inputs::use_jinja`](https://github.com/nanjmingo/llama.cpp/blob/develop2/common/chat.h#L256-L263) defaults to `true`. `common_chat_templates_apply()` dispatches to `common_chat_templates_apply_jinja()` when this flag is enabled.
-3. [`common_chat_templates_apply_jinja()` in `common/chat.cpp`](https://github.com/nanjmingo/llama.cpp/blob/develop2/common/chat.cpp#L1299-L1368) assigns `common_chat_extra_context()` to `params.extra_context`.
-4. [`common_chat_extra_context()`](https://github.com/nanjmingo/llama.cpp/blob/develop2/common/chat.cpp#L1065-L1072) calls `format_time()` for both `datetime` and `date_string`.
-5. [`format_time()`](https://github.com/nanjmingo/llama.cpp/blob/develop2/common/chat.cpp#L37-L44) calls `std::localtime(&time)` and copies the pointed-to `std::tm` value.
+1. [`apply_chat_template()` in `dataset-template.cpp`](https://github.com/nanjmingo/llama.cpp/blob/develop/tools/finetune-qlora/dataset-template.cpp#L13-L25) calls `common_chat_templates_apply()`.
+2. [`common_chat_templates_inputs::use_jinja`](https://github.com/nanjmingo/llama.cpp/blob/develop/common/chat.h#L256-L263) defaults to `true`. `common_chat_templates_apply()` dispatches to `common_chat_templates_apply_jinja()` when this flag is enabled.
+3. [`common_chat_templates_apply_jinja()` in `common/chat.cpp`](https://github.com/nanjmingo/llama.cpp/blob/develop/common/chat.cpp#L1299-L1368) assigns `common_chat_extra_context()` to `params.extra_context`.
+4. [`common_chat_extra_context()`](https://github.com/nanjmingo/llama.cpp/blob/develop/common/chat.cpp#L1065-L1072) calls `format_time()` for both `datetime` and `date_string`.
+5. [`format_time()`](https://github.com/nanjmingo/llama.cpp/blob/develop/common/chat.cpp#L37-L44) calls `std::localtime(&time)` and copies the pointed-to `std::tm` value.
 
-There is another relevant call site: the Jinja builtin [`strftime_now` in `common/jinja/value.cpp`](https://github.com/nanjmingo/llama.cpp/blob/develop2/common/jinja/value.cpp#L434-L443) passes `std::localtime()` directly to `std::strftime()`. A change limited to `format_time()` would not address this separate call path.
+There is another relevant call site: the Jinja builtin [`strftime_now` in `common/jinja/value.cpp`](https://github.com/nanjmingo/llama.cpp/blob/develop/common/jinja/value.cpp#L434-L443) passes `std::localtime()` directly to `std::strftime()`. A change limited to `format_time()` would not address this separate call path.
 
 ## Current QLoRA dataset-loading path
 
-In [`append_tokenized_batch()` in `dataset.cpp`](https://github.com/nanjmingo/llama.cpp/blob/develop2/tools/finetune-qlora/dataset.cpp#L45-L83), the loop that calls `render_dataset_example()` is sequential. The code calls `pool->parallel_for()` afterwards for tokenization. Template rendering is therefore serial in this particular loading path today.
+In [`append_tokenized_batch()` in `dataset.cpp`](https://github.com/nanjmingo/llama.cpp/blob/develop/tools/finetune-qlora/dataset.cpp#L45-L83), the loop that calls `render_dataset_example()` is sequential. The code calls `pool->parallel_for()` afterwards for tokenization. Template rendering is therefore serial in this particular loading path today.
 
 That is a property of the current caller, not a thread-safety guarantee provided by `common_chat_templates_apply()` or `format_time()`: neither function acquires a lock to serialize concurrent calls. The `Keep this call serial` comment in `dataset-template.cpp` documents the constraint; it does not implement synchronization. If rendering is parallelized later, or another caller invokes this path concurrently, the shared `std::localtime()` storage becomes relevant.
 
