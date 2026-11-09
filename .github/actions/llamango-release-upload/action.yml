@@ -1,0 +1,38 @@
+name: Upload Llamango release asset
+
+description: Upload one completed Llamango asset and publish the prerelease immediately.
+
+inputs:
+  release-tag:
+    description: Existing prerelease tag.
+    required: true
+  asset-path:
+    description: Path to the asset to upload.
+    required: true
+  token:
+    description: "GitHub token with contents: write permission."
+    required: true
+  repository:
+    description: Repository in owner/name format.
+    required: true
+  publish-release:
+    description: Remove the draft flag after the asset has been uploaded.
+    required: false
+    default: 'true'
+
+runs:
+  using: composite
+  steps:
+    - name: Upload asset and publish prerelease
+      uses: actions/github-script@v9
+      env:
+        RELEASE_TAG: ${{ inputs.release-tag }}
+        ASSET_PATH: ${{ inputs.asset-path }}
+        REPOSITORY: ${{ inputs.repository }}
+        PUBLISH_RELEASE: ${{ inputs.publish-release }}
+      with:
+        github-token: ${{ inputs.token }}
+        retries: 3
+        script: |
+          const uploadReleaseAsset = require('./.github/scripts/llamango/upload-release-asset.js');
+          await uploadReleaseAsset({ github, core });
