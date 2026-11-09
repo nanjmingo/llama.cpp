@@ -1,0 +1,137 @@
+name: Llamango Ubuntu CUDA Build
+
+on:
+  workflow_call:
+    inputs:
+      cuda_version:
+        description: Full CUDA Toolkit version installed in the build container.
+        required: true
+        type: string
+      cuda_display_version:
+        description: Short CUDA version shown in the Actions job title and package metadata.
+        required: true
+        type: string
+      container_image:
+        description: CUDA development container image.
+        required: true
+        type: string
+      cache_key_prefix:
+        description: Stable prefix for the ccache key.
+        required: true
+        type: string
+      asset_name:
+        description: Package asset filename.
+        required: true
+        type: string
+      release_tag:
+        description: Prerelease tag created by the orchestrator.
+        required: true
+        type: string
+      cccl_version:
+        description: Optional CCCL version to pin.
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  build:
+    name: CUDA ${{ inputs.cuda_display_version }}
+    runs-on: ubuntu-22.04
+    container: ${{ inputs.container_image }}
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential ccache cmake ninja-build git libgomp1 libssl-dev jq python3 python3-venv python3-pip tar
+
+      - name: Setup ccache
+        uses: ./.github/actions/llamango-cache-linux
+        with:
+          cache-key-prefix: ${{ inputs.cache_key_prefix }}
+
+      - name: Configure full CUDA build
+        shell: bash
+        env:
+          CCCL_VERSION: ${{ inputs.cccl_version }}
+        run: |
+          cmake_args=(
+            -S .
+            -B build
+            -G Ninja
+            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_RPATH_USE_ORIGIN=ON
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+            -DLLAMA_BUILD_COMMON=ON
+            -DLLAMA_BUILD_TOOLS=ON
+            -DLLAMA_BUILD_TESTS=ON
+            -DLLAMA_BUILD_EXAMPLES=ON
+            -DLLAMA_BUILD_SERVER=ON
+            -DLLAMA_BUILD_APP=ON
+            -DLLAMA_FATAL_WARNINGS=ON
+            -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined
+            -DGGML_NATIVE=OFF
+            -DGGML_CPU=ON
+            -DGGML_CUDA=ON
+          )
+          if [[ -n "$CCCL_VERSION" ]]; then
+            cmake_args+=("-DGGML_CUDA_CCCL_VERSION=${CCCL_VERSION}")
+          fi
+          cmake "${cmake_args[@]}"
+
+      - name: Build all targets
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --build build --parallel "$(nproc)"
+          # llamango-tests is a custom target and is intentionally not part of the default ALL target.
+          cmake --build build --target llamango-tests --parallel "$(nproc)"
+
+      - name: Package Ubuntu CUDA build
+        id: package
+        if: always() && steps.build.outcome == 'success'
+        shell: bash
+        env:
+          ASSET_NAME: ${{ inputs.asset_name }}
+          CUDA_VERSION: ${{ inputs.cuda_version }}
+          CUDA_DISPLAY_VERSION: ${{ inputs.cuda_display_version }}
+        run: |
+          set -euo pipefail
+          cat > build/bin/BUILD_INFO.txt <<EOF_INFO
+          Repository: ${GITHUB_REPOSITORY}
+          Commit: ${GITHUB_SHA}
+          OS: Ubuntu 22.04
+          CUDA Toolkit: ${CUDA_VERSION}
+          CUDA Display Version: ${CUDA_DISPLAY_VERSION}
+          Backend: CUDA
+          Build scope: all default CMake targets plus llamango-tests
+          Build type: Release
+          EOF_INFO
+          tar -czf "$ASSET_NAME" -C build/bin .
+
+      - name: Publish Ubuntu CUDA package
+        if: always() && steps.package.outcome == 'success'
+        uses: ./.github/actions/llamango-release-upload
+        with:
+          release-tag: ${{ inputs.release_tag }}
+          asset-path: ${{ inputs.asset_name }}
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+
+      - name: Show ccache statistics
+        if: always()
+        run: ccache --show-stats
+
+      - name: Save ccache
+        if: always() && steps.build.outcome == 'success'
+        uses: actions/cache/save@v6
+        with:
+          path: .ccache
+          key: ${{ inputs.cache_key_prefix }}-${{ github.run_id }}
