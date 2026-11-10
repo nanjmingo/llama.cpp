@@ -76,10 +76,10 @@ These are shared llama.cpp model and execution parameters.
 |---|---|---|
 | `-m` / `--model` | *(required)* | Path to the quantized GGUF base model |
 | `-t` / `--threads` | common default | CPU thread count; also used for JSONL parsing and tokenization |
-| `-c` / `--ctx-size` | `512` | Training context window (tokens) |
+| `-c` / `--ctx-size` | `0` (use the model context) | Training context window (tokens) |
 | `-b` / `--batch-size` | `2048` | Must be at least `-c`; causal models clamp the effective batch size to `-c` |
 | `-ub` / `--ubatch-size` | `512` | Must equal `-c`; with causal attention, the effective sizes satisfy `n_ubatch == n_batch == n_ctx` |
-| `-ngl` / `--gpu-layers` / `--n-gpu-layers` | `999` | Number of GPU layers to offload |
+| `-ngl` / `--gpu-layers` / `--n-gpu-layers` | `auto` | Number of GPU layers to offload; accepts an integer, `auto`, or `all` |
 | `-ctk` / `--cache-type-k` | `f32` | K cache storage type; accepts the KV cache types supported by llama.cpp, including `q8_0` |
 | `-ctv` / `--cache-type-v` | `f32` | V cache storage type; accepts the KV cache types supported by llama.cpp, including `q8_0` |
 | `-fa` / `--flash-attn` | `auto` | Flash Attention mode: `on`, `off`, or `auto`; backward propagation is supported on CPU and CUDA |
@@ -123,7 +123,7 @@ When `--flash-attn` is `on`, Flash Attention is used in the training graph as we
 | `--max-steps` | *(disabled)* | Stop after N optimizer updates, repeating the dataset as needed; overrides `--epochs` |
 | `--val-windows` | all remaining windows | Maximum number of windows to evaluate after the training range; `0` disables validation |
 | `--shuffle-dataset` | off | Shuffle dataset windows at the start of each epoch using `-s` / `--seed` |
-| `-epochs` / `--epochs` | `3` | Training epochs |
+| `-epochs` / `--epochs` | `2` | Training epochs |
 | `-lr` / `--learning-rate` | `1e-5` | AdamW learning rate |
 | `-wd` / `--weight-decay` | `0` | AdamW or SGD weight decay applied to trainable LoRA tensors; `0` disables weight decay |
 | `-opt` / `--optimizer` | `adamw` | Optimizer used to update LoRA tensors: `adamw` or `sgd` |
@@ -331,8 +331,8 @@ llama.cpp uses **internal GGUF tensor names**, not HuggingFace names:
 | `ffn_up_exps` | per-expert `up_proj` | ⚠️ opt-in; MoE expert LoRA |
 | `ffn_down_exps` | per-expert `down_proj` | ⚠️ opt-in; MoE expert LoRA |
 | `ffn_gate_up_exps` | fused per-expert gate/up | ⚠️ opt-in; use instead of separate gate/up tensors |
-| `ssm_in` | `in_proj` | ❌ not in defaults — zero gradient (SSM_SCAN no backward) |
-| `ssm_out` | `out_proj` | ❌ not in defaults — zero gradient (SSM_SCAN no backward) |
+| `ssm_in` | `in_proj` | ⚠️ opt-in; gradients cannot pass through `SSM_CONV` / `SSM_SCAN` to this upstream projection |
+| `ssm_out` | `out_proj` | ⚠️ opt-in; downstream of `SSM_SCAN`, so its LoRA weights can receive gradients |
 
 The default target set includes both K/V projections as ordinary trainable targets.
 No K/V-specific target option is required. As described above, each QLoRA training window is
@@ -483,14 +483,18 @@ vector.
 
 ## Known Limitations
 
-**1. Gemma 4 E2B/E4B Shared KV**
+**1. Shared-KV attention**
 
-QLoRA training is not supported for Gemma 4 E2B/E4B models that use Shared KV.
-The training graph does not currently propagate all gradients through shared K/V
-attention. Training may run, but the resulting adapter can be incorrect. A warning
-about affected LoRA projections is diagnostic only; it does not make this model
-configuration supported. Using full-context training (`-ub == -c`) does not remove
-this limitation.
+QLoRA cannot compute complete gradients for trainable LoRA adapters on shared K/V
+source projections when later attention layers reuse those projections. This includes
+Gemma 3N and Gemma 4 configurations that use prefix Shared KV. The training graph
+writes producer K/V values into the KV cache with `SET_ROWS`; consumer layers read
+the cached values through views, and the current backward graph has no path from
+those reads back to the producer values. When a trainable adapter matches an affected
+K/V source projection, llama.cpp emits a diagnostic warning naming the target and
+number of consumers. The warning does not repair the gradient path. Training may run,
+but those source-projection adapters receive incomplete gradients. Using full-context
+training (`-ub == -c`) does not remove this limitation.
 
 **2. Training speed**
 
