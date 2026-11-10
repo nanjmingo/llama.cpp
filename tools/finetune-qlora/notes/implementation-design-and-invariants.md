@@ -1,21 +1,49 @@
 # QLoRA Implementation Design and Internal Invariants
 
-This note records implementation details that are useful when modifying or debugging
-the QLoRA integration. It is not a user guide; user-facing setup and runtime behavior
-are documented in the parent `README.md`.
+This note records source-level details that are useful when modifying or debugging
+QLoRA. User-facing behavior is documented in the parent `README.md`.
+
+## Relationship to `examples/training`
+
+QLoRA reuses llama.cpp's `llama_opt_*` / `ggml_opt_*` optimizer infrastructure, but
+it does not use the data-loading or model-saving path in
+`examples/training/finetune.cpp`. QLoRA reads JSONL records through its own dataset
+reader, template renderer, tokenizer, and window builder. It does not build an
+optimizer dataset from `params.prompt` with `common_opt_dataset_init()`, use the
+example's `val_split` partition, or save a fully fine-tuned model with
+`llama_model_save_to_file()`. It marks selected adapter A/B tensors as optimizer
+parameters and writes adapter GGUF files and QLoRA checkpoints; base-model weights
+remain frozen.
+
+Do not carry over two properties of `examples/training`: `finetune.cpp` forces
+K/V cache types to F32, and its README says Flash Attention is disabled during
+training. QLoRA initializes K/V cache defaults to F32 but allows `--cache-type-k`
+and `--cache-type-v` to override them. It also honors the common `--flash-attn`
+setting, including its `auto`, `on`, and `off` modes; CPU and CUDA backward
+implementations are present.
+
+`common_params_parse()` is called with `LLAMA_EXAMPLE_FINETUNE` to reuse common
+llama.cpp options. Consequently, example-oriented options such as `--prompt`,
+`--file`, and `--val-split` can still be parsed, but QLoRA's training path does not
+consume them. Use `--train-file` for dataset input and `--val-windows` to control
+validation windows. The presence of a parsed common option does not make its
+`examples/training` behavior part of QLoRA.
 
 ## Dataset-loading implementation
 
-The JSONL reader processes up to 128 records per batch. `dataset_thread_pool::parallel_for()`
-executes a one-task batch synchronously on the calling thread, without dispatching work
-to workers. Reducing the batch size to one would therefore remove parallelism from JSON
-parsing and tokenization. Reducing memory further would require a bounded asynchronous
-pipeline rather than simply reducing the batch size to one.
+The JSONL reader accumulates up to 128 non-empty lines per batch and parses the
+records with `dataset_thread_pool::parallel_for()`. A one-task call, or a call
+without workers, runs synchronously on the calling thread.
+
+In `append_tokenized_batch()`, records are rendered sequentially. The resulting
+rendered samples are then tokenized with `parallel_for()`. Therefore, a batch with
+one input record does not parallelize record parsing, but tokenization can still
+run in parallel when that record produces multiple rendered samples (for example,
+multiple assistant turns). It is incorrect to state that a one-record batch always
+removes tokenization parallelism.
 
 The QLoRA-specific command-line options are parsed in `args.cpp`; shared llama.cpp
-options continue to use `common/arg.cpp`. JSONL parsing and tokenization use the shared
-`-t` / `--threads` setting and can run in parallel; chat-template rendering remains
-sequential.
+options continue to use `common/arg.cpp`.
 
 ## Selected changed llama.cpp files
 
@@ -34,10 +62,10 @@ This is a selection of significant changes, not a complete file inventory.
 
 ## Key invariants
 
-- `params.load_mode = LLAMA_LOAD_MODE_NONE` is set before `common_init_from_params()`. The model loader maps this mode to `use_mmap = false`. The code establishes the selected loading mode, but does not document why QLoRA requires it; do not infer that frozen base tensors are written back during training.
-- `params.warmup = false` is set before `common_init_from_params()`. The code establishes that warmup is disabled, but does not establish the previously suggested claim that warmup would run inference with uninitialized LoRA PARAM tensors or cause a segmentation fault. A reproduction or historical failure report is needed to justify that rationale.
-- `params.no_alloc_kv_cache = true` is set for training. When the requested context and batch settings satisfy the full-context conditions, the context preserves the requested capacity; it skips KV data-buffer allocation only when the model has no shared KV. Shared-KV models still require their cache.
-- FlashAttention follows the common `--flash-attn` setting (default `auto`); CPU and CUDA backward implementations are available.
+- `params.load_mode = LLAMA_LOAD_MODE_NONE` is set before `common_init_from_params()`. The model loader maps this mode to `use_mmap = false`. The code does not explain why QLoRA requires this setting. Do not infer that frozen base tensors are written back during training.
+- `params.warmup = false` is set before `common_init_from_params()`. The code does not document why warmup is disabled. In particular, the adapter is loaded after `common_init_from_params()`, so the source does not support the claim that initialization warmup runs inference with uninitialized LoRA PARAM tensors. The reason for disabling warmup remains undocumented in the source.
+- `params.no_alloc_kv_cache = true` is set for training. The runtime preserves the requested context capacity when its full-context-training conditions are met. It skips KV data-buffer allocation only when the model has no shared KV; Shared-KV models still require their cache.
+- FlashAttention follows the common `--flash-attn` setting (default `auto`); CPU and CUDA backward implementations are present.
 - QLoRA defaults `params.cache_type_k` and `params.cache_type_v` to F32 before common argument parsing; `--cache-type-k` and `--cache-type-v` override these defaults.
 - LoRA A/B tensors are marked `PARAM` with `ggml_set_param()` on tensors loaded by `llama_adapter_lora_init()`, not on the pre-init scratch tensors in `lt.buf`.
 - `common_init_from_params()` creates the base model and context before the temporary adapter GGUF is created. The adapter is then loaded with `llama_adapter_lora_init()`, attached with `common_set_adapter_lora()`, and its trainable A/B tensors are marked `PARAM`. `train_adapter()` subsequently calls `llama_opt_init()`, so the optimizer graph is initialized after the adapter is attached.
@@ -56,5 +84,5 @@ sched_size = inflated * 2;
 The graph-result capacity is `inflated`; the backend scheduler is created with
 `sched_size`. The scheduler must be created before `ggml_opt_init()` because the
 optimizer context retains the scheduler pointer. The current source uses this capacity
-heuristic; it does not establish a general measured ratio such as “the backward graph
-is 3–5 times the forward graph.”
+heuristic; it does not establish a general measured ratio between the backward and
+forward graph sizes.

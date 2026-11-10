@@ -2,9 +2,9 @@
 
 Native QLoRA SFT training pipeline for quantized GGUF models.
 
-The base model weights remain **frozen**; training updates only the LoRA adapter weights. LoRA A/B tensors can be stored as `F32`, `F16`, or `BF16` and are updated using F32 gradients. The saved adapter GGUF is compatible with the standard llama.cpp LoRA loader and `llama-export-lora` merge tool.
+The base model weights remain **frozen**; training updates only the selected LoRA adapter tensors. LoRA A/B tensors can be stored as `F32`, `F16`, or `BF16`; gradients are accumulated in F32. The output is a GGUF LoRA adapter loaded through llama.cpp adapter APIs. The repository also provides `llama-export-lora` for merging adapters, but the QLoRA test guide does not list an automated merge-and-reload regression test.
 
-**Status:** QLoRA SFT is implemented and functional. Training speed is currently limited by full backprop through quantized weights — see [Known Limitations](#known-limitations).
+**Implementation status:** The QLoRA SFT training path, adapter save/load, gradient accumulation, and checkpoint/resume paths are implemented. Model and backend coverage depends on the operators used by each training graph; see [Known Limitations](#known-limitations).
 
 ---
 
@@ -12,12 +12,17 @@ The base model weights remain **frozen**; training updates only the LoRA adapter
 
 Run these commands from the repository root.
 
-```bash
-# First time (CUDA build):
-cmake -B build -DGGML_CUDA=ON -DBUILD_SHARED_LIBS=ON -DLLAMA_CURL=OFF
-cmake --build build -j $(nproc)
+Choose the backend at configure time. A CPU build does not require a backend;
+add `-DGGML_CUDA=ON` for a CUDA build.
 
-# Incremental rebuild (after code changes):
+```bash
+# CPU build
+cmake -B build -DLLAMA_CURL=OFF
+
+# Or, configure a CUDA build instead:
+cmake -B build -DGGML_CUDA=ON -DBUILD_SHARED_LIBS=ON -DLLAMA_CURL=OFF
+
+# Build only the QLoRA executable
 cmake --build build --target llama-finetune-qlora -j $(nproc)
 ```
 
@@ -36,34 +41,20 @@ For test setup, the aggregate build target, test execution, fixtures, and model-
 
 Trains LoRA adapters on a quantized GGUF model.
 
-### Recommended command (1.7B model; memory-dependent full-context run)
+### Basic invocation
+
+The following shows the required arguments and full-context batch settings. It is a
+syntax example, not a model, memory, or backend compatibility recommendation. Choose
+`-c` for the intended training window and set `-ub` to the same value; `-b` must be
+at least that large.
 
 ```bash
 ./build/bin/llama-finetune-qlora \
-  --model ~/qwen3-1.7b-q4_k_m.gguf \
-  --train-file data/train.jsonl \
+  --model /path/to/base.gguf \
+  --train-file /path/to/train.jsonl \
   --output-dir ./output \
   --lora-rank 16 --lora-alpha 16 \
-  -c 4096 -b 4096 -ub 4096 --gradient-accumulation-steps 4 \
-  --lr-scheduler cosine --warmup-steps 10 --warmup-init-ratio 0.1 -lr-min 1e-6 \
-  --save-checkpoint-steps 100 --save-checkpoint-limit 3 \
-  --save-snapshot-steps 100 --save-snapshot-limit 10 \
-  --epochs 3 --shuffle-dataset --seed 42
-```
-
-### Recommended command (15B model with partial offload; memory-dependent)
-
-```bash
-./build/bin/llama-finetune-qlora \
-  --model ~/nemotron-15b-q4_k_m.gguf \
-  --train-file data/train.jsonl \
-  --output-dir ./nemotron-output \
-  --lora-rank 16 --lora-alpha 16 \
-  -ngl 13 -c 4096 -b 4096 -ub 4096 --gradient-accumulation-steps 4 \
-  --lr-scheduler cosine --warmup-steps 10 --warmup-init-ratio 0.1 -lr-min 1e-6 \
-  --save-checkpoint-steps 100 --save-checkpoint-limit 3 \
-  --save-snapshot-steps 200 --save-snapshot-limit 10 \
-  --epochs 3 --shuffle-dataset --seed 42
+  -c 512 -b 512 -ub 512
 ```
 
 ### All params
@@ -86,11 +77,11 @@ These are shared llama.cpp model and execution parameters.
 | `-ncmoe` / `--n-cpu-moe N` | `0` | Keep MoE expert weights in the first N layers in CPU memory; QLoRA training supports CPU-offloaded experts |
 | `--moe-cache-mib N` | `0` (disabled) | GPU cache capacity in MiB for MoE experts kept on CPU; with multiple GPUs, it is split according to `--tensor-split` |
 | `--op-offload` / `--no-op-offload` | enabled | Enable or disable offloading host-tensor operations to devices |
-| `--repack` / `-nr` / `--no-repack` | enabled | Enable or disable weight repacking; use `--no-repack` (`-nr`) for CPU training |
+| `--repack` / `--no-repack` (`-nr`) | enabled | Enable or disable weight repacking |
 
 `-ncmoe N` / `--n-cpu-moe N` keeps the MoE expert weights in the first N layers in CPU memory. This is supported during QLoRA training, including backward propagation through CPU-offloaded experts. `--moe-cache-mib N` optionally reserves N MiB of GPU cache for those CPU-resident experts; `0` disables the cache. With multiple GPUs, the cache capacity is distributed according to `--tensor-split`.
 
-`--op-offload` is enabled by default and allows operations on host-resident tensors to be offloaded to devices. Use `--no-op-offload` to disable it. For CPU training, specify `--no-repack` (`-nr`) rather than `--repack`.
+`--op-offload` is enabled by default and allows operations on host-resident tensors to be offloaded to devices. Use `--no-op-offload` to disable it.
 
 When `--flash-attn` is `on`, Flash Attention is used in the training graph as well as inference. Its backward implementations are available on CPU and CUDA. `auto` lets llama.cpp select the setting based on model and backend support.
 
@@ -134,7 +125,7 @@ When `--flash-attn` is `on`, Flash Attention is used in the training graph as we
 | `-decay-epochs` / `--learning-rate-decay-epochs` | `-1` | For the constant scheduler, decay toward `--learning-rate-min` over N epochs; takes effect when the minimum is positive and below the base learning rate; ignored by the cosine scheduler |
 | `-s` / `--seed` | random | Seed the optimizer RNG used for dataset shuffling when `--shuffle-dataset` is enabled; set a fixed value for reproducible permutations |
 
-`--forward-precision` controls the requested input precision for forward matrix multiplications, and `--backward-precision` controls the requested input precision for backward matrix multiplications, including input-gradient and LoRA-gradient calculations. Each request is clamped independently for the storage type of the corresponding weight tensor: F32 weights always use F32; F16 weights use F16 for F16/Q8 requests and F32 for BF16/F32 requests; BF16 weights use BF16 for BF16/Q8 requests and F32 for F16/F32 requests; Q8_0 and lower-bit quantized weights use the requested precision unchanged. This also applies to LoRA weights, which are currently stored as F32 and therefore use F32 regardless of the requested precision. Backward precision defaults to `f32`. `q8` is not supported as a backward precision. Both options leave F32 gradient tensors and optimizer moment storage (`--optimizer-state-type`) unchanged and do not change LoRA tensor storage (`--lora-type`). CUDA backward kernels use F32 accumulation and F32 outputs. For CUDA MoE, explicit forward precision uses a synchronization fallback, and backward precision is applied to expert input- and weight-gradient GEMMs through the routing fallback. These paths can reduce performance and may disable graph capture for affected nodes. CPU backends currently retain their existing backward precision behavior.
+`--forward-precision` controls the requested input precision for forward matrix multiplications, and `--backward-precision` controls the requested input precision for backward matrix multiplications, including input-gradient and LoRA-gradient calculations. Each request is clamped independently for the storage type of the corresponding weight tensor: F32 weights always use F32; F16 weights use F16 for F16/Q8 requests and F32 for BF16/F32 requests; BF16 weights use BF16 for BF16/Q8 requests and F32 for F16/F32 requests; Q8_0 and lower-bit quantized weights use the requested precision unchanged. This policy also applies to LoRA A/B weights: the requested precision is clamped according to each adapter tensor's actual storage type, selected by `--lora-type`. F32 adapter tensors use F32; F16 and BF16 adapter tensors follow the corresponding rules above. Backward precision defaults to `f32`. `q8` is not supported as a backward precision. Both options leave F32 gradient tensors and optimizer moment storage (`--optimizer-state-type`) unchanged and do not change LoRA tensor storage (`--lora-type`). For CUDA MoE, explicit forward precision uses a synchronization fallback, and backward precision is applied to expert input- and weight-gradient GEMMs through the routing fallback. These paths can introduce synchronization and may disable graph capture for affected nodes.
 
 #### Output params
 
@@ -165,8 +156,9 @@ JSONL parsing and tokenization use the shared `-t` / `--threads` setting. Chat-t
 QLoRA requires the effective batch sizes to satisfy `n_ubatch == n_batch == n_ctx`. For causal
 models, llama.cpp clamps the effective batch size to the context size, so at the command line set
 `-ub == -c` and `-b >= -c` (a larger `-b` is accepted but clamped to `-c`). Each dataset window
-is processed as one complete forward/backward graph so gradients can flow through the current
-window's K/V projections without splitting them across micro-batches. In this full-context training
+is processed as one complete forward/backward graph. This keeps the current window's K/V dependencies
+inside one graph for ordinary attention layers; Shared-KV cache reuse has the separate gradient
+limitation described below. In this full-context training
 mode, the requested `-c` is used as-is instead of being rounded up to a multiple of 256, so a context
 such as `900` uses a 900-token training graph rather than a 1024-token one. Splitting a window into smaller
 micro-batches is rejected. This can require substantially more activation memory; reduce `-c` or
@@ -193,9 +185,7 @@ and reference setting; F16 and BF16 reduce adapter storage while keeping F32 gra
 accumulation.
 
 `--optimizer-state-type` independently selects AdamW's first and second moment types.
-F16 and BF16 reduce optimizer-state memory compared with F32, but alter moment rounding
-and may change convergence. This option is only used by AdamW; SGD requires its default
-`f32` value.
+F16 and BF16 store each AdamW moment in a 16-bit type rather than F32. This option is only used by AdamW; SGD requires its default `f32` value.
 
 `--grad-stats-interval N` reports the global norm, RMS, maximum finite absolute value, exact-zero ratio,
 and non-finite element count for trainable LoRA gradients after the same loss normalization used by the optimizer,
@@ -285,20 +275,18 @@ checkpoint; the RNG state includes the state used for future dataset shuffles.
 `-s` / `--seed` initializes the optimizer RNG for a new run and does not override
 the RNG state restored from a checkpoint. Resume is supported at
 optimizer-update boundaries only; incomplete accumulated gradients are not
-serialized. Reduced-precision optimizer-state storage can change the optimizer's numeric
-trajectory and should be benchmarked against F32. F16 and BF16 use 16-bit values.
+serialized. F16 and BF16 optimizer-state storage uses a different numeric representation from F32.
 
 Chat records require a chat template in the model metadata. If the model does
 not provide one, chat records cannot be rendered; no fallback template is applied.
 
 ### Full-context memory requirements
 
-Peak activation memory is driven primarily by the full context length because the effective micro-batch
-and batch sizes both equal `-c` for causal models. Set `-ub == -c`; `-b` must be at least `-c`, and
-llama.cpp clamps its effective value to `-c`. Gradient accumulation reduces the frequency of optimizer
-updates, not the activation memory needed by an individual window. If a full window does not fit, reduce
-`-c` or increase CPU offload rather than lowering `-ub`. More context also changes the windowing of the
-dataset and the number of windows per epoch.
+The training graph processes one complete context window per microbatch. For causal models,
+`-ub` must equal `-c`, and `-b` must be at least `-c` (the effective batch is clamped to `-c`).
+Gradient accumulation combines updates across windows but does not split an individual window or
+reduce the activation memory needed by that window. If a window does not fit, reduce `-c`.
+Changing `-c` also changes dataset window construction and the number of windows per epoch.
 
 ### Default LoRA targets
 
@@ -316,23 +304,25 @@ alpha/rank ratio rescales B so loading the converted adapter initially retains
 the same effect. Frozen tensors are retained in periodic snapshots and the final
 adapter output.
 
-llama.cpp uses **internal GGUF tensor names**, not HuggingFace names:
+QLoRA matches **internal GGUF tensor-name substrings**. The default target list is
+`attn_q,attn_k,attn_v,attn_output,ffn_gate,ffn_up,ffn_down`. These names do not
+map one-to-one to Hugging Face module names across every architecture.
 
-| llama.cpp internal | HuggingFace equivalent | Status |
-|---|---|---|
-| `attn_q` | `q_proj` | ✅ default target, trainable |
-| `attn_k` | `k_proj` | ✅ default target, trainable |
-| `attn_v` | `v_proj` | ✅ default target, trainable |
-| `attn_output` | `o_proj` | ✅ default target, trainable |
-| `ffn_gate` | `gate_proj` | ✅ default target, trainable |
-| `ffn_up` | `up_proj` | ✅ default target, trainable |
-| `ffn_down` | `down_proj` | ✅ default target, trainable |
-| `ffn_gate_exps` | per-expert `gate_proj` | ⚠️ opt-in; MoE expert LoRA |
-| `ffn_up_exps` | per-expert `up_proj` | ⚠️ opt-in; MoE expert LoRA |
-| `ffn_down_exps` | per-expert `down_proj` | ⚠️ opt-in; MoE expert LoRA |
-| `ffn_gate_up_exps` | fused per-expert gate/up | ⚠️ opt-in; use instead of separate gate/up tensors |
-| `ssm_in` | `in_proj` | ⚠️ opt-in; gradients cannot pass through `SSM_CONV` / `SSM_SCAN` to this upstream projection |
-| `ssm_out` | `out_proj` | ⚠️ opt-in; downstream of `SSM_SCAN`, so its LoRA weights can receive gradients |
+| Internal tensor-name substring | Default | Notes |
+|---|---:|---|
+| `attn_q` | Yes | Attention query projection |
+| `attn_k` | Yes | Attention key projection |
+| `attn_v` | Yes | Attention value projection |
+| `attn_output` | Yes | Attention output projection |
+| `ffn_gate` | Yes | Dense FFN gate projection |
+| `ffn_up` | Yes | Dense FFN up projection |
+| `ffn_down` | Yes | Dense FFN down projection |
+| `ffn_gate_exps` | No | Explicit opt-in for separate MoE expert gate tensors |
+| `ffn_up_exps` | No | Explicit opt-in for separate MoE expert up tensors |
+| `ffn_down_exps` | No | Explicit opt-in for separate MoE expert down tensors |
+| `ffn_gate_up_exps` | No | Explicit opt-in for architectures with a fused expert gate/up tensor |
+| `ssm_in` | No | Gradient propagation stops at `SSM_CONV` / `SSM_SCAN`; this upstream projection does not receive gradients through that path |
+| `ssm_out` | No | Downstream of `SSM_SCAN`; its LoRA weights can receive gradients from downstream operations |
 
 The default target set includes both K/V projections as ordinary trainable targets.
 No K/V-specific target option is required. As described above, each QLoRA training window is
@@ -479,40 +469,56 @@ vector.
   --model base.gguf --lora adapter.gguf --output merged.gguf
 ```
 
+The QLoRA tests exercise adapter serialization and loading. The test guide does not
+list a regression test for `llama-export-lora` followed by inference with the merged
+model; verify that workflow separately for the model and build being used.
+
 ---
 
 ## Known Limitations
 
 **1. Shared-KV attention**
 
-QLoRA cannot compute complete gradients for trainable LoRA adapters on shared K/V
-source projections when later attention layers reuse those projections. This includes
-Gemma 3N and Gemma 4 configurations that use prefix Shared KV. The training graph
-writes producer K/V values into the KV cache with `SET_ROWS`; consumer layers read
-the cached values through views, and the current backward graph has no path from
-those reads back to the producer values. When a trainable adapter matches an affected
-K/V source projection, llama.cpp emits a diagnostic warning naming the target and
-number of consumers. The warning does not repair the gradient path. Training may run,
-but those source-projection adapters receive incomplete gradients. Using full-context
-training (`-ub == -c`) does not remove this limitation.
+The current graph does not propagate gradients from Shared-KV consumer layers back
+through the KV cache to the K/V source projections. A warning is emitted when a
+trainable adapter matches an affected source projection. Training can continue, but
+those adapters receive incomplete gradients. Full-context training (`-ub == -c`)
+does not remove this limitation. The warning logic explicitly handles Gemma 3N and
+Gemma 4 prefix Shared-KV configurations; see [the implementation note](notes/shared-kv-attention-gradient-limitation.md).
 
-**2. Training speed**
+**2. SSM operators**
 
-Backward propagation must pass through frozen quantized model weights to calculate
-gradients for LoRA layers. This requires additional dequantizing matrix operations
-and can make training substantially slower than inference. The cost depends on the
-model, context length, and backend.
+`SSM_CONV` and `SSM_SCAN` have no backward implementation in the current graph.
+Gradient propagation stops at these operators. Consequently, an adapter on an
+upstream projection such as `ssm_in` does not receive gradients through the SSM path.
+A downstream projection such as `ssm_out` is outside that stopped path and can
+receive gradients.
 
-**3. Activation memory**
+**3. GLU variants**
 
-Forward activations are retained for the backward pass. Memory use increases with
-context length and model depth. Gradient accumulation reduces how often optimizer
-updates occur, but does not reduce the activation memory required by one training
-window. See [Full-context memory requirements](#full-context-memory-requirements).
+`GGML_OP_GLU` backward currently handles split `SWIGLU` and `GEGLU` cases. Other
+GLU variants are not handled. Ordinary unary GELU and GELU-quick backward paths are
+implemented; this limitation is about the other `GGML_OP_GLU` variants, not GELU
+in general.
 
-**4. Trainable layers**
+**4. MTP / NextN**
 
-Gradients are calculated for layers with LoRA adapters. Use `--freeze-layers N`
-to omit adapters from the first N transformer layers; only the remaining layers
-are trained.
+The training graph optimizes the main model, not the MTP prediction graph. MTP-aware
+training is not supported. Existing MTP/NextN adapter tensors can be retained in the
+output adapter, but are not trainable through the current main-model graph.
+
+**5. Activation memory**
+
+The training graph processes one complete context window per microbatch and retains
+forward activations needed by backward. Gradient accumulation combines updates across
+windows but does not reduce the activation memory required by an individual window.
+See [Full-context memory requirements](#full-context-memory-requirements).
+
+**6. Model and backend coverage**
+
+The existence of a model loader or a forward implementation does not establish that
+all operators in that model's training graph have backward support on every backend.
+Check the operator paths and the model-backed tests before treating an untested
+architecture/backend combination as supported. The [test guide](tests/README.md)
+describes which paths are covered by automated tests.
 
