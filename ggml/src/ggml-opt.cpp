@@ -12,7 +12,6 @@
 #include <cinttypes>
 #include <locale>
 #include <map>
-#include <mutex>
 #include <random>
 #include <sstream>
 #include <string>
@@ -282,100 +281,6 @@ namespace {
 
             opt_ctx->forward_node_indices.insert(opt_ctx->forward_node_indices.begin() + insert_at, -1);
             ++opt_ctx->n_forward_nodes;
-        }
-    }
-
-    void ggml_opt_log_op_backends(ggml_opt_context_t opt_ctx) {
-        if (!opt_ctx->backend_sched || !opt_ctx->allocated_graph || !opt_ctx->allocated_graph_copy) {
-            return;
-        }
-
-        static std::mutex log_mutex;
-        static bool logged[2][4][GGML_OP_COUNT][GGML_UNARY_OP_COUNT + 1] = {};
-        std::lock_guard<std::mutex> lock(log_mutex);
-
-        for (int i = 0; i < opt_ctx->allocated_graph_copy->n_nodes; ++i) {
-            struct ggml_tensor * node = opt_ctx->allocated_graph_copy->nodes[i];
-            if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
-                node->op == GGML_OP_NONE || node->op >= GGML_OP_COUNT) {
-                continue;
-            }
-
-            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(opt_ctx->backend_sched, node);
-            if (!backend) {
-                continue;
-            }
-
-            const char * backend_name = ggml_backend_name(backend);
-            if (!backend_name) {
-                continue;
-            }
-
-            int backend_type;
-            if (std::strncmp(backend_name, "CPU", 3) == 0) {
-                backend_type = 0;
-            } else if (std::strncmp(backend_name, "CUDA", 4) == 0) {
-                backend_type = 1;
-            } else {
-                continue;
-            }
-
-            const char * phase = "unknown";
-            int phase_type = 3;
-            if (opt_ctx->allocated_graph == opt_ctx->gf) {
-                phase = "forward";
-                phase_type = 0;
-            } else if (opt_ctx->allocated_graph == opt_ctx->gb_grad) {
-                if (i < opt_ctx->n_forward_nodes) {
-                    phase = "forward";
-                    phase_type = 0;
-                } else {
-                    phase = "backward";
-                    phase_type = 1;
-                }
-            } else if (opt_ctx->allocated_graph == opt_ctx->gb_opt) {
-                if (i < opt_ctx->n_forward_nodes) {
-                    phase = "forward";
-                    phase_type = 0;
-                } else if (opt_ctx->gb_grad && i < opt_ctx->gb_grad->n_nodes) {
-                    phase = "backward";
-                    phase_type = 1;
-                } else {
-                    phase = "optimizer";
-                    phase_type = 2;
-                }
-            }
-
-            int op_variant = 0;
-            if (node->op == GGML_OP_UNARY) {
-                const enum ggml_unary_op unary_op = ggml_get_unary_op(node);
-                if (unary_op < 0 || unary_op >= GGML_UNARY_OP_COUNT) {
-                    continue;
-                }
-                op_variant = static_cast<int>(unary_op) + 1;
-            } else if (node->op == GGML_OP_GLU) {
-                const enum ggml_glu_op glu_op = ggml_get_glu_op(node);
-                if (glu_op < 0 || glu_op >= GGML_GLU_OP_COUNT) {
-                    continue;
-                }
-                op_variant = static_cast<int>(glu_op) + 1;
-            }
-
-            if (logged[backend_type][phase_type][node->op][op_variant]) {
-                continue;
-            }
-            logged[backend_type][phase_type][node->op][op_variant] = true;
-
-            if (node->op == GGML_OP_UNARY) {
-                GGML_LOG_INFO("[op-backend] phase=%s backend=%s op=%s(%s) node=%s\n",
-                    phase, backend_name, ggml_op_name(node->op), ggml_unary_op_name(ggml_get_unary_op(node)), node->name);
-            } else if (node->op == GGML_OP_GLU) {
-                GGML_LOG_INFO("[op-backend] phase=%s backend=%s op=%s(%s) node=%s\n",
-                    phase, backend_name, ggml_op_name(node->op), ggml_glu_op_name(ggml_get_glu_op(node)), node->name);
-            } else {
-                GGML_LOG_INFO("[op-backend] phase=%s backend=%s op=%s node=%s\n",
-                    phase, backend_name, ggml_op_name(node->op), node->name);
-            }
         }
     }
 
@@ -1657,7 +1562,6 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
         }
     }
 
-    ggml_opt_log_op_backends(opt_ctx);
     ggml_backend_sched_graph_compute(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
     if (result && opt_ctx->allocated_graph == opt_ctx->gb_opt && opt_ctx->grad_stats_interval > 0 &&
         opt_ctx->iter % opt_ctx->grad_stats_interval == 0) {

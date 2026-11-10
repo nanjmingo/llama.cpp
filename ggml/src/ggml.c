@@ -1038,7 +1038,6 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "MUL_MAT",
     "MUL_MAT_ID",
     "OUT_PROD",
-    "OUT_PROD_ID",
 
     "SCALE",
     "SET",
@@ -1096,7 +1095,6 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "RWKV_WKV7",
     "SOLVE_TRI",
     "GATED_DELTA_NET",
-    "GATED_DELTA_NET_BACK",
     "LIGHTNING_INDEXER",
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
@@ -1117,6 +1115,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+    "OUT_PROD_ID",
+    "GATED_DELTA_NET_BACK",
     "MUL_MAT_ID_BACK",
 };
 
@@ -1157,7 +1157,6 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "X*Y",
     "X[i]*Y",
     "X*Y",
-    "X_id⊗Y_id",
 
     "x*v",
     "y-\\>view(x)",
@@ -1215,7 +1214,6 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "rwkv_wkv7(r, w, k, v, a, b, s)",
     "A X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
-    "gated_delta_net_back(q, k, v, g, beta, s, d)",
     "lightning_indexer(q, k, weights, mask)",
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
@@ -1236,6 +1234,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+    "X_id⊗Y_id",
+    "gated_delta_net_back(q, k, v, g, beta, s, d)",
     "dY -> dB via X[i]^T",
 };
 

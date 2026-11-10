@@ -528,7 +528,6 @@ extern "C" {
         GGML_OP_MUL_MAT,
         GGML_OP_MUL_MAT_ID,
         GGML_OP_OUT_PROD,
-        GGML_OP_OUT_PROD_ID, // scattered outer-product for MUL_MAT_ID backward (MoE LoRA)
 
         GGML_OP_SCALE,
         GGML_OP_SET,
@@ -586,7 +585,6 @@ extern "C" {
         GGML_OP_RWKV_WKV7,
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
-        GGML_OP_GATED_DELTA_NET_BACK,
         GGML_OP_LIGHTNING_INDEXER,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
@@ -608,7 +606,9 @@ extern "C" {
 
         GGML_OP_GLU,
 
-        // Added at the end to preserve existing GGML_OP numeric values.
+        // New operations are appended to preserve existing GGML_OP numeric values.
+        GGML_OP_OUT_PROD_ID, // scattered outer-product for MUL_MAT_ID backward (MoE LoRA)
+        GGML_OP_GATED_DELTA_NET_BACK,
         GGML_OP_MUL_MAT_ID_BACK,
 
         GGML_OP_COUNT,
