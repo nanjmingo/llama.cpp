@@ -264,11 +264,18 @@ Checkpoint format version 4 stores the current epoch's accumulated loss, data
 count, and supervision-weight sum, so progress averages and the final epoch loss
 continue across a mid-epoch resume. Version 3 checkpoints remain readable, but
 they do not contain these aggregates; their resumed epoch statistics start at
-the checkpoint position. Preserve the original training configuration: the base
-model file, dataset files, architecture, LoRA rank/alpha targets, frozen layers,
-context length, accumulation steps, optimizer, learning rate and scheduler
-settings, `--max-steps`, `--val-windows`, and effective epoch count are validated
-before resume. The current dataset permutation is restored from
+the checkpoint position. The base model file, dataset files, architecture, LoRA
+rank/alpha/targets, frozen layers, context length, gradient accumulation steps,
+invalid-record handling, optimizer, and optimizer-state type must match the
+checkpoint. These settings determine the model, dataset, trainable parameters,
+or optimizer-state layout. `--learning-rate`, `--learning-rate-min`,
+`--weight-decay`, `--learning-rate-decay-epochs`, `--lr-scheduler`,
+`--warmup-steps`, `--warmup-init-ratio`, `--epochs`, `--max-steps`,
+`--val-windows`, `--shuffle-dataset`, `--lora-type`, `--forward-precision`,
+`--backward-precision`, and checkpoint/snapshot intervals and retention limits
+may be changed when resuming. A shorter training limit is accepted only when
+the checkpoint still has optimizer steps remaining. The current dataset
+permutation is restored from
 `training-state.json`. The optimizer RNG state, AdamW moments, optimizer
 iteration, scheduler step, and next epoch/window are restored from the
 checkpoint; the RNG state includes the state used for future dataset shuffles.

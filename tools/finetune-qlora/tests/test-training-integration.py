@@ -515,6 +515,18 @@ def main():
             r"saved checkpoint and snapshot \(optimizer step 2\)", train_log
         ):
             raise RuntimeError("training did not save both checkpoints required for resume equivalence")
+        checkpoint_logs = re.findall(
+            r"saved checkpoint(?: and snapshot)? \(optimizer step (\d+)\) "
+            r"avg_loss=([^\s]+) elapsed=(\d{2,}:\d{2}:\d{2})",
+            train_log,
+        )
+        if not checkpoint_logs:
+            raise RuntimeError("checkpoint save logs did not report average loss and elapsed time")
+        for step, average_loss, elapsed in checkpoint_logs:
+            if not math.isfinite(float(average_loss)) or float(average_loss) < 0:
+                raise RuntimeError(f"checkpoint {step} reported an invalid average loss: {average_loss}")
+            if not re.fullmatch(r"\d{2,}:\d{2}:\d{2}", elapsed):
+                raise RuntimeError(f"checkpoint {step} reported an invalid elapsed time: {elapsed}")
         saved_snapshots = sorted(output_dir.glob("snapshot-*.gguf"))
         if not saved_snapshots:
             raise RuntimeError("training did not save a periodic adapter snapshot")
@@ -602,6 +614,20 @@ def main():
             return tuple(float(value) for value in matches[0])
 
         uninterrupted_progress = progress_rows(train_log)
+        checkpoint_average_by_step = {}
+        for step, average_loss, _ in checkpoint_logs:
+            checkpoint_average_by_step.setdefault(int(step), float(average_loss))
+        for step, window in ((1, 2), (2, 4)):
+            progress_average = next(
+                (row["average"] for row in uninterrupted_progress if row["window"] == window), None
+            )
+            checkpoint_average = checkpoint_average_by_step.get(step)
+            if progress_average is None or checkpoint_average is None or not math.isclose(
+                checkpoint_average, progress_average, rel_tol=2e-3, abs_tol=2e-3,
+            ):
+                raise RuntimeError(
+                    f"checkpoint {step} average loss does not match progress at window {window}"
+                )
         if not math.isclose(
             train_loss, uninterrupted_progress[-1]["average"], rel_tol=2e-3, abs_tol=2e-3,
         ):
@@ -624,13 +650,12 @@ def main():
                 "--learning-rate", "1e-5",
                 "--epochs", "1",
                 "--max-steps", "2",
-                "--val-windows", "0",
                 "--gradient-accumulation-steps", "2",
                 "--save-snapshot-steps", "1",
                 "--save-snapshot-limit", "1",
                 "--save-checkpoint-steps", "1",
                 "--save-checkpoint-limit", "2",
-                "--shuffle-dataset",
+                "--val-windows", "1",
                 "--seed", "42",
                 "--resume-from", checkpoint_one,
             ],
@@ -694,6 +719,65 @@ def main():
             if resumed_state.get(key) != uninterrupted_state.get(key):
                 raise RuntimeError(f"resumed checkpoint metadata differs for {key}")
 
+        changed_output_dir = work / "changed-resume-output"
+        changed_log = run(
+            [
+                args.trainer,
+                *common,
+                "--train-file", train_file,
+                "--output-dir", changed_output_dir,
+                "--lora-rank", "2",
+                "--lora-alpha", "2",
+                "--lora-type", "f16",
+                "--learning-rate", "2e-5",
+                "--learning-rate-min", "1e-6",
+                "--weight-decay", "0.01",
+                "--epochs", "2",
+                "--max-steps", "3",
+                "--val-windows", "1",
+                "--gradient-accumulation-steps", "2",
+                "--lr-scheduler", "cosine",
+                "--warmup-steps", "1",
+                "--warmup-init-ratio", "0.2",
+                "--forward-precision", "f16",
+                "--backward-precision", "f16",
+                "--save-checkpoint-limit", "1",
+                "--resume-from", checkpoint_one,
+            ],
+            args.timeout,
+            f"resumed {backend_label} QLoRA training with changed compatible settings",
+            verbose=args.verbose_subprocess_logs,
+        )
+        if args.require_cuda:
+            require_cuda_offload(changed_log, "resumed training with changed settings")
+            require_backward_precision(changed_log, "f16", "resumed training with changed settings")
+        changed_checkpoint = changed_output_dir / "checkpoint-000003"
+        require_gguf(changed_output_dir / "adapter.gguf", "adapter from resumed training with changed settings")
+        require_gguf(changed_checkpoint / "adapter.gguf", "checkpoint adapter from resumed training with changed settings")
+        changed_state = json.loads((changed_checkpoint / "training-state.json").read_text(encoding="utf-8"))
+        expected_changed_settings = {
+            "lora_type": "f16",
+            "lr_scheduler": "cosine",
+            "warmup_steps": 1,
+            "max_steps": 3,
+            "val_windows": 1,
+            "forward_precision": "f16",
+            "backward_precision": "f16",
+        }
+        for key, expected in expected_changed_settings.items():
+            if changed_state.get(key) != expected:
+                raise RuntimeError(f"resumed checkpoint did not persist changed setting {key}")
+        for key, expected in {
+            "learning_rate": 2e-5,
+            "learning_rate_min": 1e-6,
+            "weight_decay": 0.01,
+            "warmup_init_ratio": 0.2,
+        }.items():
+            if not math.isclose(float(changed_state.get(key, math.nan)), expected, rel_tol=1e-6, abs_tol=1e-12):
+                raise RuntimeError(f"resumed checkpoint did not persist changed setting {key}")
+        if changed_state.get("scheduler_step") != 3:
+            raise RuntimeError("resume with changed training settings did not reach the new max-steps limit")
+
         if not args.skip_perplexity:
             adapter_log = run(
                 [args.perplexity, *eval_common, "--lora", adapter_file],
@@ -705,7 +789,7 @@ def main():
             if args.require_cuda:
                 require_cuda_offload(adapter_log, "trained adapter perplexity")
 
-        print(f"[PASS] {backend_label} model-backed training and resume equivalence", flush=True)
+        print(f"[PASS] {backend_label} model-backed training and resume tests", flush=True)
 
 
 if __name__ == "__main__":

@@ -634,7 +634,7 @@ bool validate_resume_config(const qlora_checkpoint & checkpoint,
     const common_json & state = checkpoint.metadata;
     try {
         auto fail = [](const char * key) {
-            LOG_ERR("%s: resume configuration mismatch for '%s'; use the settings from the checkpoint\n", __func__, key);
+            LOG_ERR("%s: resume configuration mismatch for '%s'; this setting must match the checkpoint\n", __func__, key);
             return false;
         };
         if (state.at("base_model_path").get<std::string>() != canonical_path_string(params.model.path)) return fail("base_model_path");
@@ -649,29 +649,11 @@ bool validate_resume_config(const qlora_checkpoint & checkpoint,
         if (state.at("lora_targets").get<std::string>() != qparams.lora_targets) return fail("lora_targets");
         if (state.at("freeze_layers").get<int32_t>() != qparams.freeze_layers) return fail("freeze_layers");
         if (state.at("gradient_accumulation_steps").get<int32_t>() != qparams.gradient_accumulation_steps) return fail("gradient_accumulation_steps");
-        if (state.value("max_steps", int32_t(0)) != qparams.max_steps) return fail("max_steps");
-        if (state.value("val_windows", int32_t(-1)) != qparams.val_windows) return fail("val_windows");
         if (state.at("context_length").get<int32_t>() != n_ctx) return fail("context_length");
         if (state.at("dataset_windows").get<int64_t>() != dataset_windows) return fail("dataset_windows");
-        if (state.at("shuffle_dataset").get<bool>() != qparams.shuffle_dataset) return fail("shuffle_dataset");
         if (state.at("skip_invalid_records").get<bool>() != qparams.dataset.skip_invalid) return fail("skip_invalid_records");
-        if (state.at("lr_scheduler").get<std::string>() != qparams.lr_scheduler) return fail("lr_scheduler");
-        if (state.at("warmup_steps").get<int32_t>() != qparams.warmup_steps) return fail("warmup_steps");
-        if (std::fabs(state.at("warmup_init_ratio").get<double>() - qparams.warmup_init_ratio) > 1e-7) return fail("warmup_init_ratio");
-        if (state.at("learning_rate").get<double>() != params.lr.lr0) return fail("learning_rate");
-        if (state.at("learning_rate_min").get<double>() != params.lr.lr_min) return fail("learning_rate_min");
-        if (state.at("weight_decay").get<double>() != params.lr.wd) return fail("weight_decay");
-        if (state.at("total_epochs").get<unsigned int>() != params.lr.epochs) return fail("total_epochs");
         if (state.at("optimizer").get<std::string>() != ggml_opt_optimizer_name(params.optimizer)) return fail("optimizer");
-        if (state.at("lora_type").get<std::string>() != qparams.lora_type) return fail("lora_type");
         if (state.at("optimizer_state_type").get<std::string>() != qparams.optimizer_state_type) return fail("optimizer_state_type");
-        const std::string saved_forward_precision = state.value("forward_precision", std::string("f32"));
-        if (saved_forward_precision != qparams.forward_precision_name) {
-            return fail("forward_precision");
-        }
-        if (state.value("backward_precision", std::string("f32")) != qparams.backward_precision_name) {
-            return fail("backward_precision");
-        }
         const ggml_opt_optimizer_params optimizer_defaults = ggml_opt_get_default_optimizer_params(nullptr);
         if (std::fabs(state.at("adamw_beta1").get<float>() - optimizer_defaults.adamw.beta1) > 1e-7f ||
             std::fabs(state.at("adamw_beta2").get<float>() - optimizer_defaults.adamw.beta2) > 1e-7f ||
@@ -906,6 +888,7 @@ struct save_context {
     int32_t save_snapshot_steps = 0;
     int32_t save_snapshot_limit = 0;
     int32_t gradient_accumulation_steps = 1;
+    int64_t training_start_us = 0;
     int64_t dataset_windows = 0;
     std::vector<int64_t> dataset_permutation;
     int64_t epoch = 0; // one-based
@@ -1052,6 +1035,21 @@ void split_progress_time(int64_t elapsed_us, int64_t & hours, int64_t & minutes,
     remaining_seconds -= hours * 3600;
     minutes = remaining_seconds / 60;
     seconds = remaining_seconds - minutes * 60;
+}
+
+void log_saved_checkpoint(const save_context & state, bool snapshot_saved) {
+    const double average_loss = calculate_weighted_training_loss(
+        state.training_loss_sum, static_cast<double>(llama_n_ctx(state.ctx)), state.training_weight_sum);
+    const std::string average_loss_text = format_four_significant_digits(average_loss);
+    const int64_t elapsed_us = std::max<int64_t>(0, ggml_time_us() - state.training_start_us);
+    int64_t elapsed_h = 0;
+    int64_t elapsed_m = 0;
+    int64_t elapsed_s = 0;
+    split_progress_time(elapsed_us, elapsed_h, elapsed_m, elapsed_s);
+
+    LOG_INF("%s (optimizer step %ld) avg_loss=%s elapsed=%02" PRId64 ":%02" PRId64 ":%02" PRId64 "\n",
+            snapshot_saved ? "saved checkpoint and snapshot" : "saved checkpoint",
+            static_cast<long>(state.schedule->step), average_loss_text.c_str(), elapsed_h, elapsed_m, elapsed_s);
 }
 
 bool get_window_training_statistics(const save_context & state,
@@ -1231,12 +1229,11 @@ void save_step_callback(bool               train,
     const bool snapshot_saved = save_snapshot_if_due(*g_save_context, ibatch);
     const bool checkpoint_saved = save_checkpoint_if_due(*g_save_context, ibatch);
     if (snapshot_saved && checkpoint_saved) {
-        LOG_INF("saved checkpoint and snapshot (optimizer step %ld)\n",
-                static_cast<long>(g_save_context->schedule->step));
+        log_saved_checkpoint(*g_save_context, true);
     } else if (snapshot_saved) {
         LOG_INF("saved snapshot (optimizer step %ld)\n", static_cast<long>(g_save_context->schedule->step));
     } else if (checkpoint_saved) {
-        LOG_INF("saved checkpoint (optimizer step %ld)\n", static_cast<long>(g_save_context->schedule->step));
+        log_saved_checkpoint(*g_save_context, false);
     }
 }
 
@@ -1414,6 +1411,7 @@ bool train_adapter(const qlora_params & qparams,
     save_state.gradient_accumulation_steps = qparams.gradient_accumulation_steps;
     save_state.dataset_windows = dataset_windows;
     save_state.schedule = &schedule;
+    save_state.training_start_us = ggml_time_us();
     save_context_scope callback_scope(save_state);
 
     LOG_INF("%s: starting QLoRA training — rank=%d alpha=%.1f epochs=%d loss=assistant-response-only\n", __func__,
@@ -1521,6 +1519,7 @@ bool train_adapter(const qlora_params & qparams,
                 LOG_ERR("%s: final resumable checkpoint could not be saved\n", __func__);
                 return false;
             }
+            log_saved_checkpoint(save_state, false);
             save_state.last_checkpoint_step = schedule.step;
             save_state.last_checkpoint_next_epoch = final_next_epoch;
             save_state.last_checkpoint_next_window = final_next_window;
