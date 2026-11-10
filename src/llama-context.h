@@ -14,6 +14,7 @@
 
 #include <array>
 #include <map>
+#include <unordered_set>
 #include <vector>
 
 struct llama_model;
@@ -219,13 +220,22 @@ struct llama_context {
     //
 
     void opt_init(struct llama_model * model, struct llama_opt_params lopt_params);
+    void opt_set_seed(uint32_t seed);
+    void opt_set_opt_period(int32_t opt_period);
+    void opt_set_grad_stats_interval(int32_t interval);
+    size_t opt_state_size() const;
+    bool opt_state_export(void * data, size_t size) const;
+    bool opt_state_import(const void * data, size_t size);
+    void opt_dataset_shuffle(ggml_opt_dataset_t dataset, int64_t idata);
 
     // TODO: more flexible combinations of logical/physical batch size and context size
     void opt_epoch(
             ggml_opt_dataset_t      dataset,
             ggml_opt_result_t       result_train,
             ggml_opt_result_t       result_eval,
+            int64_t                 idata_start,
             int64_t                 idata_split,
+            int64_t                 idata_eval_end,
             ggml_opt_epoch_callback callback_train,
             ggml_opt_epoch_callback callback_eval);
 
@@ -234,12 +244,15 @@ struct llama_context {
             ggml_opt_result_t                result,
             const std::vector<llama_token> & tokens,
             const std::vector<llama_token> & labels_sparse,
+            const std::vector<float>       & label_weights,
             llama_batch                    & batch,
             ggml_opt_epoch_callback          callback,
             bool                             train,
             int64_t                          idata_in_loop,
             int64_t                          ndata_in_loop,
-            int64_t                          t_loop_start);
+            int64_t                          t_loop_start,
+            std::unordered_set<const ggml_tensor *> & lora_grad_seen,
+            int64_t & n_train_graphs);
 
 private:
     //
@@ -293,7 +306,8 @@ private:
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
+                          llm_graph_type   gtype,
+                                    bool   training_graph = false) const;
 
     llm_graph_cb graph_get_cb() const;
 
@@ -421,6 +435,8 @@ private:
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;
+    int32_t opt_accumulation_period = 0;
+    std::unordered_set<const ggml_tensor *> opt_lora_grad_warned;
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;
