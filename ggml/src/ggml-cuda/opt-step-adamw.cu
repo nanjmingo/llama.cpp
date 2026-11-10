@@ -37,14 +37,10 @@ static __device__ __forceinline__ float opt_adamw_load(const void * data, const 
         return static_cast<const float *>(data)[i];
     } else if constexpr (type == GGML_TYPE_F16) {
         return __half2float(static_cast<const half *>(data)[i]);
-    } else if constexpr (type == GGML_TYPE_BF16) {
+    } else {
+        static_assert(type == GGML_TYPE_BF16, "unsupported AdamW tensor type");
         const uint32_t bits = static_cast<const ggml_bf16_t *>(data)[i].bits;
         return __uint_as_float(bits << 16);
-    } else {
-        static_assert(type == GGML_TYPE_Q8_0, "unsupported AdamW tensor type");
-        const block_q8_0 * blocks = static_cast<const block_q8_0 *>(data);
-        const block_q8_0 & block = blocks[i / QK8_0];
-        return __half2float(block.d) * block.qs[i % QK8_0];
     }
 }
 
@@ -54,23 +50,11 @@ static __device__ __forceinline__ void opt_adamw_store(void * data, const int64_
         static_cast<float *>(data)[i] = value;
     } else if constexpr (type == GGML_TYPE_F16) {
         static_cast<half *>(data)[i] = __float2half_rn(value);
-    } else if constexpr (type == GGML_TYPE_BF16) {
+    } else {
+        static_assert(type == GGML_TYPE_BF16, "unsupported AdamW tensor type");
         uint32_t bits = __float_as_uint(value);
         bits += 0x7fff + ((bits >> 16) & 1);
         static_cast<ggml_bf16_t *>(data)[i].bits = static_cast<uint16_t>(bits >> 16);
-    } else {
-        static_assert(type == GGML_TYPE_Q8_0, "unsupported AdamW tensor type");
-        block_q8_0 * blocks = static_cast<block_q8_0 *>(data);
-        const float amax = warp_reduce_max(fabsf(value));
-        const float d = amax / 127.0f;
-        const float id = d > 0.0f ? 1.0f / d : 0.0f;
-        int q = static_cast<int>(roundf(value * id));
-        q = q < -128 ? -128 : (q > 127 ? 127 : q);
-        block_q8_0 & block = blocks[i / QK8_0];
-        block.qs[i % QK8_0] = static_cast<int8_t>(q);
-        if ((threadIdx.x % QK8_0) == 0) {
-            block.d = __float2half_rn(d);
-        }
     }
 }
 
@@ -109,15 +93,8 @@ static __global__ void opt_step_adamw_mixed(
         w = w * (1.0f - alpha * wd) - alpha * mh / vh;
     }
 
-    if constexpr (weight_type == GGML_TYPE_Q8_0) {
+    if (valid) {
         opt_adamw_store<weight_type>(weights, i, w);
-    } else if (valid) {
-        opt_adamw_store<weight_type>(weights, i, w);
-    }
-    if constexpr (state_type == GGML_TYPE_Q8_0) {
-        opt_adamw_store<state_type>(moment_m, i, m);
-        opt_adamw_store<state_type>(moment_v, i, v);
-    } else if (valid) {
         opt_adamw_store<state_type>(moment_m, i, m);
         opt_adamw_store<state_type>(moment_v, i, v);
     }
@@ -141,7 +118,6 @@ static void opt_step_adamw_dispatch_state(
         case GGML_TYPE_F32: opt_step_adamw_mixed_cuda<weight_type, GGML_TYPE_F32>(weights, grad, moment_m, moment_v, pars, n, stream); break;
         case GGML_TYPE_F16: opt_step_adamw_mixed_cuda<weight_type, GGML_TYPE_F16>(weights, grad, moment_m, moment_v, pars, n, stream); break;
         case GGML_TYPE_BF16: opt_step_adamw_mixed_cuda<weight_type, GGML_TYPE_BF16>(weights, grad, moment_m, moment_v, pars, n, stream); break;
-        case GGML_TYPE_Q8_0: opt_step_adamw_mixed_cuda<weight_type, GGML_TYPE_Q8_0>(weights, grad, moment_m, moment_v, pars, n, stream); break;
         default: GGML_ABORT("unsupported AdamW state type");
     }
 }
@@ -154,7 +130,6 @@ void ggml_cuda_opt_step_adamw(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const ggml_tensor * adamw_params = dst->src[4];
 
     GGML_ASSERT(src0_grad->type == GGML_TYPE_F32);
-    GGML_ASSERT(src0_grad_m->type == src0_grad_v->type);
     GGML_ASSERT(adamw_params->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(src0));
     GGML_ASSERT(ggml_is_contiguous(src0_grad));
@@ -166,13 +141,25 @@ void ggml_cuda_opt_step_adamw(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     const int64_t ne = ggml_nelements(src0);
     const ggml_type state_type = src0_grad_m->type;
-    if (state_type == GGML_TYPE_Q8_0) {
-        GGML_ASSERT(ggml_nelements(src0_grad_m) >= ne && ggml_nelements(src0_grad_v) >= ne);
-        GGML_ASSERT(ggml_nelements(src0_grad_m) % QK8_0 == 0 && ggml_nelements(src0_grad_v) % QK8_0 == 0);
-    } else {
-        GGML_ASSERT(ggml_are_same_shape(src0, src0_grad_m));
-        GGML_ASSERT(ggml_are_same_shape(src0, src0_grad_v));
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16: break;
+        default: GGML_ABORT("unsupported AdamW parameter type");
     }
+    switch (state_type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16: break;
+        default: GGML_ABORT("unsupported AdamW state type");
+    }
+    if (src0_grad_v->type != state_type) {
+        GGML_ABORT("AdamW state tensors must have the same type");
+    }
+
+    GGML_ASSERT(ggml_are_same_shape(src0, src0_grad_m));
+    GGML_ASSERT(ggml_are_same_shape(src0, src0_grad_v));
 
     void * weights = src0->data;
     const float * grad = static_cast<const float *>(src0_grad->data);
@@ -191,7 +178,6 @@ void ggml_cuda_opt_step_adamw(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         case GGML_TYPE_F32:  opt_step_adamw_dispatch_state<GGML_TYPE_F32>(weights, grad, moment_m, moment_v, pars, ne, state_type, stream); break;
         case GGML_TYPE_F16:  opt_step_adamw_dispatch_state<GGML_TYPE_F16>(weights, grad, moment_m, moment_v, pars, ne, state_type, stream); break;
         case GGML_TYPE_BF16: opt_step_adamw_dispatch_state<GGML_TYPE_BF16>(weights, grad, moment_m, moment_v, pars, ne, state_type, stream); break;
-        case GGML_TYPE_Q8_0: opt_step_adamw_dispatch_state<GGML_TYPE_Q8_0>(weights, grad, moment_m, moment_v, pars, ne, state_type, stream); break;
         default: GGML_ABORT("unsupported AdamW parameter type");
     }
 }
