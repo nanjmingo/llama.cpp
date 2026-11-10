@@ -833,8 +833,8 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
 
         ggml_tensor * labels_sum = ggml_sum_rows(ctx_results, opt_ctx->labels);
         ggml_tensor * labels_valid = ggml_step(ctx_results, ggml_abs(ctx_results, labels_sum));
-        ggml_tensor * labels_invalid = ggml_sub(ctx_results,
-            ggml_fill(ctx_results, labels_valid, 1.0f), labels_valid);
+        labels_valid = ggml_reshape_1d(ctx_results, labels_valid, ggml_nelements(opt_ctx->pred));
+        ggml_tensor * labels_invalid = ggml_scale_bias(ctx_results, labels_valid, -1.0f, 1.0f);
 
         ggml_tensor * pred_masked = ggml_mul(ctx_results,
             ggml_cast(ctx_results, opt_ctx->pred, GGML_TYPE_F32), labels_valid);

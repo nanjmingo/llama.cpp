@@ -6531,20 +6531,12 @@ struct ggml_tensor * ggml_opt_step_adamw(
     GGML_ASSERT(ggml_are_same_shape(a, grad));
     GGML_ASSERT(grad->type == GGML_TYPE_F32);
     GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16 ||
-                a->type == GGML_TYPE_BF16 || a->type == GGML_TYPE_Q8_0);
+                a->type == GGML_TYPE_BF16);
     GGML_ASSERT(m->type == v->type);
     GGML_ASSERT(m->type == GGML_TYPE_F32 || m->type == GGML_TYPE_F16 ||
-                m->type == GGML_TYPE_BF16 || m->type == GGML_TYPE_Q8_0);
-    if (m->type == GGML_TYPE_Q8_0) {
-        GGML_ASSERT(ggml_is_contiguous(m) && ggml_is_contiguous(v));
-        GGML_ASSERT(ggml_nelements(m) >= ggml_nelements(a));
-        GGML_ASSERT(ggml_nelements(v) >= ggml_nelements(a));
-        GGML_ASSERT(ggml_nelements(m) % ggml_blck_size(GGML_TYPE_Q8_0) == 0);
-        GGML_ASSERT(ggml_nelements(v) % ggml_blck_size(GGML_TYPE_Q8_0) == 0);
-    } else {
-        GGML_ASSERT(ggml_are_same_shape(a, m));
-        GGML_ASSERT(ggml_are_same_shape(a, v));
-    }
+                m->type == GGML_TYPE_BF16);
+    GGML_ASSERT(ggml_are_same_shape(a, m));
+    GGML_ASSERT(ggml_are_same_shape(a, v));
     GGML_ASSERT(adamw_params->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_nelements(adamw_params) == 7);
 
