@@ -2600,8 +2600,6 @@ extern "C" {
            struct ggml_tensor  * fa,
            struct ggml_tensor  * d);
 
-    GGML_API int64_t ggml_flash_attn_back_offset(const struct ggml_tensor * back, int part);
-
     GGML_API struct ggml_tensor * ggml_ssm_conv(
             struct ggml_context * ctx,
             struct ggml_tensor  * sx,

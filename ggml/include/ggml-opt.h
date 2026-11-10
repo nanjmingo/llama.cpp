@@ -161,7 +161,6 @@ extern "C" {
         enum ggml_opt_optimizer_type optimizer;
 
         // Storage type for AdamW's first and second moments. F32 is the default.
-        // Q8_0 moments use padded, flat tensors and are supported by CPU/CUDA.
         enum ggml_type optimizer_state_type;
     };
 

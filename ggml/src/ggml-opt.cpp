@@ -875,15 +875,8 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
                     const size_t sz = 2 * ggml_tensor_overhead();
                     struct ggml_init_params mip = { sz, nullptr, true };
                     struct ggml_context * mctx = ggml_init(mip);
-                    if (opt_ctx->optimizer_state_type == GGML_TYPE_Q8_0) {
-                        const int64_t ne_padded = GGML_PAD(ggml_nelements(node), ggml_blck_size(GGML_TYPE_Q8_0));
-                        opt_ctx->grad_m[i] = ggml_new_tensor_1d(mctx, GGML_TYPE_Q8_0, ne_padded);
-                        opt_ctx->grad_v[i] = ggml_new_tensor_1d(mctx, GGML_TYPE_Q8_0, ne_padded);
-                        ggml_quantize_init(GGML_TYPE_Q8_0);
-                    } else {
-                        opt_ctx->grad_m[i] = ggml_new_tensor(mctx, opt_ctx->optimizer_state_type, GGML_MAX_DIMS, node->ne);
-                        opt_ctx->grad_v[i] = ggml_new_tensor(mctx, opt_ctx->optimizer_state_type, GGML_MAX_DIMS, node->ne);
-                    }
+                    opt_ctx->grad_m[i] = ggml_new_tensor(mctx, opt_ctx->optimizer_state_type, GGML_MAX_DIMS, node->ne);
+                    opt_ctx->grad_v[i] = ggml_new_tensor(mctx, opt_ctx->optimizer_state_type, GGML_MAX_DIMS, node->ne);
                     ggml_backend_buffer_t mbuf = ggml_backend_alloc_ctx_tensors_from_buft(mctx, param_buft);
                     ggml_backend_buffer_clear(mbuf, 0);
                     opt_ctx->bufs_momenta.push_back(mbuf);
