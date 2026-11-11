@@ -20,6 +20,7 @@
 #include "args.h"
 #include "dataset.h"
 #include "schedule.h"
+#include "save-worker.h"
 
 // Internal adapter struct is needed to mark the loaded LoRA tensors trainable.
 #include "../../src/llama-adapter.h"
@@ -700,147 +701,61 @@ bool validate_resume_config(const qlora_checkpoint & checkpoint,
     return true;
 }
 
-bool save_qlora_checkpoint(const std::filesystem::path & root,
-                           const lora_tensor_refs & output_refs,
-                           const std::string & arch,
-                           float lora_alpha,
-                           const std::string & base_model_path,
-                           const qlora_params & qparams,
-                           const common_params & params,
-                           llama_context * ctx,
-                           ggml_opt_dataset_t dataset,
-                           const qlora_lr_schedule & schedule,
-                           int32_t n_ctx,
-                           int64_t dataset_windows,
-                           int64_t next_epoch,
-                           int64_t next_window,
-                           bool training_statistics_complete,
-                           double training_loss_sum,
-                           int64_t training_data_count,
-                           double training_weight_sum,
-                           const std::filesystem::path & adapter_source,
-                           int32_t limit,
-                           std::filesystem::path * saved_directory = nullptr,
-                           bool * validation_failed = nullptr) {
-    if (validation_failed) *validation_failed = false;
-    if (root.empty() || limit <= 0) return false;
-    if (!llama_opt_state_is_finite(ctx)) {
-        if (validation_failed) *validation_failed = true;
-        LOG_ERR("%s: optimizer state contains non-finite values or is not at a valid optimizer-step boundary\n", __func__);
-        return false;
-    }
-    if (!adapter_source.empty()) {
-        std::string validation_error;
-        if (!lora_tensors_are_finite(output_refs, &validation_error)) {
-            if (validation_failed) *validation_failed = true;
-            LOG_ERR("%s: refusing to checkpoint invalid adapter tensors: %s\n", __func__, validation_error.c_str());
-            return false;
-        }
-    }
-    const size_t state_size = llama_opt_state_size(ctx);
-    if (state_size == 0) {
-        LOG_ERR("%s: optimizer state is not available at a checkpoint boundary\n", __func__);
-        return false;
-    }
-    std::vector<uint8_t> optimizer_state(state_size);
-    if (!llama_opt_state_export(ctx, optimizer_state.data(), optimizer_state.size())) {
-        LOG_ERR("%s: failed to export optimizer state\n", __func__);
-        return false;
-    }
-    const int64_t permutation_size = ggml_opt_dataset_permutation_size(dataset);
-    if (permutation_size != dataset_windows) return false;
-    std::vector<int64_t> permutation(static_cast<size_t>(permutation_size));
-    if (!ggml_opt_dataset_get_permutation(dataset, permutation.data(), permutation_size)) return false;
+struct qlora_save_job {
+    std::filesystem::path output_root;
+    std::filesystem::path snapshot_path;
+    std::filesystem::path final_adapter_path;
+    int32_t snapshot_limit = 0;
+    int32_t checkpoint_limit = 0;
+    int64_t step = 0;
+    int64_t next_epoch = 0;
+    int64_t next_window = 0;
+    bool write_snapshot = false;
+    bool write_checkpoint = false;
+    bool write_final_adapter = false;
+    bool snapshot_saved = false;
+    bool checkpoint_saved = false;
+    bool final_adapter_saved = false;
+    lora_adapter_snapshot adapter;
+    std::vector<uint8_t> optimizer_state;
+    std::string optimizer_name;
+    std::string optimizer_state_type;
+    std::string training_state_json;
+    std::string manifest_json;
+};
 
-    common_json state = common_json::object();
-    try {
-        state["format_version"] = 4;
-        dataset_file_identity base_model_identity;
-        if (!get_dataset_file_identity(base_model_path, base_model_identity)) {
-            throw std::runtime_error("cannot inspect base model file: " + base_model_path);
-        }
-        common_json base_model_file = common_json::object();
-        base_model_file["path"] = base_model_identity.path;
-        base_model_file["size"] = base_model_identity.size;
-        state["base_model_path"] = canonical_path_string(base_model_path);
-        state["base_model_file"] = base_model_file;
-        state["architecture"] = arch;
-        state["lora_rank"] = qparams.lora_rank;
-        state["lora_alpha"] = lora_alpha;
-        state["lora_targets"] = qparams.lora_targets;
-        state["freeze_layers"] = qparams.freeze_layers;
-        state["gradient_accumulation_steps"] = qparams.gradient_accumulation_steps;
-        state["max_steps"] = qparams.max_steps;
-        state["val_windows"] = qparams.val_windows;
-        state["context_length"] = n_ctx;
-        state["dataset_windows"] = dataset_windows;
-        state["dataset_files"] = make_dataset_file_metadata(qparams);
-        state["shuffle_dataset"] = qparams.shuffle_dataset;
-        state["skip_invalid_records"] = qparams.dataset.skip_invalid;
-        state["lr_scheduler"] = qparams.lr_scheduler;
-        state["warmup_steps"] = qparams.warmup_steps;
-        state["warmup_init_ratio"] = qparams.warmup_init_ratio;
-        state["learning_rate"] = params.lr.lr0;
-        state["learning_rate_min"] = params.lr.lr_min;
-        state["weight_decay"] = params.lr.wd;
-        state["optimizer"] = ggml_opt_optimizer_name(params.optimizer);
-        state["lora_type"] = qparams.lora_type;
-        state["optimizer_state_type"] = qparams.optimizer_state_type;
-        state["forward_precision"] = qparams.forward_precision_name;
-        state["backward_precision"] = qparams.backward_precision_name;
-        const ggml_opt_optimizer_params optimizer_defaults = ggml_opt_get_default_optimizer_params(nullptr);
-        state["adamw_beta1"] = optimizer_defaults.adamw.beta1;
-        state["adamw_beta2"] = optimizer_defaults.adamw.beta2;
-        state["adamw_eps"] = optimizer_defaults.adamw.eps;
-        state["total_epochs"] = params.lr.epochs;
-        state["next_epoch"] = next_epoch;
-        state["next_window"] = next_window;
-        state["scheduler_step"] = schedule.step;
-        state["training_statistics_complete"] = training_statistics_complete;
-        state["training_loss_sum"] = training_loss_sum;
-        state["training_data_count"] = training_data_count;
-        state["training_weight_sum"] = training_weight_sum;
-        common_json order = common_json::array();
-        for (const int64_t id : permutation) order.push_back(id);
-        state["dataset_permutation"] = order;
-    } catch (const std::exception & ex) {
-        LOG_ERR("%s: failed to build checkpoint metadata: %s\n", __func__, ex.what());
-        return false;
-    }
-
+bool write_checkpoint_from_snapshot(const qlora_save_job & job, std::string & error) {
+    const std::filesystem::path root = job.output_root;
     std::error_code ec;
     std::filesystem::create_directories(root, ec);
     if (ec) {
-        LOG_ERR("%s: cannot create checkpoint directory '%s': %s\n", __func__, root.string().c_str(), ec.message().c_str());
+        error = "cannot create checkpoint directory '" + root.string() + "': " + ec.message();
         return false;
     }
-    const int64_t global_step = schedule.step;
-    const std::filesystem::path final_dir = root / step_name("checkpoint-", global_step);
+
+    const std::filesystem::path final_dir = root / step_name("checkpoint-", job.step);
     const std::filesystem::path backup_dir = final_dir.string() + ".previous";
     const auto temp_stamp = std::chrono::steady_clock::now().time_since_epoch().count();
-    const std::filesystem::path temp_dir = root / ("." + step_name("checkpoint-", global_step) + ".tmp-" + std::to_string(temp_stamp));
+    const std::filesystem::path temp_dir = root /
+        ("." + step_name("checkpoint-", job.step) + ".tmp-" + std::to_string(temp_stamp));
     std::filesystem::create_directory(temp_dir, ec);
-    if (ec) return false;
+    if (ec) {
+        error = "cannot create temporary checkpoint directory '" + temp_dir.string() + "': " + ec.message();
+        return false;
+    }
 
     bool adapter_ok = false;
-    if (!adapter_source.empty()) {
-        adapter_ok = link_or_copy_file(adapter_source, temp_dir / "adapter.gguf");
-    } else {
-        bool adapter_validation_failed = false;
-        adapter_ok = save_adapter(output_refs, (temp_dir / "adapter.gguf").string(),
-                                  arch, lora_alpha, base_model_path, false, &adapter_validation_failed);
-        if (adapter_validation_failed && validation_failed) *validation_failed = true;
+    if (job.write_snapshot && job.snapshot_saved) {
+        adapter_ok = link_or_copy_file(job.snapshot_path, temp_dir / "adapter.gguf");
     }
-    bool ok = adapter_ok &&
-              write_optimizer_file(temp_dir / "optimizer.gguf", optimizer_state, ggml_opt_optimizer_name(params.optimizer), qparams.optimizer_state_type) &&
-              write_text_file(temp_dir / "training-state.json", state.dump(2) + "\n");
-    common_json manifest = common_json::object();
-    manifest["format_version"] = 2;
-    manifest["optimizer_file"] = "optimizer.gguf";
-    manifest["adapter_file"] = "adapter.gguf";
-    manifest["training_state_file"] = "training-state.json";
-    manifest["optimizer_step"] = global_step;
-    if (ok) ok = write_text_file(temp_dir / "manifest.json", manifest.dump(2) + "\n");
+    if (!adapter_ok) {
+        adapter_ok = save_lora_adapter_snapshot(job.adapter, (temp_dir / "adapter.gguf").string(), false);
+    }
+    const bool optimizer_ok = adapter_ok && write_optimizer_file(
+        temp_dir / "optimizer.gguf", job.optimizer_state, job.optimizer_name.c_str(), job.optimizer_state_type);
+    const bool state_ok = optimizer_ok && write_text_file(temp_dir / "training-state.json", job.training_state_json);
+    const bool manifest_ok = state_ok && write_text_file(temp_dir / "manifest.json", job.manifest_json);
+    bool ok = manifest_ok;
 
     if (ok) {
         const bool final_exists = std::filesystem::exists(final_dir, ec);
@@ -871,23 +786,53 @@ bool save_qlora_checkpoint(const std::filesystem::path & root,
             cleanup_ec.clear();
             std::filesystem::rename(backup_dir, final_dir, cleanup_ec);
         }
-        LOG_ERR("%s: failed to write checkpoint under '%s'\n", __func__, root.string().c_str());
+        error = "failed to write checkpoint under '" + root.string() + "'";
         return false;
     }
 
     ec.clear();
     if (std::filesystem::exists(backup_dir, ec) && !ec) {
         std::filesystem::remove_all(backup_dir, ec);
-        if (ec) {
-            LOG_WRN("%s: new checkpoint is valid but previous checkpoint could not be removed: %s\n",
-                    __func__, ec.message().c_str());
-        }
     }
-    if (saved_directory) *saved_directory = final_dir;
-    if (!prune_checkpoints(root, limit)) {
-        LOG_WRN("%s: checkpoint was saved but old checkpoint pruning failed\n", __func__);
+    if (!prune_checkpoints(root, job.checkpoint_limit)) {
+        LOG_WRN("checkpoint was saved but old checkpoint pruning failed under '%s'\n", root.string().c_str());
     }
     return true;
+}
+
+bool write_qlora_save_job(const std::shared_ptr<qlora_save_job> & job, std::string & error) {
+    bool all_ok = true;
+    if (job->write_snapshot) {
+        job->snapshot_saved = save_lora_adapter_snapshot(
+            job->adapter, job->snapshot_path.string(), false);
+        if (job->snapshot_saved) {
+            if (!prune_snapshots(job->output_root, job->snapshot_limit)) {
+                LOG_WRN("snapshot was saved but old snapshot pruning failed\n");
+            }
+        } else {
+            all_ok = false;
+            error = "failed to write adapter snapshot '" + job->snapshot_path.string() + "'";
+        }
+    }
+    if (job->write_checkpoint) {
+        std::string checkpoint_error;
+        job->checkpoint_saved = write_checkpoint_from_snapshot(*job, checkpoint_error);
+        if (!job->checkpoint_saved) {
+            all_ok = false;
+            if (!error.empty()) error += "; ";
+            error += checkpoint_error;
+        }
+    }
+    if (job->write_final_adapter) {
+        job->final_adapter_saved = save_lora_adapter_snapshot(
+            job->adapter, job->final_adapter_path.string(), false);
+        if (!job->final_adapter_saved) {
+            all_ok = false;
+            if (!error.empty()) error += "; ";
+            error += "failed to write final adapter '" + job->final_adapter_path.string() + "'";
+        }
+    }
+    return all_ok;
 }
 
 struct save_context {
@@ -905,7 +850,6 @@ struct save_context {
     int32_t save_snapshot_steps = 0;
     int32_t save_snapshot_limit = 0;
     int32_t gradient_accumulation_steps = 1;
-    int64_t training_start_us = 0;
     int64_t dataset_windows = 0;
     std::vector<int64_t> dataset_permutation;
     int64_t epoch = 0; // one-based
@@ -924,6 +868,8 @@ struct save_context {
     int64_t cached_adapter_step = -1;
     std::filesystem::path cached_adapter_path;
     qlora_lr_schedule * schedule = nullptr;
+    qlora_save_worker * worker = nullptr;
+    std::shared_ptr<qlora_save_job> active_job;
 };
 
 // The callback is intentionally an orchestrator only: progress, logical-step
@@ -950,45 +896,191 @@ bool is_optimizer_update(const save_context & state, int64_t ibatch) {
     return absolute_window % state.gradient_accumulation_steps == 0 || absolute_window == state.dataset_windows;
 }
 
-bool save_checkpoint_if_due(save_context & state, int64_t ibatch) {
-    if (state.save_checkpoint_limit <= 0 || state.save_checkpoint_steps <= 0 ||
-        !is_optimizer_update(state, ibatch) ||
-        state.schedule->step <= 0 || state.schedule->step % state.save_checkpoint_steps != 0) {
-        return false;
-    }
+void collect_save_result(save_context & state, bool wait) {
+    if (!state.worker || !state.active_job) return;
+    qlora_save_result result;
+    const bool ready = wait ? state.worker->wait(result) : state.worker->poll(result);
+    if (!ready) return;
 
-    const int64_t consumed = state.window_start + ibatch;
-    const int64_t next_epoch = consumed == state.dataset_windows ? state.epoch : state.epoch - 1;
-    const int64_t next_window = consumed == state.dataset_windows ? 0 : consumed;
-    if (state.last_checkpoint_step == state.schedule->step &&
-        state.last_checkpoint_next_epoch == next_epoch && state.last_checkpoint_next_window == next_window) {
-        return false;
+    const std::shared_ptr<qlora_save_job> job = std::move(state.active_job);
+    if (job->snapshot_saved) {
+        state.cached_adapter_step = job->step;
+        state.cached_adapter_path = job->snapshot_path;
+        LOG_INF("saved snapshot (optimizer step %ld)\n", static_cast<long>(job->step));
     }
+    if (job->checkpoint_saved) {
+        state.last_checkpoint_step = job->step;
+        state.last_checkpoint_next_epoch = job->next_epoch;
+        state.last_checkpoint_next_window = job->next_window;
+        state.cached_adapter_step = job->step;
+        state.cached_adapter_path = state.output_root / step_name("checkpoint-", job->step) / "adapter.gguf";
+        LOG_INF("saved resumable checkpoint (optimizer step %ld)\n", static_cast<long>(job->step));
+    }
+    if (job->final_adapter_saved) {
+        state.cached_adapter_step = job->step;
+        state.cached_adapter_path = job->final_adapter_path;
+    }
+    if (!result.success) {
+        LOG_ERR("asynchronous save failed: %s; training will continue\n", result.error.c_str());
+    }
+}
 
-    const std::filesystem::path adapter_source = state.cached_adapter_step == state.schedule->step
-        ? state.cached_adapter_path : std::filesystem::path();
-    std::filesystem::path saved_directory;
-    bool validation_failed = false;
-    if (save_qlora_checkpoint(state.output_root, *state.output_tensors, *state.arch, state.lora_alpha,
-                              *state.base_model_path, *state.qparams, *state.params, state.ctx, state.dataset,
-                              *state.schedule, llama_n_ctx(state.ctx), state.dataset_windows, next_epoch, next_window,
-                              state.training_statistics_complete, state.training_loss_sum,
-                              state.training_data_count, state.training_weight_sum,
-                              adapter_source, state.save_checkpoint_limit, &saved_directory, &validation_failed)) {
-        state.last_checkpoint_step = state.schedule->step;
-        state.last_checkpoint_next_epoch = next_epoch;
-        state.last_checkpoint_next_window = next_window;
-        state.cached_adapter_step = state.schedule->step;
-        state.cached_adapter_path = saved_directory / "adapter.gguf";
+bool prepare_qlora_save_job(save_context & state,
+                            bool write_snapshot,
+                            bool write_checkpoint,
+                            bool write_final_adapter,
+                            int64_t next_epoch,
+                            int64_t next_window,
+                            std::shared_ptr<qlora_save_job> & job,
+                            bool * validation_failed = nullptr) {
+    try {
+        if (validation_failed) *validation_failed = false;
+        auto prepared = std::make_shared<qlora_save_job>();
+        prepared->output_root = state.output_root;
+        prepared->snapshot_limit = state.save_snapshot_limit;
+        prepared->checkpoint_limit = state.save_checkpoint_limit;
+        prepared->step = state.schedule->step;
+        prepared->next_epoch = next_epoch;
+        prepared->next_window = next_window;
+        prepared->write_snapshot = write_snapshot;
+        prepared->write_checkpoint = write_checkpoint;
+        prepared->write_final_adapter = write_final_adapter;
+        if (write_snapshot) {
+            prepared->snapshot_path = state.output_root / step_name("snapshot-", prepared->step, ".gguf");
+        }
+        if (write_final_adapter) {
+            prepared->final_adapter_path = state.output_root / "adapter.gguf";
+        }
+
+        if (write_snapshot || write_checkpoint) {
+            if (!llama_opt_state_is_finite(state.ctx)) {
+                if (validation_failed) *validation_failed = true;
+                LOG_ERR("%s: optimizer state contains non-finite values or is not at a valid optimizer-step boundary\n",
+                        __func__);
+                return false;
+            }
+        }
+        std::string validation_error;
+        if (!capture_lora_adapter_snapshot(*state.output_tensors, *state.arch, state.lora_alpha,
+                                           *state.base_model_path, prepared->adapter, &validation_error)) {
+            if (validation_failed) *validation_failed = true;
+            LOG_ERR("%s: refusing to save invalid adapter tensors: %s\n", __func__, validation_error.c_str());
+            return false;
+        }
+
+        if (write_checkpoint) {
+            const size_t state_size = llama_opt_state_size(state.ctx);
+            if (state_size == 0) {
+                LOG_ERR("%s: optimizer state is not available at a checkpoint boundary\n", __func__);
+                return false;
+            }
+            prepared->optimizer_state.resize(state_size);
+            if (!llama_opt_state_export(state.ctx, prepared->optimizer_state.data(), prepared->optimizer_state.size())) {
+                LOG_ERR("%s: failed to export optimizer state\n", __func__);
+                return false;
+            }
+            const int64_t permutation_size = ggml_opt_dataset_permutation_size(state.dataset);
+            if (permutation_size != state.dataset_windows) return false;
+            std::vector<int64_t> permutation(static_cast<size_t>(permutation_size));
+            if (!ggml_opt_dataset_get_permutation(state.dataset, permutation.data(), permutation_size)) return false;
+
+            common_json metadata = common_json::object();
+            try {
+                metadata["format_version"] = 4;
+                dataset_file_identity base_model_identity;
+                if (!get_dataset_file_identity(*state.base_model_path, base_model_identity)) {
+                    throw std::runtime_error("cannot inspect base model file: " + *state.base_model_path);
+                }
+                common_json base_model_file = common_json::object();
+                base_model_file["path"] = base_model_identity.path;
+                base_model_file["size"] = base_model_identity.size;
+                metadata["base_model_path"] = canonical_path_string(*state.base_model_path);
+                metadata["base_model_file"] = base_model_file;
+                metadata["architecture"] = *state.arch;
+                metadata["lora_rank"] = state.qparams->lora_rank;
+                metadata["lora_alpha"] = state.lora_alpha;
+                metadata["lora_targets"] = state.qparams->lora_targets;
+                metadata["freeze_layers"] = state.qparams->freeze_layers;
+                metadata["gradient_accumulation_steps"] = state.qparams->gradient_accumulation_steps;
+                metadata["max_steps"] = state.qparams->max_steps;
+                metadata["val_windows"] = state.qparams->val_windows;
+                metadata["context_length"] = llama_n_ctx(state.ctx);
+                metadata["dataset_windows"] = state.dataset_windows;
+                metadata["dataset_files"] = make_dataset_file_metadata(*state.qparams);
+                metadata["shuffle_dataset"] = state.qparams->shuffle_dataset;
+                metadata["skip_invalid_records"] = state.qparams->dataset.skip_invalid;
+                metadata["lr_scheduler"] = state.qparams->lr_scheduler;
+                metadata["warmup_steps"] = state.qparams->warmup_steps;
+                metadata["warmup_init_ratio"] = state.qparams->warmup_init_ratio;
+                metadata["learning_rate"] = state.params->lr.lr0;
+                metadata["learning_rate_min"] = state.params->lr.lr_min;
+                metadata["weight_decay"] = state.params->lr.wd;
+                metadata["optimizer"] = ggml_opt_optimizer_name(state.params->optimizer);
+                prepared->optimizer_name = ggml_opt_optimizer_name(state.params->optimizer);
+                prepared->optimizer_state_type = state.qparams->optimizer_state_type;
+                metadata["lora_type"] = state.qparams->lora_type;
+                metadata["optimizer_state_type"] = state.qparams->optimizer_state_type;
+                metadata["forward_precision"] = state.qparams->forward_precision_name;
+                metadata["backward_precision"] = state.qparams->backward_precision_name;
+                const ggml_opt_optimizer_params optimizer_defaults = ggml_opt_get_default_optimizer_params(nullptr);
+                metadata["adamw_beta1"] = optimizer_defaults.adamw.beta1;
+                metadata["adamw_beta2"] = optimizer_defaults.adamw.beta2;
+                metadata["adamw_eps"] = optimizer_defaults.adamw.eps;
+                metadata["total_epochs"] = state.params->lr.epochs;
+                metadata["next_epoch"] = next_epoch;
+                metadata["next_window"] = next_window;
+                metadata["scheduler_step"] = state.schedule->step;
+                metadata["training_statistics_complete"] = state.training_statistics_complete;
+                metadata["training_loss_sum"] = state.training_loss_sum;
+                metadata["training_data_count"] = state.training_data_count;
+                metadata["training_weight_sum"] = state.training_weight_sum;
+                common_json order = common_json::array();
+                for (const int64_t id : permutation) order.push_back(id);
+                metadata["dataset_permutation"] = order;
+            } catch (const std::exception & ex) {
+                LOG_ERR("%s: failed to build checkpoint metadata: %s\n", __func__, ex.what());
+                return false;
+            }
+            prepared->training_state_json = metadata.dump(2) + "\n";
+            common_json manifest = common_json::object();
+            manifest["format_version"] = 2;
+            manifest["optimizer_file"] = "optimizer.gguf";
+            manifest["adapter_file"] = "adapter.gguf";
+            manifest["training_state_file"] = "training-state.json";
+            manifest["optimizer_step"] = prepared->step;
+            prepared->manifest_json = manifest.dump(2) + "\n";
+        }
+
+        job = std::move(prepared);
         return true;
+    } catch (const std::exception & ex) {
+        LOG_ERR("%s: failed to stage asynchronous save data: %s\n", __func__, ex.what());
+        return false;
+    } catch (...) {
+        LOG_ERR("%s: failed to stage asynchronous save data\n", __func__);
+        return false;
     }
-    if (validation_failed) {
-        state.abort_requested = true;
-        LOG_ERR("periodic checkpoint validation failed; stopping training without writing a final checkpoint\n");
-    } else {
-        LOG_ERR("periodic resumable checkpoint failed; training will continue\n");
+}
+
+bool submit_save_job(save_context & state, std::shared_ptr<qlora_save_job> job) {
+    try {
+        collect_save_result(state, true);
+        if (state.abort_requested) return false;
+        if (!state.worker || !state.worker->submit([job](std::string & error) {
+                return write_qlora_save_job(job, error);
+            })) {
+            LOG_ERR("%s: could not submit asynchronous save job\n", __func__);
+            return false;
+        }
+        state.active_job = std::move(job);
+        return true;
+    } catch (const std::exception & ex) {
+        LOG_ERR("%s: failed to submit asynchronous save job: %s\n", __func__, ex.what());
+        return false;
+    } catch (...) {
+        LOG_ERR("%s: failed to submit asynchronous save job\n", __func__);
+        return false;
     }
-    return false;
 }
 
 void update_training_step(save_context & state, int64_t ibatch) {
@@ -997,37 +1089,39 @@ void update_training_step(save_context & state, int64_t ibatch) {
     }
 }
 
-bool save_snapshot_if_due(save_context & state, int64_t ibatch) {
-    if (state.save_snapshot_limit <= 0 || state.save_snapshot_steps <= 0 ||
-        !is_optimizer_update(state, ibatch) ||
-        state.schedule->step <= 0 || state.schedule->step % state.save_snapshot_steps != 0) {
-        return false;
-    }
+void save_due_state(save_context & state, int64_t ibatch) {
+    const bool optimizer_update = is_optimizer_update(state, ibatch);
+    if (!optimizer_update || state.schedule->step <= 0) return;
 
-    if (!llama_opt_state_is_finite(state.ctx)) {
-        state.abort_requested = true;
-        LOG_ERR("periodic adapter snapshot validation failed: optimizer state contains non-finite values; stopping training\n");
-        return false;
-    }
+    const bool snapshot_due = state.save_snapshot_limit > 0 && state.save_snapshot_steps > 0 &&
+        state.schedule->step % state.save_snapshot_steps == 0 && state.cached_adapter_step != state.schedule->step;
+    const int64_t consumed = state.window_start + ibatch;
+    const int64_t next_epoch = consumed == state.dataset_windows ? state.epoch : state.epoch - 1;
+    const int64_t next_window = consumed == state.dataset_windows ? 0 : consumed;
+    const bool checkpoint_due = state.save_checkpoint_limit > 0 && state.save_checkpoint_steps > 0 &&
+        state.schedule->step % state.save_checkpoint_steps == 0 &&
+        !(state.last_checkpoint_step == state.schedule->step &&
+          state.last_checkpoint_next_epoch == next_epoch && state.last_checkpoint_next_window == next_window);
+    if (!snapshot_due && !checkpoint_due) return;
 
-    const std::filesystem::path path = state.output_root / step_name("snapshot-", state.schedule->step, ".gguf");
+    collect_save_result(state, true);
+    if (state.abort_requested) return;
+
+    std::shared_ptr<qlora_save_job> job;
     bool validation_failed = false;
-    if (save_adapter(*state.output_tensors, path.string(), *state.arch, state.lora_alpha,
-                     *state.base_model_path, false, &validation_failed)) {
-        state.cached_adapter_step = state.schedule->step;
-        state.cached_adapter_path = path;
-        if (!prune_snapshots(state.output_root, state.save_snapshot_limit)) {
-            LOG_WRN("snapshot was saved but old snapshot pruning failed\n");
+    if (!prepare_qlora_save_job(state, snapshot_due, checkpoint_due, false,
+                                next_epoch, next_window, job, &validation_failed)) {
+        if (validation_failed) {
+            state.abort_requested = true;
+            LOG_ERR("periodic save validation failed; stopping training without writing a final adapter or checkpoint\n");
+        } else {
+            LOG_ERR("periodic save snapshot preparation failed; training will continue\n");
         }
-        return true;
+        return;
     }
-    if (validation_failed) {
-        state.abort_requested = true;
-        LOG_ERR("periodic adapter snapshot validation failed; stopping training without writing a final adapter\n");
-    } else {
-        LOG_ERR("periodic adapter snapshot failed: %s; training will continue\n", path.string().c_str());
+    if (!submit_save_job(state, std::move(job))) {
+        LOG_ERR("periodic save job could not be queued\n");
     }
-    return false;
 }
 
 int64_t progress_number_width(int64_t value) {
@@ -1075,21 +1169,6 @@ void split_progress_time(int64_t elapsed_us, int64_t & hours, int64_t & minutes,
     remaining_seconds -= hours * 3600;
     minutes = remaining_seconds / 60;
     seconds = remaining_seconds - minutes * 60;
-}
-
-void log_saved_checkpoint(const save_context & state, bool snapshot_saved) {
-    const double average_loss = calculate_weighted_training_loss(
-        state.training_loss_sum, static_cast<double>(llama_n_ctx(state.ctx)), state.training_weight_sum);
-    const std::string average_loss_text = format_four_significant_digits(average_loss);
-    const int64_t elapsed_us = std::max<int64_t>(0, ggml_time_us() - state.training_start_us);
-    int64_t elapsed_h = 0;
-    int64_t elapsed_m = 0;
-    int64_t elapsed_s = 0;
-    split_progress_time(elapsed_us, elapsed_h, elapsed_m, elapsed_s);
-
-    LOG_INF("%s (optimizer step %ld) avg_loss=%s elapsed=%02" PRId64 ":%02" PRId64 ":%02" PRId64 "\n",
-            snapshot_saved ? "saved checkpoint and snapshot" : "saved checkpoint",
-            static_cast<long>(state.schedule->step), average_loss_text.c_str(), elapsed_h, elapsed_m, elapsed_s);
 }
 
 bool get_window_training_statistics(const save_context & state,
@@ -1281,26 +1360,20 @@ void save_step_callback(bool               train,
                         int64_t            ibatch,
                         int64_t            ibatch_max,
                         int64_t            t_start_us) {
+    if (!g_save_context) {
+        qlora_epoch_callback_progress_line(train, opt_ctx, dataset, result, ibatch, ibatch_max, t_start_us);
+        return;
+    }
+    collect_save_result(*g_save_context, false);
     qlora_epoch_callback_progress_line(train, opt_ctx, dataset, result, ibatch, ibatch_max, t_start_us);
-
-    if (!train || !g_save_context || g_save_context->abort_requested) {
+    if (!train || g_save_context->abort_requested) {
         return;
     }
     update_training_step(*g_save_context, ibatch);
     if (is_optimizer_update(*g_save_context, ibatch)) {
         log_gradient_stats_if_due(*g_save_context, result);
     }
-    const bool snapshot_saved = save_snapshot_if_due(*g_save_context, ibatch);
-    if (g_save_context->abort_requested) return;
-    const bool checkpoint_saved = save_checkpoint_if_due(*g_save_context, ibatch);
-    if (g_save_context->abort_requested) return;
-    if (snapshot_saved && checkpoint_saved) {
-        log_saved_checkpoint(*g_save_context, true);
-    } else if (snapshot_saved) {
-        LOG_INF("saved snapshot (optimizer step %ld)\n", static_cast<long>(g_save_context->schedule->step));
-    } else if (checkpoint_saved) {
-        log_saved_checkpoint(*g_save_context, false);
-    }
+    save_due_state(*g_save_context, ibatch);
 }
 
 void log_epoch_loss(int epoch, int total_epochs, double training_loss_sum,
@@ -1460,7 +1533,9 @@ bool train_adapter(const qlora_params & qparams,
         LOG_ERR("%s: failed to allocate optimizer results\n", __func__);
         return false;
     }
+    qlora_save_worker save_worker;
     save_context save_state;
+    save_state.worker = &save_worker;
     save_state.output_tensors = &output_refs;
     save_state.output_root = qparams.output_dir;
     save_state.arch = &arch;
@@ -1477,7 +1552,6 @@ bool train_adapter(const qlora_params & qparams,
     save_state.gradient_accumulation_steps = qparams.gradient_accumulation_steps;
     save_state.dataset_windows = dataset_windows;
     save_state.schedule = &schedule;
-    save_state.training_start_us = ggml_time_us();
     save_context_scope callback_scope(save_state);
 
     LOG_INF("%s: starting QLoRA training — rank=%d alpha=%.1f epochs=%d loss=assistant-response-only\n", __func__,
@@ -1578,30 +1652,33 @@ bool train_adapter(const qlora_params & qparams,
         }
     }
 
+    collect_save_result(save_state, true);
+    if (save_state.abort_requested) {
+        LOG_ERR("%s: training was aborted; final adapter and checkpoint saves were skipped\n", __func__);
+        return false;
+    }
+
     const int64_t final_next_epoch = params.lr.epochs;
     const int64_t final_next_window = 0;
     if (save_state.save_checkpoint_limit > 0) {
         if (save_state.last_checkpoint_step != schedule.step ||
             save_state.last_checkpoint_next_epoch != final_next_epoch ||
             save_state.last_checkpoint_next_window != final_next_window) {
-            const std::filesystem::path adapter_source = save_state.cached_adapter_step == schedule.step
-                ? save_state.cached_adapter_path : std::filesystem::path();
-            std::filesystem::path saved_directory;
-            if (!save_qlora_checkpoint(save_state.output_root, output_refs, arch, lora_alpha, params.model.path,
-                                       qparams, params, ctx, dataset.get(), schedule, n_ctx, dataset_windows,
-                                       final_next_epoch, final_next_window, save_state.training_statistics_complete,
-                                       save_state.training_loss_sum,
-                                       save_state.training_data_count, save_state.training_weight_sum, adapter_source,
-                                       save_state.save_checkpoint_limit, &saved_directory)) {
+            std::shared_ptr<qlora_save_job> job;
+            if (!prepare_qlora_save_job(save_state, false, true, false,
+                                        final_next_epoch, final_next_window, job)) {
+                LOG_ERR("%s: final resumable checkpoint data could not be staged\n", __func__);
+                return false;
+            }
+            if (!submit_save_job(save_state, job)) {
+                LOG_ERR("%s: final resumable checkpoint could not be queued\n", __func__);
+                return false;
+            }
+            collect_save_result(save_state, true);
+            if (!job->checkpoint_saved) {
                 LOG_ERR("%s: final resumable checkpoint could not be saved\n", __func__);
                 return false;
             }
-            log_saved_checkpoint(save_state, false);
-            save_state.last_checkpoint_step = schedule.step;
-            save_state.last_checkpoint_next_epoch = final_next_epoch;
-            save_state.last_checkpoint_next_window = final_next_window;
-            save_state.cached_adapter_step = schedule.step;
-            save_state.cached_adapter_path = saved_directory / "adapter.gguf";
         }
 
         const std::filesystem::path final_checkpoint = save_state.output_root / step_name("checkpoint-", schedule.step);
@@ -1615,13 +1692,27 @@ bool train_adapter(const qlora_params & qparams,
         const std::filesystem::path adapter_source = save_state.cached_adapter_step == schedule.step
             ? save_state.cached_adapter_path : std::filesystem::path();
         const std::filesystem::path final_adapter = save_state.output_root / "adapter.gguf";
-        const bool saved = adapter_source.empty()
-            ? save_adapter(output_refs, final_adapter.string(), arch, lora_alpha,
-                           params.model.path, false)
-            : install_file_alias(adapter_source, final_adapter);
-        if (!saved) {
-            LOG_ERR("%s: final adapter could not be saved to '%s'\n", __func__, final_adapter.string().c_str());
-            return false;
+        if (!adapter_source.empty()) {
+            if (!install_file_alias(adapter_source, final_adapter)) {
+                LOG_ERR("%s: final adapter could not be installed in '%s'\n", __func__, final_adapter.string().c_str());
+                return false;
+            }
+        } else {
+            std::shared_ptr<qlora_save_job> job;
+            if (!prepare_qlora_save_job(save_state, false, false, true,
+                                        final_next_epoch, final_next_window, job)) {
+                LOG_ERR("%s: final adapter data could not be staged\n", __func__);
+                return false;
+            }
+            if (!submit_save_job(save_state, job)) {
+                LOG_ERR("%s: final adapter could not be queued\n", __func__);
+                return false;
+            }
+            collect_save_result(save_state, true);
+            if (!job->final_adapter_saved) {
+                LOG_ERR("%s: final adapter could not be saved to '%s'\n", __func__, final_adapter.string().c_str());
+                return false;
+            }
         }
     }
     LOG_INF("final adapter saved (optimizer step %ld)\n", static_cast<long>(schedule.step));

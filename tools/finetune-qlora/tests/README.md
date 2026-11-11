@@ -11,7 +11,8 @@ This directory contains unit tests, integration tests, and chat-template fixture
 
 | Test Target | Type | Model Needed? | Description |
 |---|---|---|---|
-| `test-qlora-adapter` | Unit | No | LoRA rank/alpha conversion, target filtering, F32/F16/BF16 serialization, and non-finite tensor rejection. |
+| `test-qlora-adapter` | Unit | No | LoRA rank/alpha conversion, target filtering, F32/F16/BF16 serialization, non-finite tensor rejection, and immutable adapter snapshot capture. |
+| `test-qlora-save-worker` | Unit | No | Background save execution, single-job backpressure, and result/error propagation. |
 | `test-qlora-dataset-format` | Unit | No | JSONL parsing, format auto-detection, and bad record handling. |
 | `test-qlora-dataset-thread-pool` | Unit | No | Worker thread limits, task completion, and error propagation. |
 | `test-qlora-dataset-template` | Unit | No | Real Jinja template rendering with ChatML fixture, multi-turn masking. |

@@ -3,6 +3,7 @@
 #include "gguf.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -407,6 +408,55 @@ void test_lora_storage_types() {
     require(unsupported_q8.refs.empty(), "Q8_0 LoRA storage type should be rejected");
 }
 
+void test_adapter_snapshot_owns_tensor_data() {
+    const std::string path = (std::filesystem::temp_directory_path() /
+        "llama-qlora-adapter-snapshot-test.gguf").string();
+    std::remove(path.c_str());
+
+    ggml_context_ptr tensor_ctx(ggml_init({ 8 * 1024 * 1024, nullptr, true }));
+    require(static_cast<bool>(tensor_ctx), "failed to allocate adapter snapshot source context");
+    ggml_tensor * tensor_a = ggml_new_tensor_2d(tensor_ctx.get(), GGML_TYPE_F32, 4, 2);
+    ggml_tensor * tensor_b = ggml_new_tensor_2d(tensor_ctx.get(), GGML_TYPE_F32, 2, 3);
+    ggml_set_name(tensor_a, "blk.0.attn_q.weight.lora_a");
+    ggml_set_name(tensor_b, "blk.0.attn_q.weight.lora_b");
+    ggml_backend_buffer_ptr buffer(
+        ggml_backend_alloc_ctx_tensors_from_buft(tensor_ctx.get(), ggml_backend_cpu_buffer_type()));
+    require(static_cast<bool>(buffer), "failed to allocate adapter snapshot source buffer");
+
+    float * data_a = static_cast<float *>(tensor_a->data);
+    float * data_b = static_cast<float *>(tensor_b->data);
+    for (int i = 0; i < 8; ++i) data_a[i] = static_cast<float>(i + 1);
+    for (int i = 0; i < 6; ++i) data_b[i] = static_cast<float>(i + 21);
+    const std::vector<float> expected_a(data_a, data_a + 8);
+    const std::vector<float> expected_b(data_b, data_b + 6);
+
+    lora_tensor_refs refs = { { "blk.0.attn_q.weight", { tensor_a, tensor_b } } };
+    lora_adapter_snapshot snapshot;
+    std::string error;
+    require(capture_lora_adapter_snapshot(refs, "llama", 2.0f, "base.gguf", snapshot, &error),
+            "failed to capture adapter snapshot: " + error);
+
+    std::fill(data_a, data_a + 8, -100.0f);
+    std::fill(data_b, data_b + 6, -200.0f);
+    require(save_lora_adapter_snapshot(snapshot, path, false), "failed to save captured adapter snapshot");
+
+    ggml_context * loaded_ctx_raw = nullptr;
+    gguf_context_ptr loaded_gguf(gguf_init_from_file(path.c_str(), { false, &loaded_ctx_raw }));
+    ggml_context_ptr loaded_ctx(loaded_ctx_raw);
+    require(static_cast<bool>(loaded_gguf) && static_cast<bool>(loaded_ctx),
+            "failed to reopen captured adapter snapshot");
+    ggml_tensor * loaded_a = ggml_get_tensor(loaded_ctx.get(), "blk.0.attn_q.weight.lora_a");
+    ggml_tensor * loaded_b = ggml_get_tensor(loaded_ctx.get(), "blk.0.attn_q.weight.lora_b");
+    require(loaded_a && loaded_b, "captured adapter snapshot is missing tensors");
+    std::vector<float> actual_a(8);
+    std::vector<float> actual_b(6);
+    std::memcpy(actual_a.data(), loaded_a->data, actual_a.size() * sizeof(float));
+    std::memcpy(actual_b.data(), loaded_b->data, actual_b.size() * sizeof(float));
+    require(actual_a == expected_a && actual_b == expected_b,
+            "adapter snapshot changed after source tensors were modified");
+    std::remove(path.c_str());
+}
+
 void test_moe_expert_lora_allocation_and_transform() {
     const std::string input_path = (std::filesystem::temp_directory_path() /
         "llama-qlora-moe-expert-adapter-test.gguf").string();
@@ -548,6 +598,7 @@ int main() {
         test_peft_default_lora_initialization();
         test_lora_finite_validation();
         test_lora_storage_types();
+        test_adapter_snapshot_owns_tensor_data();
         test_moe_expert_lora_allocation_and_transform();
         llama_backend_free();
         std::cout << "adapter transformation tests passed\n";

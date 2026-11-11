@@ -1,6 +1,7 @@
 set(TARGET llama-finetune-qlora)
 set(QLORA_SOURCES
     finetune-qlora.cpp
+    save-worker.cpp
     args.cpp
     adapter.cpp
     schedule.cpp

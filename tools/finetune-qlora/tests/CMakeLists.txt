@@ -9,6 +9,15 @@ target_link_libraries(test-qlora-adapter PRIVATE llama-common llama)
 target_compile_features(test-qlora-adapter PRIVATE cxx_std_17)
 add_test(NAME test-qlora-adapter COMMAND test-qlora-adapter)
 
+add_executable(test-qlora-save-worker
+    test-save-worker.cpp
+    "${QLORA_DIR}/save-worker.cpp"
+)
+target_include_directories(test-qlora-save-worker PRIVATE "${QLORA_DIR}")
+target_link_libraries(test-qlora-save-worker PRIVATE ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(test-qlora-save-worker PRIVATE cxx_std_17)
+add_test(NAME test-qlora-save-worker COMMAND test-qlora-save-worker)
+
 add_executable(test-qlora-dataset-format
     test-dataset-format.cpp
     "${QLORA_DIR}/dataset-format.cpp"
@@ -161,6 +170,7 @@ add_test(NAME test-qlora-eval-options COMMAND test-qlora-eval-options)
 add_custom_target(llamango-tests
     DEPENDS
         test-qlora-adapter
+        test-qlora-save-worker
         test-qlora-dataset-format
         test-qlora-dataset-thread-pool
         test-qlora-dataset-template
