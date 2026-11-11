@@ -63,13 +63,17 @@ void main() {
     max_logit = wg_reduce_max(max_logit);
 
     FLOAT_TYPE sum_exp = FLOAT_TYPE(0.0f);
+    FLOAT_TYPE label_sum = FLOAT_TYPE(0.0f);
     for (uint i = tid; i < p.KX; i += BLOCK_SIZE) {
         sum_exp += exp(FLOAT_TYPE(data_x[off + i]) - max_logit);
+        label_sum += FLOAT_TYPE(data_y[off + i]);
     }
-    const FLOAT_TYPE inv_sum = FLOAT_TYPE(1.0f) / wg_reduce_sum(sum_exp);
+    const FLOAT_TYPE sum_labels = wg_reduce_sum(label_sum);
+    const FLOAT_TYPE total_sum_exp = wg_reduce_sum(sum_exp);
+    const FLOAT_TYPE sm_scale = sum_labels / total_sum_exp;
 
     for (uint i = tid; i < p.KX; i += BLOCK_SIZE) {
-        const FLOAT_TYPE sm = exp(FLOAT_TYPE(data_x[off + i]) - max_logit) * inv_sum;
+        const FLOAT_TYPE sm = exp(FLOAT_TYPE(data_x[off + i]) - max_logit) * sm_scale;
         data_d[off + i] = D_TYPE((sm - FLOAT_TYPE(data_y[off + i])) * d_by_nrows);
     }
 }
