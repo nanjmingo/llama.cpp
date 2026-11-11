@@ -1745,6 +1745,8 @@ extern "C" {
     LLAMA_API void llama_opt_set_grad_stats_interval(struct llama_context * lctx, int32_t interval);
     // Export or import optimizer state at an optimizer-step boundary. The state is opaque and versioned.
     LLAMA_API size_t llama_opt_state_size(const struct llama_context * lctx);
+    // Check that optimizer state is at a step boundary and all moment values are finite.
+    LLAMA_API bool llama_opt_state_is_finite(const struct llama_context * lctx);
     LLAMA_API bool llama_opt_state_export(const struct llama_context * lctx, void * data, size_t size);
     LLAMA_API bool llama_opt_state_import(struct llama_context * lctx, const void * data, size_t size);
     // Shuffle the first idata dataset entries with the optimizer RNG, or all entries if idata is negative.
@@ -1773,6 +1775,20 @@ extern "C" {
             int64_t                   idata_eval_end,
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
+
+    // Returns false when the abort callback requests cancellation or epoch execution fails.
+    LLAMA_API bool llama_opt_epoch_range_ex(
+            struct llama_context    * lctx,
+            ggml_opt_dataset_t        dataset,
+            ggml_opt_result_t         result_train,
+            ggml_opt_result_t         result_eval,
+            int64_t                   idata_start,
+            int64_t                   idata_split,
+            int64_t                   idata_eval_end,
+            ggml_opt_epoch_callback   callback_train,
+            ggml_opt_epoch_callback   callback_eval,
+            ggml_abort_callback       abort_callback,
+            void                    * abort_callback_data);
 
 #ifdef __cplusplus
 }

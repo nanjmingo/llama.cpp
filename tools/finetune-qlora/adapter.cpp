@@ -746,12 +746,53 @@ static std::string basename_from_path(const std::string & path) {
     return pos == std::string::npos ? path : path.substr(pos + 1);
 }
 
+bool lora_tensors_are_finite(const lora_tensor_refs & tensors, std::string * error) {
+    if (error) error->clear();
+    if (tensors.empty()) {
+        if (error) *error = "no LoRA tensors are available";
+        return false;
+    }
+
+    for (const auto & entry : tensors) {
+        const std::string & name = entry.first;
+        for (const auto & component : { std::make_pair(entry.second.first, "lora_a"),
+                                        std::make_pair(entry.second.second, "lora_b") }) {
+            const ggml_tensor * tensor = component.first;
+            if (!tensor || !lora_type_is_supported(tensor->type, name + "." + component.second)) {
+                if (error) *error = "invalid LoRA tensor " + name + "." + component.second;
+                return false;
+            }
+            const size_t nbytes = ggml_nbytes(tensor);
+            std::vector<char> cpu_buf(nbytes);
+            ggml_backend_tensor_get(tensor, cpu_buf.data(), 0, nbytes);
+            std::vector<float> values;
+            if (!tensor_read_f32_values(cpu_buf.data(), tensor->type, ggml_nelements(tensor), values)) {
+                if (error) *error = "cannot inspect LoRA tensor " + name + "." + component.second;
+                return false;
+            }
+            if (!std::all_of(values.begin(), values.end(), [](float value) { return std::isfinite(value); })) {
+                if (error) *error = "non-finite value in LoRA tensor " + name + "." + component.second;
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 bool save_adapter(const lora_tensor_refs & tensors,
                   const std::string & out_path,
                   const std::string & arch,
                   float alpha,
                   const std::string & base_model_path,
-                  bool log_success) {
+                  bool log_success,
+                  bool * validation_failed) {
+    if (validation_failed) *validation_failed = false;
+    std::string validation_error;
+    if (!lora_tensors_are_finite(tensors, &validation_error)) {
+        if (validation_failed) *validation_failed = true;
+        LOG_ERR("%s: refusing to save adapter: %s\n", __func__, validation_error.c_str());
+        return false;
+    }
     if (tensors.empty()) {
         LOG_ERR("%s: refusing to save an adapter with no LoRA tensors\n", __func__);
         return false;

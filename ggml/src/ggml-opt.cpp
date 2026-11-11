@@ -1149,6 +1149,25 @@ std::vector<ggml_tensor *> ggml_opt_moment_tensors(ggml_opt_context_t opt_ctx) {
     return result;
 }
 
+bool ggml_opt_tensor_is_finite(const ggml_tensor * tensor) {
+    if (!tensor) return false;
+
+    const int64_t count = ggml_nelements(tensor);
+    if (count <= 0) return false;
+
+    std::vector<uint8_t> data(ggml_nbytes(tensor));
+    ggml_backend_tensor_get(tensor, data.data(), 0, data.size());
+    std::vector<float> values(static_cast<size_t>(count));
+    if (tensor->type == GGML_TYPE_F32) {
+        std::memcpy(values.data(), data.data(), values.size() * sizeof(float));
+    } else {
+        const ggml_type_traits * traits = ggml_get_type_traits(tensor->type);
+        if (!traits || !traits->to_float) return false;
+        traits->to_float(data.data(), values.data(), count);
+    }
+    return std::all_of(values.begin(), values.end(), [](float value) { return std::isfinite(value); });
+}
+
 bool ggml_opt_apply_pending_state(ggml_opt_context_t opt_ctx) {
     if (opt_ctx->pending_optimizer_state.empty()) return true;
     if (!opt_ctx->optimizer_state_ready) return true;
@@ -1225,6 +1244,17 @@ size_t ggml_opt_state_size(ggml_opt_context_t opt_ctx) {
     if (!opt_ctx) return 0;
     std::vector<uint8_t> state;
     return ggml_opt_state_serialize(opt_ctx, state) ? state.size() : 0;
+}
+
+bool ggml_opt_state_is_finite(ggml_opt_context_t opt_ctx) {
+    if (!opt_ctx || !opt_ctx->optimizer_state_ready || opt_ctx->eval_ready || opt_ctx->opt_i != 0 ||
+        !opt_ctx->pending_optimizer_state.empty()) {
+        return false;
+    }
+    for (const ggml_tensor * tensor : ggml_opt_moment_tensors(opt_ctx)) {
+        if (!ggml_opt_tensor_is_finite(tensor)) return false;
+    }
+    return true;
 }
 
 bool ggml_opt_state_export(ggml_opt_context_t opt_ctx, void * data, size_t size) {

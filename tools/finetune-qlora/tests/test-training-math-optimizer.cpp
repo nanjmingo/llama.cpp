@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -177,6 +178,95 @@ void test_ggml_opt_reports_gradient_statistics() {
     ggml_opt_result_reset(fixture->result);
     require(!ggml_opt_result_grad_stats(fixture->result, &stats),
             "reset optimizer result retained stale gradient statistics");
+}
+
+void test_ggml_opt_checks_optimizer_state_finiteness() {
+    constexpr int64_t physical_positions = 2;
+    const std::vector<float> a_values = { 0.2f, -0.1f, 0.3f, 0.4f };
+    const std::vector<float> b_values = { -0.2f, 0.1f, 0.3f, 0.4f, -0.1f, 0.2f };
+    const std::vector<float> labels_values = { 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f };
+
+    for (const ggml_type state_type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
+        auto finite_fixture = make_ggml_opt_lora_fixture(
+            physical_positions, 1, a_values, b_values, 0.75f, true,
+            GGML_OPT_OPTIMIZER_TYPE_ADAMW, state_type);
+        run_ggml_opt_microbatch(*finite_fixture, { 0.5f, -1.0f, 1.5f, 0.25f }, labels_values);
+        require(ggml_opt_state_is_finite(finite_fixture->opt),
+                "finite AdamW state was reported as non-finite for " + std::string(ggml_type_name(state_type)));
+    }
+
+    auto nonfinite_fixture = make_ggml_opt_lora_fixture(
+        physical_positions, 1, a_values, b_values, 0.75f, true,
+        GGML_OPT_OPTIMIZER_TYPE_ADAMW, GGML_TYPE_F32);
+    run_ggml_opt_microbatch(*nonfinite_fixture,
+        { 0.5f, -1.0f, 1.5f, 0.25f }, labels_values);
+    require(ggml_opt_state_is_finite(nonfinite_fixture->opt),
+            "finite F32 AdamW state was reported as non-finite");
+
+    const size_t state_size = ggml_opt_state_size(nonfinite_fixture->opt);
+    require(state_size > 0, "failed to serialize finite AdamW state for validation test");
+    std::vector<uint8_t> state(state_size);
+    require(ggml_opt_state_export(nonfinite_fixture->opt, state.data(), state.size()),
+            "failed to export finite AdamW state for validation test");
+
+    size_t offset = 8;
+    const auto read_u32 = [&state, &offset]() {
+        require(offset <= state.size() && state.size() - offset >= sizeof(uint32_t),
+                "truncated optimizer state while locating a tensor payload");
+        uint32_t value = 0;
+        for (size_t i = 0; i < sizeof(value); ++i) {
+            value |= static_cast<uint32_t>(state[offset++]) << (i * 8);
+        }
+        return value;
+    };
+    const auto read_u64 = [&state, &offset]() {
+        require(offset <= state.size() && state.size() - offset >= sizeof(uint64_t),
+                "truncated optimizer state while locating a tensor payload");
+        uint64_t value = 0;
+        for (size_t i = 0; i < sizeof(value); ++i) {
+            value |= static_cast<uint64_t>(state[offset++]) << (i * 8);
+        }
+        return value;
+    };
+
+    require(state.size() >= 8 && std::memcmp(state.data(), "GGOPTST1", 8) == 0,
+            "invalid optimizer state magic in validation test");
+    const uint32_t version = read_u32();
+    read_u32();
+    if (version >= 2) {
+        read_u32();
+    }
+    read_u64();
+    const uint64_t rng_size = read_u64();
+    require((version == 1 || version == 2) && rng_size <= state.size() - offset,
+            "unexpected optimizer state format in validation test");
+    offset += static_cast<size_t>(rng_size);
+    require(read_u32() > 0, "serialized AdamW state contains no moment tensors");
+    const uint32_t name_size = read_u32();
+    require(name_size > 0 && name_size <= state.size() - offset,
+            "invalid optimizer state tensor name in validation test");
+    offset += name_size;
+    require(read_u32() == GGML_TYPE_F32,
+            "optimizer state validation test expected an F32 moment tensor");
+    read_u32();
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        read_u64();
+    }
+    const uint64_t tensor_bytes = read_u64();
+    require(tensor_bytes >= sizeof(float) && tensor_bytes <= state.size() - offset,
+            "invalid optimizer state tensor payload in validation test");
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    std::memcpy(state.data() + offset, &nan, sizeof(nan));
+    require(ggml_opt_state_import(nonfinite_fixture->opt, state.data(), state.size()),
+            "failed to import optimizer state containing NaN for validation test");
+    require(!ggml_opt_state_is_finite(nonfinite_fixture->opt),
+            "NaN AdamW state was accepted");
+    const float inf = std::numeric_limits<float>::infinity();
+    std::memcpy(state.data() + offset, &inf, sizeof(inf));
+    require(ggml_opt_state_import(nonfinite_fixture->opt, state.data(), state.size()),
+            "failed to import optimizer state containing Inf for validation test");
+    require(!ggml_opt_state_is_finite(nonfinite_fixture->opt),
+            "Inf AdamW state was accepted");
 }
 
 void test_ggml_opt_detects_missing_gradient_path() {
@@ -843,6 +933,7 @@ void test_adamw_supports_parameter_and_state_types() {
 void run_training_math_ggml_opt_tests() {
     test_ggml_opt_cross_entropy_gradient_accumulation();
     test_ggml_opt_reports_gradient_statistics();
+    test_ggml_opt_checks_optimizer_state_finiteness();
     test_ggml_opt_normalizes_accumulated_gradient_by_target_weight();
     test_ggml_opt_detects_missing_gradient_path();
     test_dynamic_ggml_opt_resets_gradients_between_optimizer_steps();

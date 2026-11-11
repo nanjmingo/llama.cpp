@@ -188,6 +188,8 @@ extern "C" {
 
     // Export or import optimizer state at an optimizer-step boundary. The state is an opaque, versioned byte blob.
     GGML_API size_t ggml_opt_state_size(ggml_opt_context_t opt_ctx);
+    // Check that optimizer state is at a step boundary and all moment values are finite.
+    GGML_API bool ggml_opt_state_is_finite(ggml_opt_context_t opt_ctx);
     GGML_API bool ggml_opt_state_export(ggml_opt_context_t opt_ctx, void * data, size_t size);
     GGML_API bool ggml_opt_state_import(ggml_opt_context_t opt_ctx, const void * data, size_t size);
 

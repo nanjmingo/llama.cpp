@@ -224,12 +224,13 @@ struct llama_context {
     void opt_set_opt_period(int32_t opt_period);
     void opt_set_grad_stats_interval(int32_t interval);
     size_t opt_state_size() const;
+    bool opt_state_is_finite() const;
     bool opt_state_export(void * data, size_t size) const;
     bool opt_state_import(const void * data, size_t size);
     void opt_dataset_shuffle(ggml_opt_dataset_t dataset, int64_t idata);
 
     // TODO: more flexible combinations of logical/physical batch size and context size
-    void opt_epoch(
+    bool opt_epoch(
             ggml_opt_dataset_t      dataset,
             ggml_opt_result_t       result_train,
             ggml_opt_result_t       result_eval,
@@ -237,9 +238,11 @@ struct llama_context {
             int64_t                 idata_split,
             int64_t                 idata_eval_end,
             ggml_opt_epoch_callback callback_train,
-            ggml_opt_epoch_callback callback_eval);
+            ggml_opt_epoch_callback callback_eval,
+            ggml_abort_callback     abort_callback,
+            void                  * abort_callback_data);
 
-    void opt_epoch_iter(
+    bool opt_epoch_iter(
             ggml_opt_dataset_t               dataset,
             ggml_opt_result_t                result,
             const std::vector<llama_token> & tokens,
@@ -252,7 +255,9 @@ struct llama_context {
             int64_t                          ndata_in_loop,
             int64_t                          t_loop_start,
             std::unordered_set<const ggml_tensor *> & lora_grad_seen,
-            int64_t & n_train_graphs);
+            int64_t & n_train_graphs,
+            ggml_abort_callback abort_callback,
+            void * abort_callback_data);
 
 private:
     //

@@ -720,8 +720,23 @@ bool save_qlora_checkpoint(const std::filesystem::path & root,
                            double training_weight_sum,
                            const std::filesystem::path & adapter_source,
                            int32_t limit,
-                           std::filesystem::path * saved_directory = nullptr) {
+                           std::filesystem::path * saved_directory = nullptr,
+                           bool * validation_failed = nullptr) {
+    if (validation_failed) *validation_failed = false;
     if (root.empty() || limit <= 0) return false;
+    if (!llama_opt_state_is_finite(ctx)) {
+        if (validation_failed) *validation_failed = true;
+        LOG_ERR("%s: optimizer state contains non-finite values or is not at a valid optimizer-step boundary\n", __func__);
+        return false;
+    }
+    if (!adapter_source.empty()) {
+        std::string validation_error;
+        if (!lora_tensors_are_finite(output_refs, &validation_error)) {
+            if (validation_failed) *validation_failed = true;
+            LOG_ERR("%s: refusing to checkpoint invalid adapter tensors: %s\n", __func__, validation_error.c_str());
+            return false;
+        }
+    }
     const size_t state_size = llama_opt_state_size(ctx);
     if (state_size == 0) {
         LOG_ERR("%s: optimizer state is not available at a checkpoint boundary\n", __func__);
@@ -811,8 +826,10 @@ bool save_qlora_checkpoint(const std::filesystem::path & root,
     if (!adapter_source.empty()) {
         adapter_ok = link_or_copy_file(adapter_source, temp_dir / "adapter.gguf");
     } else {
+        bool adapter_validation_failed = false;
         adapter_ok = save_adapter(output_refs, (temp_dir / "adapter.gguf").string(),
-                                  arch, lora_alpha, base_model_path, false);
+                                  arch, lora_alpha, base_model_path, false, &adapter_validation_failed);
+        if (adapter_validation_failed && validation_failed) *validation_failed = true;
     }
     bool ok = adapter_ok &&
               write_optimizer_file(temp_dir / "optimizer.gguf", optimizer_state, ggml_opt_optimizer_name(params.optimizer), qparams.optimizer_state_type) &&
@@ -900,6 +917,7 @@ struct save_context {
     double training_weight_sum = 0.0;
     bool training_statistics_complete = true;
     double validation_weight_sum = 0.0;
+    bool abort_requested = false;
     int64_t last_checkpoint_step = -1;
     int64_t last_checkpoint_next_epoch = -1;
     int64_t last_checkpoint_next_window = -1;
@@ -921,6 +939,11 @@ struct save_context_scope {
         g_save_context = nullptr;
     }
 };
+
+bool qlora_should_abort(void * user_data) {
+    const save_context * state = static_cast<const save_context *>(user_data);
+    return !state || state->abort_requested;
+}
 
 bool is_optimizer_update(const save_context & state, int64_t ibatch) {
     const int64_t absolute_window = state.window_start + ibatch;
@@ -945,12 +968,13 @@ bool save_checkpoint_if_due(save_context & state, int64_t ibatch) {
     const std::filesystem::path adapter_source = state.cached_adapter_step == state.schedule->step
         ? state.cached_adapter_path : std::filesystem::path();
     std::filesystem::path saved_directory;
+    bool validation_failed = false;
     if (save_qlora_checkpoint(state.output_root, *state.output_tensors, *state.arch, state.lora_alpha,
                               *state.base_model_path, *state.qparams, *state.params, state.ctx, state.dataset,
                               *state.schedule, llama_n_ctx(state.ctx), state.dataset_windows, next_epoch, next_window,
                               state.training_statistics_complete, state.training_loss_sum,
                               state.training_data_count, state.training_weight_sum,
-                              adapter_source, state.save_checkpoint_limit, &saved_directory)) {
+                              adapter_source, state.save_checkpoint_limit, &saved_directory, &validation_failed)) {
         state.last_checkpoint_step = state.schedule->step;
         state.last_checkpoint_next_epoch = next_epoch;
         state.last_checkpoint_next_window = next_window;
@@ -958,7 +982,12 @@ bool save_checkpoint_if_due(save_context & state, int64_t ibatch) {
         state.cached_adapter_path = saved_directory / "adapter.gguf";
         return true;
     }
-    LOG_ERR("periodic resumable checkpoint failed; training will continue\n");
+    if (validation_failed) {
+        state.abort_requested = true;
+        LOG_ERR("periodic checkpoint validation failed; stopping training without writing a final checkpoint\n");
+    } else {
+        LOG_ERR("periodic resumable checkpoint failed; training will continue\n");
+    }
     return false;
 }
 
@@ -975,9 +1004,16 @@ bool save_snapshot_if_due(save_context & state, int64_t ibatch) {
         return false;
     }
 
+    if (!llama_opt_state_is_finite(state.ctx)) {
+        state.abort_requested = true;
+        LOG_ERR("periodic adapter snapshot validation failed: optimizer state contains non-finite values; stopping training\n");
+        return false;
+    }
+
     const std::filesystem::path path = state.output_root / step_name("snapshot-", state.schedule->step, ".gguf");
+    bool validation_failed = false;
     if (save_adapter(*state.output_tensors, path.string(), *state.arch, state.lora_alpha,
-                     *state.base_model_path, false)) {
+                     *state.base_model_path, false, &validation_failed)) {
         state.cached_adapter_step = state.schedule->step;
         state.cached_adapter_path = path;
         if (!prune_snapshots(state.output_root, state.save_snapshot_limit)) {
@@ -985,8 +1021,12 @@ bool save_snapshot_if_due(save_context & state, int64_t ibatch) {
         }
         return true;
     }
-    // Snapshot failures are deliberately non-fatal: keep the training loop running.
-    LOG_ERR("periodic adapter snapshot failed: %s; training will continue\n", path.string().c_str());
+    if (validation_failed) {
+        state.abort_requested = true;
+        LOG_ERR("periodic adapter snapshot validation failed; stopping training without writing a final adapter\n");
+    } else {
+        LOG_ERR("periodic adapter snapshot failed: %s; training will continue\n", path.string().c_str());
+    }
     return false;
 }
 
@@ -1115,6 +1155,16 @@ void qlora_epoch_callback_progress_line(bool               train,
     const int64_t window_start = train ? state.window_start : state.validation_window_start;
     const int64_t window_index = window_start + ibatch - 1;
     const int64_t current_window = window_index + 1;
+    double loss = 0.0;
+    ggml_opt_result_last_loss(result, &loss);
+    if (!std::isfinite(loss)) {
+        state.abort_requested = true;
+        LOG_ERR("%s: non-finite %s loss at epoch %ld window %ld; stopping training without final saves\n",
+                __func__, train ? "training" : "validation", static_cast<long>(state.epoch),
+                static_cast<long>(current_window));
+        return;
+    }
+
     int64_t supervised = 0;
     double weight_sum = 0.0;
     if (!get_window_training_statistics(state, window_index, supervised, weight_sum)) {
@@ -1122,9 +1172,7 @@ void qlora_epoch_callback_progress_line(bool               train,
         return;
     }
 
-    double loss = 0.0;
     double average_loss = 0.0;
-    ggml_opt_result_last_loss(result, &loss);
     const double context_size = static_cast<double>(llama_n_ctx(state.ctx));
     if (train) {
         state.training_loss_sum += loss;
@@ -1139,8 +1187,24 @@ void qlora_epoch_callback_progress_line(bool               train,
             average_loss *= context_size * static_cast<double>(ibatch) / state.validation_weight_sum;
         }
     }
+    if (!std::isfinite(average_loss) || !std::isfinite(state.training_loss_sum) ||
+        !std::isfinite(state.training_weight_sum) || !std::isfinite(state.validation_weight_sum) ||
+        !std::isfinite(weight_sum)) {
+        state.abort_requested = true;
+        LOG_ERR("%s: non-finite accumulated %s loss at epoch %ld window %ld; stopping training without final saves\n",
+                __func__, train ? "training" : "validation", static_cast<long>(state.epoch),
+                static_cast<long>(current_window));
+        return;
+    }
     if (weight_sum > 0.0) {
         loss *= context_size / weight_sum;
+    }
+    if (!std::isfinite(loss)) {
+        state.abort_requested = true;
+        LOG_ERR("%s: non-finite weighted %s loss at epoch %ld window %ld; stopping training without final saves\n",
+                __func__, train ? "training" : "validation", static_cast<long>(state.epoch),
+                static_cast<long>(current_window));
+        return;
     }
     const std::string loss_text = format_four_significant_digits(loss);
     const std::string average_loss_text = format_four_significant_digits(average_loss);
@@ -1219,7 +1283,7 @@ void save_step_callback(bool               train,
                         int64_t            t_start_us) {
     qlora_epoch_callback_progress_line(train, opt_ctx, dataset, result, ibatch, ibatch_max, t_start_us);
 
-    if (!train || !g_save_context) {
+    if (!train || !g_save_context || g_save_context->abort_requested) {
         return;
     }
     update_training_step(*g_save_context, ibatch);
@@ -1227,7 +1291,9 @@ void save_step_callback(bool               train,
         log_gradient_stats_if_due(*g_save_context, result);
     }
     const bool snapshot_saved = save_snapshot_if_due(*g_save_context, ibatch);
+    if (g_save_context->abort_requested) return;
     const bool checkpoint_saved = save_checkpoint_if_due(*g_save_context, ibatch);
+    if (g_save_context->abort_requested) return;
     if (snapshot_saved && checkpoint_saved) {
         log_saved_checkpoint(*g_save_context, true);
     } else if (snapshot_saved) {
@@ -1487,10 +1553,21 @@ bool train_adapter(const qlora_params & qparams,
             window_end + std::min<int64_t>(qparams.val_windows, dataset_windows - window_end);
         save_state.validation_window_start = window_end;
         save_state.validation_progress_started = false;
-        llama_opt_epoch_range(ctx, dataset.get(), result_train.get(), result_eval.get(),
-                                            window_start, window_end, eval_end,
-                                            train_callback, qlora_epoch_callback_progress_line);
+        const bool epoch_completed = llama_opt_epoch_range_ex(
+            ctx, dataset.get(), result_train.get(), result_eval.get(),
+            window_start, window_end, eval_end,
+            train_callback, qlora_epoch_callback_progress_line,
+            qlora_should_abort, &save_state);
         std::fprintf(stderr, "\n");
+        if (!epoch_completed) {
+            if (save_state.abort_requested) {
+                LOG_ERR("%s: training aborted after numerical validation failure; final adapter and checkpoint saves were skipped\n",
+                        __func__);
+            } else {
+                LOG_ERR("%s: optimizer epoch execution failed; final adapter and checkpoint saves were skipped\n", __func__);
+            }
+            return false;
+        }
         log_epoch_loss(params.lr.epoch + 1, params.lr.epochs, save_state.training_loss_sum,
                        static_cast<double>(llama_n_ctx(ctx)), save_state.training_weight_sum);
         ggml_opt_result_reset(result_train.get());

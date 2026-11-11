@@ -7,7 +7,9 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -275,6 +277,70 @@ void test_peft_default_lora_initialization() {
             "embedding LoRA B must use a unit-standard-deviation normal distribution");
 }
 
+void test_lora_finite_validation() {
+    const std::vector<ggml_type> types = { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 };
+    for (const ggml_type type : types) {
+        ggml_context_ptr ctx(ggml_init({ 8 * ggml_tensor_overhead(), nullptr, true }));
+        require(static_cast<bool>(ctx), "failed to allocate LoRA finite-check context");
+        ggml_tensor * a = ggml_new_tensor_2d(ctx.get(), type, 2, 2);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx.get(), type, 2, 2);
+        require(a && b, "failed to allocate LoRA finite-check tensors");
+        ggml_backend_buffer_ptr buffer(
+            ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_cpu_buffer_type()));
+        require(static_cast<bool>(buffer), "failed to allocate LoRA finite-check tensor buffer");
+
+        const std::vector<float> finite_values = { 0.25f, -0.5f, 0.75f, -1.0f };
+        const auto write_values = [type](ggml_tensor * tensor, const std::vector<float> & values) {
+            if (type == GGML_TYPE_F32) {
+                std::memcpy(tensor->data, values.data(), values.size() * sizeof(float));
+            } else {
+                const ggml_type_traits * traits = ggml_get_type_traits(type);
+                require(traits && traits->from_float_ref, "LoRA type has no float encoder");
+                traits->from_float_ref(values.data(), tensor->data, static_cast<int64_t>(values.size()));
+            }
+        };
+        write_values(a, finite_values);
+        write_values(b, finite_values);
+        const lora_tensor_refs refs = { { "test.weight", { a, b } } };
+        std::string validation_error;
+        require(lora_tensors_are_finite(refs, &validation_error),
+                "finite LoRA tensors were rejected for " + std::string(ggml_type_name(type)));
+
+        std::vector<float> invalid_values = finite_values;
+        invalid_values[2] = std::numeric_limits<float>::quiet_NaN();
+        write_values(b, invalid_values);
+        require(!lora_tensors_are_finite(refs, &validation_error),
+                "NaN LoRA tensor was accepted for " + std::string(ggml_type_name(type)));
+        require(validation_error.find("test.weight.lora_b") != std::string::npos,
+                "LoRA finite check did not identify the invalid tensor");
+        invalid_values[2] = std::numeric_limits<float>::infinity();
+        write_values(b, invalid_values);
+        require(!lora_tensors_are_finite(refs, &validation_error),
+                "Inf LoRA tensor was accepted for " + std::string(ggml_type_name(type)));
+
+        const std::filesystem::path output_path = std::filesystem::temp_directory_path() /
+            ("llama-qlora-nonfinite-" + std::string(ggml_type_name(type)) + ".gguf");
+        const std::string sentinel = "existing adapter must remain unchanged";
+        {
+            std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
+            require(static_cast<bool>(output), "failed to create existing adapter sentinel");
+            output << sentinel;
+        }
+        bool validation_failed = false;
+        require(!save_adapter(refs, output_path.string(), "llama", 2.0f, "base.gguf", false,
+                              &validation_failed),
+                "save_adapter accepted non-finite LoRA tensors");
+        require(validation_failed, "save_adapter did not report a tensor validation failure");
+        {
+            std::ifstream input(output_path, std::ios::binary);
+            const std::string contents((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+            require(contents == sentinel, "non-finite adapter save overwrote the existing adapter");
+        }
+        std::filesystem::remove(output_path);
+        std::filesystem::remove(output_path.string() + ".tmp");
+    }
+}
+
 void test_lora_storage_types() {
     ggml_context_ptr model_ctx(ggml_init({ 8 * ggml_tensor_overhead(), nullptr, true }));
     require(static_cast<bool>(model_ctx), "failed to allocate model context for type test");
@@ -480,6 +546,7 @@ int main() {
         llama_backend_init();
         test_transform_preserves_delta_adds_targets_and_keeps_frozen_tensors();
         test_peft_default_lora_initialization();
+        test_lora_finite_validation();
         test_lora_storage_types();
         test_moe_expert_lora_allocation_and_transform();
         llama_backend_free();

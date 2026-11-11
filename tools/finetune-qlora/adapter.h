@@ -54,9 +54,12 @@ bool lora_tensor_matches_targets(const std::string & name,
 
 bool lora_param_filter(const ggml_tensor * tensor, void * userdata);
 
+bool lora_tensors_are_finite(const lora_tensor_refs & tensors, std::string * error = nullptr);
+
 bool save_adapter(const lora_tensor_refs & tensors,
                   const std::string & out_path,
                   const std::string & arch,
                   float alpha,
                   const std::string & base_model_path,
-                  bool log_success = true);
+                  bool log_success = true,
+                  bool * validation_failed = nullptr);
