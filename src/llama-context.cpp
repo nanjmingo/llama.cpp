@@ -4407,10 +4407,6 @@ size_t llama_context::opt_state_size() const {
     return opt_ctx ? ggml_opt_state_size(opt_ctx) : 0;
 }
 
-bool llama_context::opt_state_is_finite() const {
-    return opt_ctx && ggml_opt_state_is_finite(opt_ctx);
-}
-
 bool llama_context::opt_state_export(void * data, size_t size) const {
     return opt_ctx && ggml_opt_state_export(opt_ctx, data, size);
 }
@@ -5562,10 +5558,6 @@ void llama_opt_set_grad_stats_interval(struct llama_context * ctx, int32_t inter
 
 size_t llama_opt_state_size(const struct llama_context * ctx) {
     return ctx ? ctx->opt_state_size() : 0;
-}
-
-bool llama_opt_state_is_finite(const struct llama_context * ctx) {
-    return ctx && ctx->opt_state_is_finite();
 }
 
 bool llama_opt_state_export(const struct llama_context * ctx, void * data, size_t size) {

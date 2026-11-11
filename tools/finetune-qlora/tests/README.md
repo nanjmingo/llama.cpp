@@ -19,7 +19,8 @@ This directory contains unit tests, integration tests, and chat-template fixture
 | `test-qlora-dataset-template-hf` | Unit | No | Smoke tests for Gemma 4 and Qwen Jinja templates. |
 | `test-qlora-dataset-reader` | Unit | No | JSONL streaming, batching, and ordering guarantees. |
 | `test-qlora-dataset-window` | Unit | No | Window packing, BOS padding, and overlap masking. |
-| `test-qlora-training-math` | Unit | No | Cross-entropy autodiff, LoRA gradients against finite differences, optimizer steps, and optimizer-state finite-value checks. |
+| `test-qlora-optimizer-state` | Unit | No | Serialized optimizer-state finite-value validation for F32/F16/BF16 and version 1 compatibility. |
+| `test-qlora-training-math` | Unit | No | Cross-entropy autodiff, LoRA gradients against finite differences, optimizer steps, and optimizer-state export, size calculation, and CPU-buffer finite-value checks. |
 | `test-qlora-forward-precision` | Unit | No | Matrix multiplication with Q8, F32, F16, and BF16 precision. |
 | `test-qlora-schedule` | Unit | No | LR warmup, cosine decay, and weight decay logic. |
 | `test-qlora-dataset-template-model` | Integration | GGUF vocab | Validates model metadata and embedded Jinja chat template (no weights loaded). |

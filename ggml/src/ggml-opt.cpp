@@ -1044,19 +1044,6 @@ struct ggml_opt_state_data {
 constexpr char GGML_OPT_STATE_MAGIC[8] = {'G', 'G', 'O', 'P', 'T', 'S', 'T', '1'};
 constexpr uint32_t GGML_OPT_STATE_VERSION = 2;
 
-template<typename T>
-void opt_state_append(std::vector<uint8_t> & out, T value) {
-    static_assert(std::is_integral<T>::value, "integer type required");
-    for (size_t i = 0; i < sizeof(T); ++i) {
-        out.push_back(static_cast<uint8_t>((static_cast<uint64_t>(value) >> (i * 8)) & 0xff));
-    }
-}
-
-void opt_state_append_bytes(std::vector<uint8_t> & out, const void * data, size_t size) {
-    const auto * begin = static_cast<const uint8_t *>(data);
-    out.insert(out.end(), begin, begin + size);
-}
-
 struct opt_state_reader {
     const uint8_t * data = nullptr;
     size_t size = 0;
@@ -1065,7 +1052,7 @@ struct opt_state_reader {
     template<typename T>
     bool read_int(T & value) {
         static_assert(std::is_integral<T>::value, "integer type required");
-        if (size - pos < sizeof(T)) return false;
+        if (pos > size || size - pos < sizeof(T)) return false;
         uint64_t result = 0;
         for (size_t i = 0; i < sizeof(T); ++i) {
             result |= static_cast<uint64_t>(data[pos++]) << (i * 8);
@@ -1075,16 +1062,29 @@ struct opt_state_reader {
     }
 
     bool read_string(std::string & value, size_t len) {
-        if (size - pos < len) return false;
+        if (pos > size || size - pos < len) return false;
         value.assign(reinterpret_cast<const char *>(data + pos), len);
         pos += len;
         return true;
     }
 
-    bool read_bytes(std::vector<uint8_t> & value, size_t len) {
-        if (size - pos < len) return false;
-        value.assign(data + pos, data + pos + len);
+    bool read_view(const uint8_t *& value, size_t len) {
+        if (pos > size || size - pos < len) return false;
+        value = data + pos;
         pos += len;
+        return true;
+    }
+
+    bool skip_bytes(size_t len) {
+        if (pos > size || size - pos < len) return false;
+        pos += len;
+        return true;
+    }
+
+    bool read_bytes(std::vector<uint8_t> & value, size_t len) {
+        const uint8_t * bytes = nullptr;
+        if (!read_view(bytes, len)) return false;
+        value.assign(bytes, bytes + len);
         return true;
     }
 };
@@ -1149,23 +1149,42 @@ std::vector<ggml_tensor *> ggml_opt_moment_tensors(ggml_opt_context_t opt_ctx) {
     return result;
 }
 
-bool ggml_opt_tensor_is_finite(const ggml_tensor * tensor) {
-    if (!tensor) return false;
+bool ggml_opt_state_check_tensor_data(const uint8_t * data, size_t size, ggml_type type,
+                                      const int64_t ne[GGML_MAX_DIMS], float * values,
+                                      size_t value_capacity, void * aligned_data) {
+    if (!data || (type != GGML_TYPE_F32 && type != GGML_TYPE_F16 && type != GGML_TYPE_BF16)) return false;
 
-    const int64_t count = ggml_nelements(tensor);
-    if (count <= 0) return false;
-
-    std::vector<uint8_t> data(ggml_nbytes(tensor));
-    ggml_backend_tensor_get(tensor, data.data(), 0, data.size());
-    std::vector<float> values(static_cast<size_t>(count));
-    if (tensor->type == GGML_TYPE_F32) {
-        std::memcpy(values.data(), data.data(), values.size() * sizeof(float));
-    } else {
-        const ggml_type_traits * traits = ggml_get_type_traits(tensor->type);
-        if (!traits || !traits->to_float) return false;
-        traits->to_float(data.data(), values.data(), count);
+    size_t element_count = 1;
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        if (ne[d] <= 0 || static_cast<uint64_t>(ne[d]) > SIZE_MAX / element_count) return false;
+        element_count *= static_cast<size_t>(ne[d]);
     }
-    return std::all_of(values.begin(), values.end(), [](float value) { return std::isfinite(value); });
+
+    const size_t element_size = ggml_type_size(type);
+    if (element_size == 0 || element_count > SIZE_MAX / element_size || element_count * element_size != size) {
+        return false;
+    }
+
+    const ggml_type_traits * traits = ggml_get_type_traits(type);
+    if (type != GGML_TYPE_F32 && (!traits || !traits->to_float)) return false;
+
+    if (!values || value_capacity == 0 || (type != GGML_TYPE_F32 && !aligned_data)) return false;
+    for (size_t offset = 0; offset < element_count;) {
+        const size_t count = std::min(element_count - offset, value_capacity);
+        const uint8_t * chunk = data + offset * element_size;
+        if (type == GGML_TYPE_F32) {
+            std::memcpy(values, chunk, count * sizeof(float));
+        } else {
+            std::memcpy(aligned_data, chunk, count * element_size);
+            traits->to_float(aligned_data, values, static_cast<int64_t>(count));
+        }
+        if (!std::all_of(values, values + count,
+                         [](float value) { return std::isfinite(value); })) {
+            return false;
+        }
+        offset += count;
+    }
+    return true;
 }
 
 bool ggml_opt_apply_pending_state(ggml_opt_context_t opt_ctx) {
@@ -1198,71 +1217,193 @@ bool ggml_opt_apply_pending_state(ggml_opt_context_t opt_ctx) {
     return true;
 }
 
-bool ggml_opt_state_serialize(ggml_opt_context_t opt_ctx, std::vector<uint8_t> & out) {
-    if (!opt_ctx->optimizer_state_ready || opt_ctx->eval_ready || opt_ctx->opt_i != 0 ||
-        !opt_ctx->pending_optimizer_state.empty()) return false;
+struct ggml_opt_state_layout {
+    std::string rng;
+    std::vector<ggml_tensor *> tensors;
+    size_t size = 0;
+};
 
-    std::ostringstream rng_stream;
-    rng_stream.imbue(std::locale::classic());
-    rng_stream << opt_ctx->rng;
-    const std::string rng_state = rng_stream.str();
-    const std::vector<ggml_tensor *> tensors = ggml_opt_moment_tensors(opt_ctx);
-
-    out.clear();
-    opt_state_append_bytes(out, GGML_OPT_STATE_MAGIC, sizeof(GGML_OPT_STATE_MAGIC));
-    opt_state_append<uint32_t>(out, GGML_OPT_STATE_VERSION);
-    opt_state_append<uint32_t>(out, static_cast<uint32_t>(opt_ctx->optimizer));
-    opt_state_append<uint32_t>(out, static_cast<uint32_t>(opt_ctx->optimizer_state_type));
-    opt_state_append<uint64_t>(out, opt_ctx->iter);
-    opt_state_append<uint64_t>(out, static_cast<uint64_t>(rng_state.size()));
-    opt_state_append_bytes(out, rng_state.data(), rng_state.size());
-    opt_state_append<uint32_t>(out, static_cast<uint32_t>(tensors.size()));
-
-    for (const ggml_tensor * tensor : tensors) {
-        if (!tensor || tensor->name[0] == '\0') return false;
-        const size_t name_size = std::strlen(tensor->name);
-        if (name_size == 0 || name_size > GGML_MAX_NAME) return false;
-        opt_state_append<uint32_t>(out, static_cast<uint32_t>(name_size));
-        opt_state_append_bytes(out, tensor->name, name_size);
-        opt_state_append<uint32_t>(out, static_cast<uint32_t>(tensor->type));
-        opt_state_append<uint32_t>(out, static_cast<uint32_t>(ggml_n_dims(tensor)));
-        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
-            opt_state_append<uint64_t>(out, static_cast<uint64_t>(tensor->ne[d]));
-        }
-        const size_t nbytes = ggml_nbytes(tensor);
-        opt_state_append<uint64_t>(out, static_cast<uint64_t>(nbytes));
-        const size_t offset = out.size();
-        out.resize(offset + nbytes);
-        ggml_backend_tensor_get(tensor, out.data() + offset, 0, nbytes);
-    }
+bool opt_state_size_add(size_t & size, size_t value) {
+    if (value > SIZE_MAX - size) return false;
+    size += value;
     return true;
 }
 
-} // namespace
-
-size_t ggml_opt_state_size(ggml_opt_context_t opt_ctx) {
-    if (!opt_ctx) return 0;
-    std::vector<uint8_t> state;
-    return ggml_opt_state_serialize(opt_ctx, state) ? state.size() : 0;
-}
-
-bool ggml_opt_state_is_finite(ggml_opt_context_t opt_ctx) {
+bool ggml_opt_state_make_layout(ggml_opt_context_t opt_ctx, ggml_opt_state_layout & layout) {
     if (!opt_ctx || !opt_ctx->optimizer_state_ready || opt_ctx->eval_ready || opt_ctx->opt_i != 0 ||
         !opt_ctx->pending_optimizer_state.empty()) {
         return false;
     }
-    for (const ggml_tensor * tensor : ggml_opt_moment_tensors(opt_ctx)) {
-        if (!ggml_opt_tensor_is_finite(tensor)) return false;
+
+    std::ostringstream rng_stream;
+    rng_stream.imbue(std::locale::classic());
+    rng_stream << opt_ctx->rng;
+    if (!rng_stream) return false;
+    layout.rng = rng_stream.str();
+    layout.tensors = ggml_opt_moment_tensors(opt_ctx);
+    if (layout.tensors.size() > UINT32_MAX || layout.rng.size() > UINT64_MAX) return false;
+
+    layout.size = 0;
+    if (!opt_state_size_add(layout.size, sizeof(GGML_OPT_STATE_MAGIC)) ||
+        !opt_state_size_add(layout.size, sizeof(uint32_t) * 3) ||
+        !opt_state_size_add(layout.size, sizeof(uint64_t) * 2) ||
+        !opt_state_size_add(layout.size, layout.rng.size()) ||
+        !opt_state_size_add(layout.size, sizeof(uint32_t))) {
+        return false;
+    }
+
+    for (const ggml_tensor * tensor : layout.tensors) {
+        if (!tensor || tensor->name[0] == '\0') return false;
+        const size_t name_size = std::strlen(tensor->name);
+        const int n_dims = ggml_n_dims(tensor);
+        if (name_size == 0 || name_size > GGML_MAX_NAME || n_dims < 1 || n_dims > GGML_MAX_DIMS ||
+            tensor->type != opt_ctx->optimizer_state_type) {
+            return false;
+        }
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (tensor->ne[d] <= 0) return false;
+        }
+        if (!opt_state_size_add(layout.size, sizeof(uint32_t)) ||
+            !opt_state_size_add(layout.size, name_size) ||
+            !opt_state_size_add(layout.size, sizeof(uint32_t) * 2) ||
+            !opt_state_size_add(layout.size, sizeof(uint64_t) * GGML_MAX_DIMS) ||
+            !opt_state_size_add(layout.size, sizeof(uint64_t)) ||
+            !opt_state_size_add(layout.size, ggml_nbytes(tensor))) {
+            return false;
+        }
     }
     return true;
 }
 
+struct opt_state_writer {
+    uint8_t * data;
+    size_t size;
+    size_t pos = 0;
+
+    template<typename T>
+    bool write_int(T value) {
+        static_assert(std::is_integral<T>::value, "integer type required");
+        if (pos > size || size - pos < sizeof(T)) return false;
+        for (size_t i = 0; i < sizeof(T); ++i) {
+            data[pos++] = static_cast<uint8_t>((static_cast<uint64_t>(value) >> (i * 8)) & 0xff);
+        }
+        return true;
+    }
+
+    bool write_bytes(const void * source, size_t count) {
+        if (pos > size || count > size - pos) return false;
+        if (count != 0) std::memcpy(data + pos, source, count);
+        pos += count;
+        return true;
+    }
+};
+
+} // namespace
+
+size_t ggml_opt_state_size(ggml_opt_context_t opt_ctx) {
+    ggml_opt_state_layout layout;
+    return ggml_opt_state_make_layout(opt_ctx, layout) ? layout.size : 0;
+}
+
 bool ggml_opt_state_export(ggml_opt_context_t opt_ctx, void * data, size_t size) {
-    if (!opt_ctx || !data) return false;
-    std::vector<uint8_t> state;
-    if (!ggml_opt_state_serialize(opt_ctx, state) || state.size() != size) return false;
-    std::memcpy(data, state.data(), state.size());
-    return true;
+    if (!data) return false;
+    ggml_opt_state_layout layout;
+    if (!ggml_opt_state_make_layout(opt_ctx, layout) || layout.size != size) return false;
+
+    opt_state_writer writer{static_cast<uint8_t *>(data), size, 0};
+    if (!writer.write_bytes(GGML_OPT_STATE_MAGIC, sizeof(GGML_OPT_STATE_MAGIC)) ||
+        !writer.write_int<uint32_t>(GGML_OPT_STATE_VERSION) ||
+        !writer.write_int<uint32_t>(static_cast<uint32_t>(opt_ctx->optimizer)) ||
+        !writer.write_int<uint32_t>(static_cast<uint32_t>(opt_ctx->optimizer_state_type)) ||
+        !writer.write_int<uint64_t>(opt_ctx->iter) ||
+        !writer.write_int<uint64_t>(static_cast<uint64_t>(layout.rng.size())) ||
+        !writer.write_bytes(layout.rng.data(), layout.rng.size()) ||
+        !writer.write_int<uint32_t>(static_cast<uint32_t>(layout.tensors.size()))) {
+        return false;
+    }
+
+    for (const ggml_tensor * tensor : layout.tensors) {
+        const size_t name_size = std::strlen(tensor->name);
+        const size_t nbytes = ggml_nbytes(tensor);
+        if (!writer.write_int<uint32_t>(static_cast<uint32_t>(name_size)) ||
+            !writer.write_bytes(tensor->name, name_size) ||
+            !writer.write_int<uint32_t>(static_cast<uint32_t>(tensor->type)) ||
+            !writer.write_int<uint32_t>(static_cast<uint32_t>(ggml_n_dims(tensor)))) {
+            return false;
+        }
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (!writer.write_int<uint64_t>(static_cast<uint64_t>(tensor->ne[d]))) return false;
+        }
+        if (!writer.write_int<uint64_t>(static_cast<uint64_t>(nbytes)) ||
+            writer.pos > writer.size || writer.size - writer.pos < nbytes) {
+            return false;
+        }
+        ggml_backend_tensor_get(tensor, writer.data + writer.pos, 0, nbytes);
+        writer.pos += nbytes;
+    }
+    return writer.pos == writer.size;
+}
+
+bool ggml_opt_state_data_is_finite(const void * data, size_t size) {
+    if (!data || size < sizeof(GGML_OPT_STATE_MAGIC)) return false;
+
+    opt_state_reader reader{static_cast<const uint8_t *>(data), size, 0};
+    const uint8_t * magic = nullptr;
+    uint32_t version = 0;
+    uint32_t optimizer = 0;
+    uint32_t optimizer_state_type = GGML_TYPE_F32;
+    uint64_t iter = 0;
+    uint64_t rng_size = 0;
+    uint32_t tensor_count = 0;
+    if (!reader.read_view(magic, sizeof(GGML_OPT_STATE_MAGIC)) ||
+        std::memcmp(magic, GGML_OPT_STATE_MAGIC, sizeof(GGML_OPT_STATE_MAGIC)) != 0 ||
+        !reader.read_int(version) || (version != 1 && version != GGML_OPT_STATE_VERSION) ||
+        !reader.read_int(optimizer) || optimizer >= GGML_OPT_OPTIMIZER_TYPE_COUNT ||
+        (version >= 2 && (!reader.read_int(optimizer_state_type) || optimizer_state_type >= GGML_TYPE_COUNT)) ||
+        !reader.read_int(iter) || iter < 1 ||
+        !reader.read_int(rng_size) || rng_size > SIZE_MAX ||
+        !reader.skip_bytes(static_cast<size_t>(rng_size)) ||
+        !reader.read_int(tensor_count) || tensor_count > size / 16 ||
+        (optimizer_state_type != GGML_TYPE_F32 && optimizer_state_type != GGML_TYPE_F16 &&
+         optimizer_state_type != GGML_TYPE_BF16)) {
+        return false;
+    }
+
+    std::vector<float> values(tensor_count == 0 ? 0 : 4096);
+    std::vector<uint64_t> aligned_data(
+        tensor_count == 0 || optimizer_state_type == GGML_TYPE_F32 ? 0 : 1024);
+    for (uint32_t i = 0; i < tensor_count; ++i) {
+        uint32_t name_size = 0;
+        uint32_t type_value = 0;
+        uint32_t n_dims = 0;
+        uint64_t nbytes = 0;
+        const uint8_t * unused = nullptr;
+        int64_t ne[GGML_MAX_DIMS] = {};
+        if (!reader.read_int(name_size) || name_size == 0 || name_size > GGML_MAX_NAME ||
+            !reader.read_view(unused, name_size) ||
+            !reader.read_int(type_value) || type_value >= GGML_TYPE_COUNT ||
+            !reader.read_int(n_dims) || n_dims < 1 || n_dims > GGML_MAX_DIMS) {
+            return false;
+        }
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            uint64_t dimension = 0;
+            if (!reader.read_int(dimension) || dimension == 0 || dimension > static_cast<uint64_t>(INT64_MAX) ||
+                (d >= static_cast<int>(n_dims) && dimension != 1)) {
+                return false;
+            }
+            ne[d] = static_cast<int64_t>(dimension);
+        }
+        if (!reader.read_int(nbytes) || nbytes > SIZE_MAX) return false;
+        const uint8_t * tensor_data = nullptr;
+        if (!reader.read_view(tensor_data, static_cast<size_t>(nbytes)) ||
+            type_value != optimizer_state_type ||
+            !ggml_opt_state_check_tensor_data(tensor_data, static_cast<size_t>(nbytes),
+                                              static_cast<ggml_type>(type_value), ne,
+                                              values.data(), values.size(), aligned_data.data())) {
+            return false;
+        }
+    }
+    return reader.pos == reader.size;
 }
 
 bool ggml_opt_state_import(ggml_opt_context_t opt_ctx, const void * data, size_t size) {

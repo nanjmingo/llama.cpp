@@ -953,10 +953,24 @@ bool prepare_qlora_save_job(save_context & state,
         }
 
         if (write_snapshot || write_checkpoint) {
-            if (!llama_opt_state_is_finite(state.ctx)) {
+            std::vector<uint8_t> snapshot_validation_state;
+            std::vector<uint8_t> & optimizer_state = write_checkpoint
+                ? prepared->optimizer_state
+                : snapshot_validation_state;
+            const size_t state_size = llama_opt_state_size(state.ctx);
+            if (state_size == 0) {
                 if (validation_failed) *validation_failed = true;
-                LOG_ERR("%s: optimizer state contains non-finite values or is not at a valid optimizer-step boundary\n",
-                        __func__);
+                LOG_ERR("%s: optimizer state is not available at a valid optimizer-step boundary\n", __func__);
+                return false;
+            }
+            optimizer_state.resize(state_size);
+            if (!llama_opt_state_export(state.ctx, optimizer_state.data(), optimizer_state.size())) {
+                LOG_ERR("%s: failed to export optimizer state\n", __func__);
+                return false;
+            }
+            if (!ggml_opt_state_data_is_finite(optimizer_state.data(), optimizer_state.size())) {
+                if (validation_failed) *validation_failed = true;
+                LOG_ERR("%s: serialized optimizer state contains non-finite values or is invalid\n", __func__);
                 return false;
             }
         }
@@ -969,16 +983,6 @@ bool prepare_qlora_save_job(save_context & state,
         }
 
         if (write_checkpoint) {
-            const size_t state_size = llama_opt_state_size(state.ctx);
-            if (state_size == 0) {
-                LOG_ERR("%s: optimizer state is not available at a checkpoint boundary\n", __func__);
-                return false;
-            }
-            prepared->optimizer_state.resize(state_size);
-            if (!llama_opt_state_export(state.ctx, prepared->optimizer_state.data(), prepared->optimizer_state.size())) {
-                LOG_ERR("%s: failed to export optimizer state\n", __func__);
-                return false;
-            }
             const int64_t permutation_size = ggml_opt_dataset_permutation_size(state.dataset);
             if (permutation_size != state.dataset_windows) return false;
             std::vector<int64_t> permutation(static_cast<size_t>(permutation_size));

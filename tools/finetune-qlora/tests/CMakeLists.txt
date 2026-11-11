@@ -109,6 +109,14 @@ target_link_libraries(test-qlora-dataset-window PRIVATE llama-common)
 target_compile_features(test-qlora-dataset-window PRIVATE cxx_std_17)
 add_test(NAME test-qlora-dataset-window COMMAND test-qlora-dataset-window)
 
+add_executable(test-qlora-optimizer-state
+    test-optimizer-state.cpp
+)
+target_include_directories(test-qlora-optimizer-state PRIVATE "${CMAKE_SOURCE_DIR}/ggml/include")
+target_link_libraries(test-qlora-optimizer-state PRIVATE ggml-base)
+target_compile_features(test-qlora-optimizer-state PRIVATE cxx_std_17)
+add_test(NAME test-qlora-optimizer-state COMMAND test-qlora-optimizer-state)
+
 add_executable(test-qlora-training-math
     test-training-math.cpp
     test-training-math-common.cpp
@@ -177,6 +185,7 @@ add_custom_target(llamango-tests
         test-qlora-dataset-template-hf
         test-qlora-dataset-reader
         test-qlora-dataset-window
+        test-qlora-optimizer-state
         test-qlora-training-math
         test-qlora-forward-precision
         test-qlora-args

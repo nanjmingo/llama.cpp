@@ -224,7 +224,6 @@ struct llama_context {
     void opt_set_opt_period(int32_t opt_period);
     void opt_set_grad_stats_interval(int32_t interval);
     size_t opt_state_size() const;
-    bool opt_state_is_finite() const;
     bool opt_state_export(void * data, size_t size) const;
     bool opt_state_import(const void * data, size_t size);
     void opt_dataset_shuffle(ggml_opt_dataset_t dataset, int64_t idata);
