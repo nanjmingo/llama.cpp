@@ -1,54 +1,79 @@
-# QLoRA Precision Evaluation
+# QLoRA Precision Evaluation Tool
 
-## Compare forward and backward precision
+`eval-qlora-model-precision` evaluates how forward and backward precision affect training loss convergence across different learning rates.
 
-`eval-qlora-model-precision` measures inference loss before training and after each optimizer update for every requested learning rate. `--forward-precision` selects the requested input precision for forward matrix multiplications, and `--backward-precision` selects the requested input precision for backward matrix multiplications. Both are clamped per weight tensor type: F32 weights use F32; F16 weights use F16 for F16/Q8 requests and F32 otherwise; BF16 weights use BF16 for BF16/Q8 requests and F32 otherwise; Q8_0 and lower-bit quantized weights retain the requested precision. F32 LoRA weights therefore use F32. Backward precision defaults to `f32`; Q8 is not supported for backward. Losses are always measured with F32 forward precision; the selected training forward precision is restored before the next optimizer update.
+---
 
-Each learning rate starts from the same initial LoRA adapter and a new optimizer context. Within a learning-rate run, LoRA parameters and optimizer state are retained across updates. `--epoch` specifies the number of optimizer updates (default: `10`). The initial F32 evaluation loss is printed once on a separate `[initial_loss]` line with six digits after the decimal point, before the learning-rate results. Entries `[1]` through `[N]` on each learning-rate line are loss deltas: `[1]` is the loss after update 1 minus the initial loss, and `[N]` is the loss after update `N` minus the loss after update `N-1`. The final `[sum]` is the net loss change from the initial loss to the final loss (equivalent to the sum of all per-update deltas before formatting). A negative delta means the loss decreased; a positive delta means it increased. This probe uses one fixed training window; `--epoch 10` does not mean ten passes over a representative dataset.
+## How It Works
 
-The `--n-gpu-layers N` option controls how many model layers are requested for GPU offload. It defaults to `0` to preserve CPU-only behavior; use a positive number to offload that many layers, or `-1` to request all layers. When GPU offload is requested, KQV and operation offload are enabled for both training and inference contexts. Add `--verbose-logs` to inspect the backend logs and verify how many layers were actually offloaded. A GPU-enabled build and an available GPU backend are required.
+1. Measures initial baseline loss on a fixed evaluation window using F32 forward precision.
+2. For each specified learning rate, trains a fresh LoRA adapter for N optimizer updates (`--epoch`).
+3. Evaluates inference loss after each update (always evaluated in F32 forward precision).
+4. Prints per-step loss changes and elapsed time.
 
-The `--flash-attn on|off` option controls Flash Attention in both training and inference contexts. It defaults to `off`, preserving the previous behavior. Some model architectures or backend configurations may not support forcing Flash Attention on. The selected setting is printed in the `[CONFIG]` line.
+---
 
-The `--lora-targets CSV` option selects the model tensor-name substrings for which the evaluation adapter is created and trained. Its default preserves the original attention and dense-FFN targets. To evaluate expert LoRA, explicitly pass the expert tensor names used by the model, for example `--lora-targets ffn_gate_up_exps,ffn_down_exps` for models with fused gate/up expert weights, or `--lora-targets ffn_gate_exps,ffn_up_exps,ffn_down_exps` for models with separate expert weights. Target names are comma-separated, whitespace around names is ignored, and every requested target must match a supported tensor in the model. The selected targets are printed in the `[CONFIG]` line.
+## CLI Options
 
-The loss measurement uses the configured inference KV-cache types (`-ctk` and `-ctv`), while forward precision is fixed to F32. Backward precision does not affect inference-only loss evaluation. Keep the model, target tensors, cache types, sample, and all other settings identical when comparing runs. The base model's GGUF weight types are unchanged. The reported loss values are measurements on a fixed probe sample, not a substitute for held-out task evaluation.
+| Option | Default | Description |
+|---|---|---|
+| `-m`, `--model` | *(required)* | Path to GGUF model file. |
+| `--forward-precision` | `f32` | Forward matrix multiplication precision (`f32`, `f16`, `bf16`, `q8`). |
+| `--backward-precision` | `f32` | Backward matrix multiplication precision (`f32`, `f16`, `bf16`). |
+| `--learning-rates` | *(required)* | Comma-separated learning rates (e.g. `1e-2,1e-3,1e-4`). |
+| `--epoch` | `10` | Number of optimizer updates per learning rate. |
+| `--n-gpu-layers` | `0` | GPU offload layers (`0` = CPU only, `-1` = all layers). |
+| `--flash-attn` | `off` | Flash Attention mode (`on` or `off`). |
+| `--lora-targets` | (standard) | Comma-separated GGUF tensor-name substrings. |
+| `-ctk`, `-ctv` | `f32` | KV cache storage types for K and V. |
+| `--verbose-logs` | disabled | Show verbose library logging. |
 
-Results are printed as one line per learning rate. Learning rates use compact scientific notation with an explicit exponent sign for nonnegative exponents. Loss deltas use scientific notation with three significant digits; positive deltas have a leading `+`, negative deltas have a leading `-`, and zero is printed as `-0`. The initial loss is printed once on a separate `[initial_loss]` line. Learning-rate lines contain per-update deltas `[1]` through `[N]`, the net `[sum]`, and `[time]` with elapsed seconds to millisecond precision. The timer starts before creating that learning-rate's experiment and includes experiment setup, optimizer updates, and per-update loss evaluation; it excludes model loading and the initial baseline evaluation. For example:
+---
+
+## Output Format
 
 ```text
 [initial_loss]=1.278270
 [lr=1e-2] [1]=-3.00e-05 [2]=+1.10e-04 [3]=-0 [sum]=+8.00e-05 [time]=1.234s
-[lr=3e+0] [1]=+2.45e-06 [2]=-1.23e-04 ... [sum]=-1.20e-04 [time]=1.087s
+[lr=1e-3] [1]=-1.25e-04 [2]=-2.10e-04 [3]=-1.50e-04 [sum]=-4.85e-04 [time]=1.189s
 ```
 
-Build and run an evaluation:
+- `[initial_loss]`: Baseline loss before training.
+- `[N]`: Loss change at update $N$ relative to update $N-1$ (negative means loss decreased).
+- `[sum]`: Net total loss change from baseline to final step.
+- `[time]`: Elapsed time for that learning rate.
+
+---
+
+## Build and Run
+
+### 1. Build the Tool
 
 ```bash
-cmake --build build-qlora-test --target llamango-eval-tools --parallel 2
-./build-qlora-test/bin/eval-qlora-model-precision \
-  --model /path/to/test-models/SmolLM2-135M-Instruct-Q8_0.gguf \
+cmake --build build --target llamango-eval-tools -j
+```
+
+### 2. Standard Dense Model Example
+
+```bash
+./build/bin/eval-qlora-model-precision \
+  --model /path/to/SmolLM2-135M-Instruct-Q8_0.gguf \
   --forward-precision q8 \
   --backward-precision f32 \
   --n-gpu-layers 99 \
-  --flash-attn off \
-  --verbose-logs \
-  --cache-type-k f32 --cache-type-v f32 \
+  --flash-attn on \
   --learning-rates 1e-2,1e-3,1e-4,1e-5 \
   --epoch 10
 ```
 
-Evaluate expert LoRA with a model that has fused gate/up expert tensors:
+### 3. MoE Model with Fused Expert Targets
 
 ```bash
-./build-qlora-test/bin/eval-qlora-model-precision \
+./build/bin/eval-qlora-model-precision \
   --model /path/to/moe-model.gguf \
   --lora-targets ffn_gate_up_exps,ffn_down_exps \
   --n-gpu-layers 99 \
   --flash-attn on \
-  --verbose-logs \
   --learning-rates 1e-3,1e-4 \
   --epoch 10
 ```
-
-Supported forward precision values are `f32`, `f16`, `bf16`, and `q8`. Supported backward precision values are `f32`, `f16`, and `bf16`. Explicit backward precision currently affects CUDA matrix-multiplication backward kernels; CPU backends retain their existing behavior. `--epoch` must be a positive integer. `--verbose-logs` enables library logs. Runtime/configuration errors are reported as errors; numerical results are reported as measurements, not judged as pass or fail.

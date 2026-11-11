@@ -1,37 +1,28 @@
 # QLoRA Implementation Status and Operator Gaps
 
-This note records behavior visible in the current source snapshot. It does not assign
-future priorities or claim performance improvements; those require project decisions
-or measurements.
+This note records the current implementation status and operator-level limitations in `llama-finetune-qlora`.
 
-## Implemented in the current source
+---
 
-- `--freeze-layers N` excludes LoRA targets from the first N transformer layers.
-- `--shuffle-dataset` shuffles training windows at epoch boundaries.
-- Automatic tokenizer special tokens are added once per rendered sample when the
-  selected input format requests them.
-- Training reports an epoch loss summary.
-- `MUL_MAT_ID` / `OUT_PROD_ID` provide the routed expert gradient path used by MoE
-  LoRA targets.
-- Quantized `OUT_PROD` has CUDA handling and backend support checks in the current
-  CUDA source. This is not a statement that every backend supports the operation.
-- The optimizer reuses the `ctx_compute_opt` metadata context across windows and
-  resets it with `ggml_reset()`.
+## 1. Implemented Features
 
-## Operator limitations visible in the current source
+| Feature | Description |
+|---|---|
+| **Layer Freezing** | `--freeze-layers N` excludes LoRA adapters from layers $0$ to $N-1$ and prunes backward paths. |
+| **Dataset Shuffling** | `--shuffle-dataset` performs pseudo-random window shuffling at each epoch boundary. |
+| **MoE LoRA Backward** | `MUL_MAT_ID` and `OUT_PROD_ID` enable backward passes through routed MoE experts. |
+| **Quantized CUDA Out-Prod** | Supports quantized `OUT_PROD` operations in CUDA kernels. |
+| **Special Token Wrapping** | Automatically inserts tokenizer special tokens once per rendered sample (not duplicated across turns). |
+| **Memory Reuse** | Reuses the `ctx_compute_opt` metadata context across training windows via `ggml_reset()`. |
+| **Epoch Loss Reporting** | Calculates and logs true token-weighted average loss across epochs. |
 
-- `SSM_CONV` and `SSM_SCAN` have no backward implementation. Gradients do not
-  propagate through these operators to upstream inputs such as the `ssm_in`
-  projection. A downstream projection such as `ssm_out` is outside that stopped
-  path and can receive gradients from later operations.
-- `GGML_OP_GLU` backward handles the split `SWIGLU` and `GEGLU` cases. Other GLU
-  variants are not handled. Ordinary unary GELU and GELU-quick backward paths are
-  implemented; they are distinct from the `GGML_OP_GLU` cases.
-- `SET_ROWS` does not propagate gradients to the source values or indices. This is
-  relevant to graph paths that write K/V into a cache and later read the cache via
-  views; see [the Shared-KV note](shared-kv-attention-gradient-limitation.md).
-- The current QLoRA training graph optimizes the main model, not the MTP/NextN
-  prediction graph.
+---
 
-No priority or delivery date is recorded here because it is not inferable from the
-implementation.
+## 2. Operator Limitations and Gaps
+
+| Operator / Component | Current Status | Impact on Training |
+|---|---|---|
+| **`SSM_CONV` / `SSM_SCAN`** | No backward implementation. | Gradients stop at SSM layers. Upstream projections (e.g. `ssm_in`) receive no gradients. Downstream projections (`ssm_out`) work normally. |
+| **`GGML_OP_GLU`** | Backward only supports split `SWIGLU` and `GEGLU`. | Other GLU variants cannot be trained with backward autodiff. (Unary GELU / GELU-quick are supported via standard ops). |
+| **`SET_ROWS`** | No backward path from cache destination to source values. | Gradients cannot flow through KV cache views back to producer projections. Affects Shared-KV models. |
+| **MTP / NextN Models** | Training graph optimizes main model only. | Multi-token prediction layers are ignored during training and kept frozen in adapter checkpoints. |

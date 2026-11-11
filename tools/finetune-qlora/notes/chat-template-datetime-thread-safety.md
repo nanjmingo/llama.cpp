@@ -1,40 +1,56 @@
-# Date/Time Formatting and Chat-Template Thread Safety
+# Chat-Template Date/Time Thread Safety
 
-## Relevant call path
+## Summary
 
-`tools/finetune-qlora/dataset-template.cpp` calls
-`common_chat_templates_apply()`. The Jinja path obtains `datetime` and `date_string`
-from `common_chat_extra_context()` in `common/chat.cpp`; its `format_time()` helper
-calls `std::localtime()` and copies the returned `std::tm` value.
+`std::localtime()` is **not thread-safe** under POSIX because it uses shared internal storage. Concurrent calls can overwrite each other's state.
 
-There is a second call site in `common/jinja/value.cpp`: the Jinja builtin
-`strftime_now` passes the result of `std::localtime()` directly to `std::strftime()`.
-Both call sites therefore depend on the thread-safety properties of `std::localtime()`.
+To prevent race conditions, **chat-template rendering in QLoRA is strictly sequential**. Only the subsequent tokenization step is parallelized.
 
-POSIX specifies that `localtime()` need not be thread-safe and that related time
-conversion functions may use shared storage. Concurrent calls can therefore
-interfere on implementations that use the shared storage. The POSIX `localtime_r()`
-variant writes the result to caller-provided storage.
+---
 
-## Current QLoRA dataset-loading path
+## Call Sites Using `std::localtime()`
 
-`append_tokenized_batch()` in `tools/finetune-qlora/dataset.cpp` calls
-`render_dataset_example()` in a sequential loop. It then calls `parallel_for()` for
-tokenization. Thus template rendering is serial in the current QLoRA dataset-loading
-path; tokenization is the parallel stage.
+Two locations in llama.cpp rely on `std::localtime()`:
 
-This serialization is a property of the current caller, not a thread-safety guarantee
-provided by `common_chat_templates_apply()`, `format_time()`, or `strftime_now()`.
-The comment in `dataset-template.cpp` to keep rendering serial documents this
-constraint but does not add synchronization. Revisit both `std::localtime()` call
-sites before making template rendering concurrent or allowing concurrent callers.
+| Location | Caller | Usage |
+|---|---|---|
+| `common/chat.cpp` | `common_chat_extra_context()` via `format_time()` | Sets `datetime` and `date_string` fields in Jinja context. |
+| `common/jinja/value.cpp` | `strftime_now` (Jinja builtin function) | Formats current timestamp inside Jinja expressions. |
 
-## Maintenance requirement
+Both call sites share the same underlying storage on platforms where `std::localtime()` is not thread-safe.
 
-If date/time formatting is changed, address both `format_time()` and `strftime_now()`.
-Changing only one wrapper does not remove the other `std::localtime()` call. A mutex
-around one call site is insufficient if other call sites do not use the same mutex.
+---
+
+## Current QLoRA Implementation
+
+In `tools/finetune-qlora/dataset.cpp`:
+
+```text
+JSONL Batch (up to 128 lines)
+       |
+       v
+1. Parse JSON records          [Parallel: dataset_thread_pool::parallel_for()]
+       |
+       v
+2. Render chat templates       [SERIAL / Single-Threaded]  <-- Protected here!
+       |
+       v
+3. Tokenize rendered samples   [Parallel: parallel_for()]
+```
+
+- Template rendering is deliberately serialized in `append_tokenized_batch()`.
+- Tokenization (which does not call `std::localtime()`) runs in parallel.
+
+---
+
+## Invariants & Rules for Developers
+
+1. **Do not parallelize template rendering** without fixing both call sites first.
+2. **Fixing only one helper is insufficient:** Wrapping `format_time()` with a mutex does not protect against concurrent calls from `strftime_now`. Both call sites must be migrated to reentrant storage (such as POSIX `localtime_r()` or Windows `localtime_s()`) or share a common lock across `common/`.
+3. **Preserve serial rendering:** Keep the serial loop in `dataset.cpp` unless a comprehensive thread-safe time library is integrated project-wide.
+
+---
 
 ## Reference
 
-- [POSIX `localtime()` / `localtime_r()` specification](https://www.man7.org/linux/man-pages/man3/localtime_r.3p.html)
+- [POSIX `localtime()` / `localtime_r()` Specification](https://www.man7.org/linux/man-pages/man3/localtime_r.3p.html)

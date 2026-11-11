@@ -1,61 +1,72 @@
-# Context-Length Rounding and QLoRA Training Windows
+# Context-Length Rounding and Training Windows
 
-## Context capacity in the runtime
+## Summary
 
-`src/llama-context.cpp` rounds `cparams.n_ctx` up to a multiple of 256 unless the
-context satisfies the runtime's full-context-training condition. For non-unified KV
-cache configurations, `n_ctx_seq` is also rounded unless full-context training is
-active. The padding is applied after the effective batch and micro-batch sizes have
-been derived, so those values do not necessarily grow with the padded context.
+This note explains how `llama-finetune-qlora` handles context dimensions, dataset window packing, and loss normalization.
 
-The full-context-training condition requires `no_alloc_kv_cache`, an effective
-`n_ubatch` equal to `n_ctx`, an effective `n_batch` at least `n_ctx`, no secondary
-context, and either a unified KV cache or a context length divisible by the sequence
-count. QLoRA sets `no_alloc_kv_cache` and requires a full-context microbatch. Under
-these conditions, the requested context capacity is retained instead of rounded to
-256. Code that depends on effective values should query the initialized context with
-`llama_n_ctx()`, `llama_n_batch()`, and `llama_n_ubatch()` rather than assuming they
-match requested settings.
+---
 
-`no_alloc_kv_cache` does not mean that every model's KV cache is omitted. In
-full-context training, the runtime omits KV data-buffer allocation for models without
-shared KV. Models with shared KV still allocate the cache they need, while retaining
-the requested full-context capacity.
+## 1. Context Capacity in the Runtime
 
-## Dataset windows and padding
+By default, `src/llama-context.cpp` rounds context capacity (`cparams.n_ctx`) up to a multiple of 256.
 
-Context-capacity rounding does not append token IDs to inference batches. QLoRA's
-window builder has a separate padding operation: a sample shorter than the context
-length is padded to one full window, using the BOS token when available (otherwise
-token ID 0), and positions without a next-token target receive label `-1`. For
-samples longer than the context length, only complete context windows are created;
-a trailing fragment is not emitted as a separate padded window. Targets already
-covered by an earlier overlapping window are masked to avoid duplicate training.
+### The Full-Context Training Exception
 
-For `text` samples, the first half of the first window is also masked as context.
-This initial mask is applied only to the first window. Chat and prompt/completion
-samples use their rendered supervision weights instead of this additional text
-initial-context mask.
+QLoRA bypasses this 256-token rounding when all of the following conditions are met:
 
-## Loss normalization with masked positions
+| Condition | Setting in QLoRA |
+|---|---|
+| No KV cache allocation | `cparams.no_alloc_kv_cache = true` |
+| Microbatch equals context | `n_ubatch == n_ctx` |
+| Batch size is large enough | `n_batch >= n_ctx` |
+| No secondary context | `cparams.n_ctx_seq == 1` (or unified KV cache) |
 
-The raw `ggml_cross_entropy_loss` reduction divides by the number of rows, including
-rows whose labels are masked. The current QLoRA path applies a separate normalization:
-`llama_context::opt_epoch()` sums supervision weights over the accumulation group and
-passes the sum to `ggml_opt_set_loss_normalizer()`. The optimizer uses that normalizer
-when scaling the accumulated gradient. QLoRA's progress and epoch loss summaries are
-also converted to means over supervised target weight.
+When these conditions hold:
+- **Requested context size is exact:** A context of `900` creates a 900-token graph, not 1024.
+- **KV data buffers are omitted:** For standard models, forward passes read the input window directly; KV buffers are not allocated. (Shared-KV models still allocate their required cache).
 
-Keep these quantities distinct when inspecting loss values: the raw cross-entropy
-reduction includes masked rows in its denominator, while the optimizer gradient and
-QLoRA-reported mean loss are normalized by supervised target weight.
+> [!TIP]
+> Always query effective runtime values using `llama_n_ctx()`, `llama_n_batch()`, and `llama_n_ubatch()` rather than assuming they match the raw CLI parameters.
 
-## Model-backed gradient tests
+---
 
-A model-backed test should assert the effective context and batch values returned by
-the initialized context, and use the same window length in the dataset and independent
-loss calculation. For a single full-window finite-difference check, a fixture can use
-a 256-token context with batch and micro-batch capacities of 256 and provide 257
-sample tokens (256 input positions plus the final next-token target). The test should
-still query the initialized context and assert these invariants rather than relying
-only on requested settings.
+## 2. Dataset Window Construction and Padding
+
+Context capacity is an internal buffer size. Dataset windowing is a separate process in `dataset.cpp`:
+
+| Sample Length | Packing Behavior |
+|---|---|
+| **Shorter than `n_ctx`** | Padded to exactly `n_ctx` tokens using the BOS token (or token ID 0). Padding positions receive target label `-1` (loss masked). |
+| **Longer than `n_ctx`** | Split into multiple full-sized windows. Any trailing fragment that does not fill a full window is discarded. |
+| **Overlapping tokens** | Targets already trained in an earlier window are masked with label `-1` to avoid double-counting. |
+| **Plain `text` format** | The first half of the first window is masked as prompt context (`weight = 0`). Subsequent tokens and windows are prediction targets. |
+| **Chat / Prompt formats** | Prompt and non-assistant tokens are masked (`weight = 0`). Assistant / completion tokens are trained (`weight = 1`). No half-window mask is applied. |
+
+---
+
+## 3. Loss Normalization with Masked Positions
+
+Do not confuse raw GGML loss calculation with the optimizer's effective gradient scaling:
+
+```text
+Raw GGML Operator:
+  loss = -sum(labels * log_softmax(logits)) / total_rows
+  (total_rows includes masked positions where label == -1)
+
+QLoRA Optimizer Normalization:
+  normalized_grad = accumulated_grad / sum(supervision_weights)
+  (Normalizes only by active target tokens across the accumulation group)
+```
+
+1. **Raw GGML Cross-Entropy:** `ggml_cross_entropy_loss` divides by all rows, including masked rows.
+2. **QLoRA Optimizer Normalizer:** `llama_context::opt_epoch()` computes the sum of active target weights across all windows in the gradient accumulation group, then calls `ggml_opt_set_loss_normalizer()`.
+3. **Reported Loss:** Progress logs and epoch summaries report the mean loss over active supervised target tokens, not over all context tokens.
+
+---
+
+## 4. Invariants for Tests
+
+When writing tests or finite-difference gradient checks:
+- Verify effective context values using `llama_n_ctx()`.
+- Ensure dataset samples match the context length: for a 256-token context, provide 257 tokens (256 input tokens + 1 target token).
+- Distinguish between per-token cross-entropy and group-normalized loss when comparing numerical values against independent references.
