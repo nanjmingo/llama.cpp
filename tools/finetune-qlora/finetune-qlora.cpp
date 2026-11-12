@@ -695,6 +695,61 @@ bool validate_resume_config(const qlora_checkpoint & checkpoint,
     return true;
 }
 
+struct qlora_loss_log_entry {
+    bool training = true;
+    int64_t epoch = 0;
+    int64_t window = 0;
+    double loss = 0.0;
+    double average_loss = 0.0;
+};
+
+struct qlora_grad_stats_log_entry {
+    int64_t step = 0;
+    ggml_opt_grad_stats stats = {};
+};
+
+std::string serialize_loss_log(const std::vector<qlora_loss_log_entry> & history) {
+    std::ostringstream stream;
+    stream << "phase\tepoch\twindow\tloss\taverage_loss\n";
+    stream << std::setprecision(std::numeric_limits<double>::max_digits10);
+    for (const qlora_loss_log_entry & entry : history) {
+        stream << (entry.training ? "train" : "validation") << '\t'
+               << entry.epoch << '\t' << entry.window << '\t'
+               << entry.loss << '\t' << entry.average_loss << '\n';
+    }
+    return stream.str();
+}
+
+std::string serialize_grad_stats_log(const std::vector<qlora_grad_stats_log_entry> & history) {
+    std::ostringstream stream;
+    stream << "step\ttensors\telements\tscale\tnorm\trms\tmax_abs\tzero_percent\tnonfinite\n";
+    stream << std::setprecision(std::numeric_limits<double>::max_digits10);
+    for (const qlora_grad_stats_log_entry & entry : history) {
+        const ggml_opt_grad_stats & stats = entry.stats;
+        const double zero_percent = stats.n_elements > 0
+            ? 100.0 * static_cast<double>(stats.n_zeros) / static_cast<double>(stats.n_elements) : 0.0;
+        stream << entry.step << '\t' << stats.n_tensors << '\t' << stats.n_elements << '\t'
+               << stats.scale << '\t' << stats.norm << '\t' << stats.rms << '\t'
+               << stats.max_abs << '\t' << zero_percent << '\t' << stats.n_nonfinite << '\n';
+    }
+    return stream.str();
+}
+
+bool initialize_training_logs(const std::filesystem::path & output_root, bool write_grad_stats_log) {
+    if (!write_text_file(output_root / "loss.log", serialize_loss_log({}))) {
+        return false;
+    }
+
+    const std::filesystem::path grad_stats_path = output_root / "grad-stats.log";
+    if (write_grad_stats_log) {
+        return write_text_file(grad_stats_path, serialize_grad_stats_log({}));
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(grad_stats_path, ec);
+    return !ec;
+}
+
 struct qlora_save_job {
     std::filesystem::path output_root;
     std::filesystem::path snapshot_path;
@@ -707,6 +762,7 @@ struct qlora_save_job {
     bool write_snapshot = false;
     bool write_checkpoint = false;
     bool write_final_adapter = false;
+    bool write_grad_stats_log = false;
     bool snapshot_saved = false;
     bool checkpoint_saved = false;
     bool final_adapter_saved = false;
@@ -714,6 +770,8 @@ struct qlora_save_job {
     std::vector<uint8_t> optimizer_state;
     std::string optimizer_name;
     std::string optimizer_state_type;
+    std::string loss_log;
+    std::string grad_stats_log;
     std::string training_state_json;
     std::string manifest_json;
 };
@@ -747,7 +805,10 @@ bool write_checkpoint_from_snapshot(const qlora_save_job & job, std::string & er
     }
     const bool optimizer_ok = adapter_ok && write_optimizer_file(
         temp_dir / "optimizer.gguf", job.optimizer_state, job.optimizer_name.c_str(), job.optimizer_state_type);
-    const bool state_ok = optimizer_ok && write_text_file(temp_dir / "training-state.json", job.training_state_json);
+    const bool loss_log_ok = optimizer_ok && write_text_file(temp_dir / "loss.log", job.loss_log);
+    const bool grad_stats_log_ok = loss_log_ok && (!job.write_grad_stats_log ||
+        write_text_file(temp_dir / "grad-stats.log", job.grad_stats_log));
+    const bool state_ok = grad_stats_log_ok && write_text_file(temp_dir / "training-state.json", job.training_state_json);
     const bool manifest_ok = state_ok && write_text_file(temp_dir / "manifest.json", job.manifest_json);
     bool ok = manifest_ok;
 
@@ -826,6 +887,18 @@ bool write_qlora_save_job(const std::shared_ptr<qlora_save_job> & job, std::stri
             error += "failed to write final adapter '" + job->final_adapter_path.string() + "'";
         }
     }
+    if ((job->snapshot_saved || job->checkpoint_saved) &&
+        !write_text_file(job->output_root / "loss.log", job->loss_log)) {
+        all_ok = false;
+        if (!error.empty()) error += "; ";
+        error += "failed to update loss log";
+    }
+    if ((job->snapshot_saved || job->checkpoint_saved) && job->write_grad_stats_log &&
+        !write_text_file(job->output_root / "grad-stats.log", job->grad_stats_log)) {
+        all_ok = false;
+        if (!error.empty()) error += "; ";
+        error += "failed to update gradient statistics log";
+    }
     return all_ok;
 }
 
@@ -855,6 +928,8 @@ struct save_context {
     double training_weight_sum = 0.0;
     bool training_statistics_complete = true;
     double validation_weight_sum = 0.0;
+    std::vector<qlora_loss_log_entry> loss_history;
+    std::vector<qlora_grad_stats_log_entry> grad_stats_history;
     bool abort_requested = false;
     int64_t last_checkpoint_step = -1;
     int64_t last_checkpoint_next_epoch = -1;
@@ -937,6 +1012,13 @@ bool prepare_qlora_save_job(save_context & state,
         prepared->write_snapshot = write_snapshot;
         prepared->write_checkpoint = write_checkpoint;
         prepared->write_final_adapter = write_final_adapter;
+        prepared->write_grad_stats_log = state.qparams->grad_stats_interval > 0;
+        if (write_snapshot || write_checkpoint) {
+            prepared->loss_log = serialize_loss_log(state.loss_history);
+            if (prepared->write_grad_stats_log) {
+                prepared->grad_stats_log = serialize_grad_stats_log(state.grad_stats_history);
+            }
+        }
         if (write_snapshot) {
             prepared->snapshot_path = state.output_root / step_name("snapshot-", prepared->step, ".gguf");
         }
@@ -1281,6 +1363,7 @@ void qlora_epoch_callback_progress_line(bool               train,
                 static_cast<long>(current_window));
         return;
     }
+    state.loss_history.push_back({ train, state.epoch, current_window, loss, average_loss });
     const std::string loss_text = format_four_significant_digits(loss);
     const std::string average_loss_text = format_four_significant_digits(average_loss);
     const std::string weight_sum_text = format_four_significant_digits(weight_sum);
@@ -1327,7 +1410,7 @@ void qlora_epoch_callback_progress_line(bool               train,
     fflush(stderr);
 }
 
-void log_gradient_stats_if_due(const save_context & state, ggml_opt_result_t result) {
+void log_gradient_stats_if_due(save_context & state, ggml_opt_result_t result) {
     const int32_t interval = state.qparams->grad_stats_interval;
     const int64_t step = state.schedule->step;
     if (interval <= 0 || step <= 0 || step % interval != 0) {
@@ -1340,6 +1423,7 @@ void log_gradient_stats_if_due(const save_context & state, ggml_opt_result_t res
                 __func__, static_cast<long>(step));
         return;
     }
+    state.grad_stats_history.push_back({ step, stats });
 
     const double zero_percent = stats.n_elements > 0
         ? 100.0 * static_cast<double>(stats.n_zeros) / static_cast<double>(stats.n_elements) : 0.0;
@@ -1548,6 +1632,11 @@ bool train_adapter(const qlora_params & qparams,
     save_state.gradient_accumulation_steps = qparams.gradient_accumulation_steps;
     save_state.dataset_windows = dataset_windows;
     save_state.schedule = &schedule;
+    if (!initialize_training_logs(save_state.output_root, qparams.grad_stats_interval > 0)) {
+        LOG_ERR("%s: failed to initialize training logs in '%s'\n", __func__,
+                save_state.output_root.string().c_str());
+        return false;
+    }
     save_context_scope callback_scope(save_state);
 
     LOG_INF("%s: starting QLoRA training — rank=%d alpha=%.1f epochs=%d loss=assistant-response-only\n", __func__,
