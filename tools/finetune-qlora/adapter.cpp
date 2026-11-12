@@ -111,19 +111,18 @@ static bool tensor_matches_targets(const char * name, const std::vector<std::str
 
     const std::string tensor_name(name);
     return std::any_of(targets.begin(), targets.end(), [&tensor_name](const std::string & target) {
-        const bool tensor_is_moe_expert = tensor_name.find("_exps") != std::string::npos;
-        const bool target_is_moe_expert = target.find("_exps") != std::string::npos;
-        if (tensor_is_moe_expert != target_is_moe_expert) {
+        if (target.empty()) {
             return false;
         }
-        if (target == "ffn_gate" || target == "ffn_up" || target == "ffn_down") {
-            if (tensor_name.find(target + ".") != std::string::npos) {
-                return true;
-            }
-            return (target == "ffn_gate" || target == "ffn_up") &&
-                   tensor_name.find("ffn_gate_up.") != std::string::npos;
+
+        std::string pattern = target;
+        if (pattern.front() != '.') {
+            pattern.insert(pattern.begin(), '.');
         }
-        return tensor_name.find(target) != std::string::npos;
+        if (pattern.back() != '.') {
+            pattern.push_back('.');
+        }
+        return tensor_name.find(pattern) != std::string::npos;
     });
 }
 

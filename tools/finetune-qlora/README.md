@@ -86,7 +86,7 @@ Train a LoRA adapter with context size 512:
 | `--lora-rank` | `16` | LoRA rank $r$. |
 | `--lora-alpha` | `0` (= rank) | LoRA scaling factor $\alpha$. Effective scale is $\alpha / r$. |
 | `--lora-type` | `f32` | Storage type for trainable LoRA A/B tensors: `f32`, `f16`, or `bf16`. |
-| `--lora-targets` | (standard targets) | Comma-separated substrings matching internal GGUF tensor names. |
+| `--lora-targets` | (standard targets) | Comma-separated internal GGUF tensor-name components. Missing boundary periods are added automatically. |
 | `--freeze-layers` | `0` | Skip LoRA adapters on the first N layers (`blk.0` ... `blk.N-1`). |
 
 ### Training & Optimizer Options
@@ -170,14 +170,14 @@ To resume from the latest checkpoint in `./output`:
 
 ## LoRA Target Modules
 
-Target modules are specified as internal GGUF tensor-name substrings with `--lora-targets`.
+Target modules are specified as internal GGUF tensor-name components with `--lora-targets`. Missing leading or trailing periods are added automatically, so `attn_q` and `.attn_q.` select the same component.
 
 ### Standard Targets (Default)
 
 By default, `--lora-targets` trains:
 `attn_q,attn_k,attn_v,attn_output,ffn_gate,ffn_up,ffn_down`
 
-| Substring | Module | Description |
+| Target component | Module | Description |
 |---|---|---|
 | `attn_q` | Self-attention | Query projection |
 | `attn_k` | Self-attention | Key projection |
@@ -187,11 +187,13 @@ By default, `--lora-targets` trains:
 | `ffn_up` | Feed-Forward | Up projection (dense models) |
 | `ffn_down` | Feed-Forward | Down projection (dense models) |
 
+Fused tensors such as `ffn_gate_up` must be selected explicitly with `--lora-targets ffn_gate_up`; `ffn_gate` and `ffn_up` do not match the fused component.
+
 ### Mixture of Experts (MoE) Targets
 
-MoE expert weights are **opt-in**. Add expert substrings to `--lora-targets`:
+MoE expert weights are **opt-in**. Specify the exact `_exps` component in `--lora-targets`:
 
-| Substring | Description |
+| Target component | Description |
 |---|---|
 | `ffn_gate_exps` | Separate MoE expert gate projections |
 | `ffn_up_exps` | Separate MoE expert up projections |

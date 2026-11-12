@@ -163,7 +163,7 @@ const std::vector<qlora_arg> & get_qlora_arg_defs() {
         ));
         add_opt(qlora_arg(
             {"--lora-targets"}, "CSV",
-            "Comma-separated trainable tensor-name substrings; use explicit *_exps names to train MoE experts",
+            "Comma-separated tensor-name components; periods are added at missing target boundaries",
             [](qlora_params & params, const std::string & value) {
                 params.lora_targets = value;
             }

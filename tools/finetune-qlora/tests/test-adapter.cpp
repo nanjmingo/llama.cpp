@@ -109,15 +109,24 @@ void test_transform_preserves_delta_adds_targets_and_keeps_frozen_tensors() {
             "existing non-target adapter tensor should be frozen");
     require(!lora_tensor_matches_targets("blk.0.ffn_gate_exps.weight", { "attn_q", "attn_k" }, 0),
             "unselected MoE expert tensors must remain frozen");
+    require(!lora_tensor_matches_targets("blk.0.attn_qkv.weight", { "attn_q" }, 0),
+            "attn_q must not match attn_qkv");
+    require(!lora_tensor_matches_targets("blk.0.attn_q_norm.weight", { "attn_q" }, 0),
+            "attn_q must not match attn_q_norm");
+    require(lora_tensor_matches_targets("blk.0.attn_q.weight", { ".attn_q." }, 0),
+            "targets with explicit leading and trailing periods must match");
+    require(lora_tensor_matches_targets("blk.0.attn_q.weight", { "attn_q." }, 0) &&
+            lora_tensor_matches_targets("blk.0.attn_q.weight", { ".attn_q" }, 0),
+            "missing target boundary periods must be added");
+    require(!lora_tensor_matches_targets("blk.0.ffn_gate_up.weight", { "ffn_gate" }, 0) &&
+            !lora_tensor_matches_targets("blk.0.ffn_gate_up.weight", { "ffn_up" }, 0),
+            "individual FFN targets must not match fused gate/up tensors");
+    require(lora_tensor_matches_targets("blk.0.ffn_gate_up.weight", { "ffn_gate_up" }, 0),
+            "fused gate/up tensors must be selected by their exact target");
     require(!lora_tensor_matches_targets("blk.0.ffn_gate_exps.weight", { "ffn_gate" }, 0),
-            "dense FFN targets must not select MoE expert tensors");
-    require(!lora_tensor_matches_targets("blk.0.ffn_gate_up_exps.weight", { "ffn_gate_up" }, 0),
-            "dense fused FFN targets must not select fused MoE expert tensors");
-    require(lora_tensor_matches_targets("blk.0.ffn_gate_up.weight", { "ffn_gate" }, 0) &&
-            lora_tensor_matches_targets("blk.0.ffn_gate_up.weight", { "ffn_up" }, 0),
-            "dense FFN targets must retain support for fused gate/up tensors");
+            "ffn_gate must not match the ffn_gate_exps component");
     require(lora_tensor_matches_targets("blk.0.ffn_gate_exps.weight", { "ffn_gate_exps" }, 0),
-            "explicit MoE expert targets must be selectable");
+            "MoE expert tensors must be selectable by their exact target");
     require(!lora_tensor_matches_targets("blk.1.attn_q.weight", { "attn_q", "attn_k" }, 0, 1),
             "MTP/NextN tensors at or beyond the main model layer count must be frozen");
     require(lora_tensor_matches_targets("blk.0.attn_q.weight", { "attn_q", "attn_k" }, 0, 1),

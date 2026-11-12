@@ -24,7 +24,7 @@
 | `--epoch` | `10` | Number of optimizer updates per learning rate. |
 | `--n-gpu-layers` | `0` | GPU offload layers (`0` = CPU only, `-1` = all layers). |
 | `--flash-attn` | `off` | Flash Attention mode (`on` or `off`). |
-| `--lora-targets` | (standard) | Comma-separated GGUF tensor-name substrings. |
+| `--lora-targets` | (standard) | Comma-separated GGUF tensor-name components; missing boundary periods are added automatically. |
 | `-ctk`, `-ctv` | `f32` | KV cache storage types for K and V. |
 | `--verbose-logs` | disabled | Show verbose library logging. |
 

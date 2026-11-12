@@ -616,6 +616,10 @@ bool load_qlora_checkpoint(const std::string & requested_path, qlora_checkpoint 
         LOG_ERR("%s: invalid optimizer checkpoint contents\n", __func__);
         return false;
     }
+    if (!ggml_opt_state_data_is_finite(result.optimizer_state.data(), result.optimizer_state.size())) {
+        LOG_ERR("%s: optimizer checkpoint contains non-finite values or is invalid\n", __func__);
+        return false;
+    }
     return true;
 }
 
