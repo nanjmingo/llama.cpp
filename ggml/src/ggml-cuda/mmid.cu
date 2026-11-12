@@ -236,25 +236,53 @@ static __global__ void mul_mat_id_back_gather_kernel(
 }
 
 template<typename dst_t>
-static __global__ void mul_mat_id_back_convert_f32_kernel(
-        const float * __restrict__ src,
-        dst_t * __restrict__ dst,
-        const int64_t src_stride,
-        const int64_t src_offset,
+static __global__ void mul_mat_id_back_gather_lowp_kernel(
+        const float * __restrict__ grad,
+        const int32_t * __restrict__ pairs,
+        dst_t * __restrict__ gathered,
+        const int64_t output_offset,
         const int64_t chunk_dim,
-        const int64_t route_count) {
-    const int64_t n = chunk_dim * route_count;
-    for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-         i < n; i += blockDim.x * gridDim.x) {
-        const int64_t route = i / chunk_dim;
-        const int64_t row = i % chunk_dim;
-        const float value = src[route * src_stride + src_offset + row];
+        const int64_t n_used,
+        const int64_t grad_nb0,
+        const int64_t grad_nb1,
+        const int64_t grad_nb2) {
+    const int64_t route_idx = blockIdx.y;
+    const int64_t route = pairs[route_idx];
+    const int64_t used = route % n_used;
+    const int64_t token = route / n_used;
+
+    const float * grad_route = grad + used * grad_nb1 + token * grad_nb2;
+    dst_t * gathered_route = gathered + route_idx * chunk_dim;
+
+    for (int64_t row = blockIdx.x * blockDim.x + threadIdx.x;
+         row < chunk_dim; row += gridDim.x * blockDim.x) {
+        const float value = grad_route[(output_offset + row) * grad_nb0];
         if constexpr (std::is_same_v<dst_t, half>) {
-            dst[i] = __float2half_rn(value);
+            gathered_route[row] = __float2half_rn(value);
         } else {
-            dst[i] = __float2bfloat16(value);
+            gathered_route[row] = __float2bfloat16(value);
         }
     }
+}
+
+template<typename dst_t>
+static void mul_mat_id_back_gather_lowp(
+        const float * grad,
+        const int32_t * pairs,
+        dst_t * gathered,
+        const int64_t output_offset,
+        const int64_t chunk_dim,
+        const int64_t route_count,
+        const int64_t n_used,
+        const int64_t grad_nb0,
+        const int64_t grad_nb1,
+        const int64_t grad_nb2,
+        cudaStream_t stream) {
+    const dim3 grid((chunk_dim + 255) / 256, route_count, 1);
+    mul_mat_id_back_gather_lowp_kernel<<<grid, 256, 0, stream>>>(
+        grad, pairs, gathered, output_offset, chunk_dim, n_used,
+        grad_nb0, grad_nb1, grad_nb2);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 static __global__ void mul_mat_id_back_scatter_kernel(
@@ -447,8 +475,9 @@ void ggml_cuda_mul_mat_id_back(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     ggml_cuda_pool_alloc<half> gathered_f16(ctx.pool());
     ggml_cuda_pool_alloc<nv_bfloat16> gathered_bf16(ctx.pool());
     ggml_cuda_pool_alloc<float> input_gradient(ctx.pool());
-    gathered.alloc(static_cast<size_t>(max_batch_routes * output_dim));
-    if (use_fp16) {
+    if (use_fp32) {
+        gathered.alloc(static_cast<size_t>(max_batch_routes * output_dim));
+    } else if (use_fp16) {
         gathered_f16.alloc(static_cast<size_t>(max_batch_routes * weight_chunk_capacity));
     } else if (use_bf16) {
         gathered_bf16.alloc(static_cast<size_t>(max_batch_routes * weight_chunk_capacity));
@@ -522,11 +551,13 @@ void ggml_cuda_mul_mat_id_back(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         for (int64_t route_offset = 0; route_offset < expert_routes; route_offset += max_batch_routes) {
             const int64_t route_count = std::min(max_batch_routes, expert_routes - route_offset);
             const int32_t * route_pairs = expert_pairs + route_offset;
-            const dim3 gather_grid((output_dim + 255) / 256, route_count, 1);
-            mul_mat_id_back_gather_kernel<<<gather_grid, 256, 0, stream>>>(
-                grad_ptr, route_pairs, gathered.ptr, output_dim, n_used,
-                grad_nb0, grad_nb1, grad_nb2);
-            CUDA_CHECK(cudaGetLastError());
+            if (use_fp32) {
+                const dim3 gather_grid((output_dim + 255) / 256, route_count, 1);
+                mul_mat_id_back_gather_kernel<<<gather_grid, 256, 0, stream>>>(
+                    grad_ptr, route_pairs, gathered.ptr, output_dim, n_used,
+                    grad_nb0, grad_nb1, grad_nb2);
+                CUDA_CHECK(cudaGetLastError());
+            }
 
             if (as->type == GGML_TYPE_F32 && use_fp32) {
                 CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
@@ -541,6 +572,13 @@ void ggml_cuda_mul_mat_id_back(ggml_backend_cuda_context & ctx, ggml_tensor * ds
                     const float * beta = output_offset == 0 ? &beta_zero : &beta_one;
 
                     if (use_fp16) {
+                        // Gather and convert directly from the F32 gradient into the F16 GEMM input.
+                        // This avoids keeping a full F32 gathered copy alongside the F16 tile.
+                        mul_mat_id_back_gather_lowp(
+                            grad_ptr, route_pairs, gathered_f16.ptr,
+                            output_offset, chunk_dim, route_count, n_used,
+                            grad_nb0, grad_nb1, grad_nb2, stream);
+
                         const half * weights_f16_ptr;
                         if (as->type == GGML_TYPE_F16) {
                             weights_f16_ptr = (const half *) weight_chunk;
@@ -561,12 +599,6 @@ void ggml_cuda_mul_mat_id_back(ggml_backend_cuda_context & ctx, ggml_tensor * ds
                             weights_f16_ptr = weights_f16.ptr;
                         }
 
-                        const int64_t gathered_count = route_count * chunk_dim;
-                        const dim3 convert_grid((gathered_count + 255) / 256, 1, 1);
-                        mul_mat_id_back_convert_f32_kernel<<<convert_grid, 256, 0, stream>>>(
-                            gathered.ptr, gathered_f16.ptr, output_dim, output_offset, chunk_dim, route_count);
-                        CUDA_CHECK(cudaGetLastError());
-
                         CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N,
                             static_cast<int>(input_dim), static_cast<int>(route_count), static_cast<int>(chunk_dim),
                             &alpha, weights_f16_ptr, CUDA_R_16F, static_cast<int>(input_dim),
@@ -574,6 +606,12 @@ void ggml_cuda_mul_mat_id_back(ggml_backend_cuda_context & ctx, ggml_tensor * ds
                             beta, input_gradient.ptr, CUDA_R_32F, static_cast<int>(input_dim),
                             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
                     } else if (use_bf16) {
+                        // Same fused gather/conversion for the BF16 path.
+                        mul_mat_id_back_gather_lowp(
+                            grad_ptr, route_pairs, gathered_bf16.ptr,
+                            output_offset, chunk_dim, route_count, n_used,
+                            grad_nb0, grad_nb1, grad_nb2, stream);
+
                         const nv_bfloat16 * weights_bf16_ptr;
                         if (as->type == GGML_TYPE_BF16) {
                             weights_bf16_ptr = (const nv_bfloat16 *) weight_chunk;
@@ -593,12 +631,6 @@ void ggml_cuda_mul_mat_id_back(ggml_backend_cuda_context & ctx, ggml_tensor * ds
                             }
                             weights_bf16_ptr = weights_bf16.ptr;
                         }
-
-                        const int64_t gathered_count = route_count * chunk_dim;
-                        const dim3 convert_grid((gathered_count + 255) / 256, 1, 1);
-                        mul_mat_id_back_convert_f32_kernel<<<convert_grid, 256, 0, stream>>>(
-                            gathered.ptr, gathered_bf16.ptr, output_dim, output_offset, chunk_dim, route_count);
-                        CUDA_CHECK(cudaGetLastError());
 
                         CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N,
                             static_cast<int>(input_dim), static_cast<int>(route_count), static_cast<int>(chunk_dim),
