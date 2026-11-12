@@ -1909,10 +1909,19 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         const float scale = alpha ? lora.second * alpha / rank : lora.second;
 
         ggml_tensor * lora_a_cur = ggml_mul_mat_id(ctx0, lw->a, cur, ids);
-        ggml_tensor * ab_cur = ggml_mul_mat_id(ctx0, lw->b, lora_a_cur, ids);
         if (prec_policy) {
             prec_policy->apply_backward(lora_a_cur);
+        }
+        if (training_graph && ggml_prec_get_bwd(lora_a_cur) == GGML_PREC_F16) {
+            cur->flags |= GGML_TENSOR_FLAG_F16_BACKWARD_CACHE;
+        }
+
+        ggml_tensor * ab_cur = ggml_mul_mat_id(ctx0, lw->b, lora_a_cur, ids);
+        if (prec_policy) {
             prec_policy->apply_backward(ab_cur);
+        }
+        if (training_graph && ggml_prec_get_bwd(ab_cur) == GGML_PREC_F16) {
+            lora_a_cur->flags |= GGML_TENSOR_FLAG_F16_BACKWARD_CACHE;
         }
 
         ab_cur = ggml_scale(ctx0, ab_cur, scale);

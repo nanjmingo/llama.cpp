@@ -108,10 +108,17 @@ struct ggml_opt_result {
 namespace {
     bool ggml_opt_apply_pending_state(ggml_opt_context_t opt_ctx);
 
+    struct ggml_opt_f16_cache_user {
+        ggml_tensor * owner;
+        int src_index;
+        ggml_tensor * backend_node;
+        bool replace_repeat;
+    };
+
     struct ggml_opt_f16_cache_candidate {
         ggml_tensor * activation;
         int last_forward_use;
-        std::vector<ggml_tensor *> backward_users;
+        std::vector<ggml_opt_f16_cache_user> backward_users;
     };
 
     static bool ggml_opt_is_view_of(const ggml_tensor * tensor, const ggml_tensor * base) {
@@ -207,20 +214,52 @@ namespace {
                     break;
                 }
                 for (int k = 0; k < GGML_MAX_SRC; ++k) {
-                    if (backward_node->src[k] != activation) {
-                        if (ggml_opt_is_view_of(backward_node->src[k], activation)) {
+                    ggml_tensor * backward_src = backward_node->src[k];
+                    if (backward_src != activation) {
+                        if (ggml_opt_is_view_of(backward_src, activation)) {
                             safe = false;
                             break;
                         }
                         continue;
                     }
-                    if (backward_node->op != GGML_OP_OUT_PROD || k != 0 ||
-                            !backward_node->src[1] || backward_node->src[1]->type != GGML_TYPE_F32 ||
-                            ggml_prec_get_bwd(backward_node) != GGML_PREC_F16) {
+
+                    if ((backward_node->op == GGML_OP_OUT_PROD ||
+                            backward_node->op == GGML_OP_OUT_PROD_ID) && k == 0 &&
+                            backward_node->src[1] && backward_node->src[1]->type == GGML_TYPE_F32 &&
+                            ggml_prec_get_bwd(backward_node) == GGML_PREC_F16) {
+                        candidate.backward_users.push_back({ backward_node, k, backward_node, false });
+                    } else if (backward_node->op == GGML_OP_REPEAT && k == 0) {
+                        // The expanded activation created by MUL_MAT_ID backward is consumed
+                        // by OUT_PROD_ID. Change this repeat to F16 together with its source.
+                        ggml_tensor * consumer = nullptr;
+                        bool has_other_use = false;
+                        for (int u = n_nodes_f; u < opt_ctx->gb_grad->n_nodes; ++u) {
+                            ggml_tensor * user = opt_ctx->gb_grad->nodes[u];
+                            for (int src = 0; src < GGML_MAX_SRC; ++src) {
+                                if (user->src[src] != backward_node) {
+                                    continue;
+                                }
+                                if (user->op == GGML_OP_OUT_PROD_ID && src == 0 &&
+                                        user->src[1] && user->src[1]->type == GGML_TYPE_F32 &&
+                                        ggml_prec_get_bwd(user) == GGML_PREC_F16 && !consumer) {
+                                    consumer = user;
+                                } else {
+                                    has_other_use = true;
+                                }
+                            }
+                        }
+                        if (!consumer || has_other_use) {
+                            safe = false;
+                            break;
+                        }
+                        candidate.backward_users.push_back({ backward_node, k, consumer, true });
+                    } else if (backward_node->op == GGML_OP_MUL_MAT_ID_BACK && k == 3) {
+                        // src[3] (b_like) is shape-only metadata in MUL_MAT_ID_BACK.
+                        candidate.backward_users.push_back({ backward_node, k, nullptr, false });
+                    } else {
                         safe = false;
                         break;
                     }
-                    candidate.backward_users.push_back(backward_node);
                 }
             }
             if (!safe || candidate.backward_users.empty()) {
@@ -237,9 +276,12 @@ namespace {
         ggml_backend_sched_reset(opt_ctx->backend_sched);
         ggml_backend_sched_split_graph(opt_ctx->backend_sched, opt_ctx->gb_grad);
         candidates.erase(std::remove_if(candidates.begin(), candidates.end(), [&](const auto & candidate) {
-            for (ggml_tensor * backward_user : candidate.backward_users) {
-                ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(opt_ctx->backend_sched, backward_user);
-                if (!backend || !ggml_opt_backend_supports_f16_out_prod(backend, backward_user)) {
+            for (const ggml_opt_f16_cache_user & backward_user : candidate.backward_users) {
+                if (!backward_user.backend_node) {
+                    continue;
+                }
+                ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(opt_ctx->backend_sched, backward_user.backend_node);
+                if (!backend || !ggml_opt_backend_supports_f16_out_prod(backend, backward_user.backend_node)) {
                     return true;
                 }
             }
@@ -273,12 +315,22 @@ namespace {
             GGML_ASSERT(old_hash != GGML_HASHSET_FULL && ggml_bitset_get(opt_ctx->gb_grad->visited_hash_set.used, old_hash));
             GGML_ASSERT(new_hash != GGML_HASHSET_FULL && ggml_bitset_get(opt_ctx->gb_grad->visited_hash_set.used, new_hash));
 
-            for (ggml_tensor * backward_user : candidate.backward_users) {
-                GGML_ASSERT(backward_user->src[0] == candidate.activation);
+            for (const ggml_opt_f16_cache_user & backward_user : candidate.backward_users) {
+                GGML_ASSERT(backward_user.owner->src[backward_user.src_index] == candidate.activation);
                 GGML_ASSERT(opt_ctx->gb_grad->use_counts[old_hash] > 0);
                 --opt_ctx->gb_grad->use_counts[old_hash];
                 ++opt_ctx->gb_grad->use_counts[new_hash];
-                backward_user->src[0] = cache;
+                backward_user.owner->src[backward_user.src_index] = cache;
+
+                if (backward_user.replace_repeat) {
+                    ggml_tensor * repeat = backward_user.owner;
+                    GGML_ASSERT(repeat->op == GGML_OP_REPEAT && repeat->src[0] == cache);
+                    repeat->type = GGML_TYPE_F16;
+                    repeat->nb[0] = ggml_type_size(GGML_TYPE_F16);
+                    repeat->nb[1] = ggml_row_size(GGML_TYPE_F16, repeat->ne[0]);
+                    repeat->nb[2] = repeat->nb[1] * repeat->ne[1];
+                    repeat->nb[3] = repeat->nb[2] * repeat->ne[2];
+                }
             }
 
             opt_ctx->forward_node_indices.insert(opt_ctx->forward_node_indices.begin() + insert_at, -1);
