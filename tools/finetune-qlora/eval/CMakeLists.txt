@@ -1,10 +1,10 @@
 add_executable(eval-qlora-model-precision EXCLUDE_FROM_ALL
     eval-model-precision.cpp
-    eval-model-precision-options.cpp
-    eval-model-precision-model.cpp
-    eval-model-precision-model-forward.cpp
-    eval-model-precision-model-step.cpp
+    options.cpp
+    model.cpp
+    run.cpp
     ../adapter.cpp
+    ../adapter-save.cpp
     ../dataset-window.cpp
 )
 target_include_directories(eval-qlora-model-precision PRIVATE
@@ -22,8 +22,8 @@ add_executable(eval-qlora-dataset EXCLUDE_FROM_ALL
     ../dataset-reader.cpp
     ../dataset-reader-jsonl.cpp
     ../dataset-thread-pool.cpp
-    ../dataset-format.cpp
-    ../dataset-template.cpp
+    ../dataset-parser.cpp
+    ../dataset-renderer.cpp
     ../dataset-tokenize.cpp
 )
 target_include_directories(eval-qlora-dataset PRIVATE

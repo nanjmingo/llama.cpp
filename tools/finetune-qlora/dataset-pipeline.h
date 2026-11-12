@@ -1,8 +1,6 @@
 #pragma once
 
-#include "dataset-reader.h"
 #include "dataset-types.h"
-#include "dataset-window.h"
 
 #include <string>
 #include <vector>

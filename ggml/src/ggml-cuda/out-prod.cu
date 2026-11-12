@@ -251,16 +251,115 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 template<typename lowp_t>
-static __global__ void out_prod_id_convert_f32_kernel(
-        const float * src, lowp_t * dst, const int64_t n) {
+static __global__ void out_prod_id_gather_f32_kernel(
+        const float * src, lowp_t * dst, const int64_t * token_indices,
+        const int64_t n_cols, const int64_t n_tokens,
+        const int64_t stride_exp, const int64_t stride_tok,
+        const int64_t n_elements) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) {
+    if (i >= n_elements) {
         return;
     }
+
+    const int64_t token_i = i / n_cols;
+    const int64_t col     = i % n_cols;
+    const int64_t flat    = token_indices[token_i];
+    const int64_t expert_slot = flat / n_tokens;
+    const int64_t token       = flat % n_tokens;
+    const float value = src[expert_slot * stride_exp + token * stride_tok + col];
+
     if constexpr (std::is_same_v<lowp_t, half>) {
-        dst[i] = __float2half_rn(src[i]);
+        dst[i] = __float2half_rn(value);
     } else {
-        dst[i] = __float2bfloat16(src[i]);
+        dst[i] = __float2bfloat16(value);
+    }
+}
+
+template<typename lowp_t>
+static void ggml_cuda_out_prod_id_lowp(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+        const std::vector<std::vector<int64_t>> & expert_tokens,
+        const cudaDataType_t data_type) {
+    const int64_t cols     = src0->ne[0];
+    const int64_t n_tokens = src0->ne[2];
+    const int64_t rows     = src1->ne[0];
+
+    const int64_t a_stride_exp = src0->nb[1] / sizeof(float);
+    const int64_t a_stride_tok = src0->nb[2] / sizeof(float);
+    const int64_t b_stride_exp = src1->nb[1] / sizeof(float);
+    const int64_t b_stride_tok = src1->nb[2] / sizeof(float);
+    const int64_t dst_stride_e = dst->nb[2] / sizeof(float);
+
+    size_t max_expert_tokens = 0;
+    for (const auto & tokens : expert_tokens) {
+        max_expert_tokens = std::max(max_expert_tokens, tokens.size());
+    }
+    if (max_expert_tokens == 0) {
+        return;
+    }
+
+    // Bound the two low-precision gather buffers and the device-side index list.
+    constexpr size_t workspace_max = 64ull * 1024 * 1024;
+    const size_t bytes_per_token = sizeof(lowp_t) *
+        (static_cast<size_t>(cols) + static_cast<size_t>(rows)) + sizeof(int64_t);
+    const size_t tile_capacity = std::max<size_t>(1,
+        std::min(max_expert_tokens, workspace_max / bytes_per_token));
+
+    ggml_cuda_pool_alloc<lowp_t> a_gathered(ctx.pool(), static_cast<size_t>(cols) * tile_capacity);
+    ggml_cuda_pool_alloc<lowp_t> b_gathered(ctx.pool(), static_cast<size_t>(rows) * tile_capacity);
+    ggml_cuda_pool_alloc<int64_t> token_indices(ctx.pool(), tile_capacity);
+
+    cudaStream_t stream = ctx.stream();
+    cublasHandle_t handle = ctx.cublas_handle();
+    CUBLAS_CHECK(cublasSetStream(handle, stream));
+
+    const float alpha = 1.0f;
+    const float beta  = 1.0f;
+    const int threads = 256;
+    cublasPointerMode_t pointer_mode = CUBLAS_POINTER_MODE_HOST;
+    CUBLAS_CHECK(cublasGetPointerMode(handle, &pointer_mode));
+    if (pointer_mode != CUBLAS_POINTER_MODE_HOST) {
+        CUBLAS_CHECK(cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_HOST));
+    }
+    const float * a_base = (const float *) src0->data;
+    const float * b_base = (const float *) src1->data;
+    float * d_base = (float *) dst->data;
+
+    for (size_t e = 0; e < expert_tokens.size(); ++e) {
+        const auto & tokens = expert_tokens[e];
+        const int64_t dst_offset = static_cast<int64_t>(e) * dst_stride_e;
+
+        for (size_t token_begin = 0; token_begin < tokens.size(); token_begin += tile_capacity) {
+            const int64_t tile_ntoks = static_cast<int64_t>(
+                std::min(tile_capacity, tokens.size() - token_begin));
+            const int64_t a_count = cols * tile_ntoks;
+            const int64_t b_count = rows * tile_ntoks;
+
+            CUDA_CHECK(cudaMemcpyAsync(token_indices.ptr, tokens.data() + token_begin,
+                static_cast<size_t>(tile_ntoks) * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
+
+            out_prod_id_gather_f32_kernel<<<
+                (a_count + threads - 1) / threads, threads, 0, stream>>>(
+                    a_base, a_gathered.ptr, token_indices.ptr, cols, n_tokens,
+                    a_stride_exp, a_stride_tok, a_count);
+            out_prod_id_gather_f32_kernel<<<
+                (b_count + threads - 1) / threads, threads, 0, stream>>>(
+                    b_base, b_gathered.ptr, token_indices.ptr, rows, n_tokens,
+                    b_stride_exp, b_stride_tok, b_count);
+            CUDA_CHECK(cudaGetLastError());
+
+            CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_T,
+                static_cast<int>(cols), static_cast<int>(rows), static_cast<int>(tile_ntoks),
+                &alpha, a_gathered.ptr, data_type, static_cast<int>(cols),
+                        b_gathered.ptr, data_type, static_cast<int>(rows),
+                &beta,  d_base + dst_offset, CUDA_R_32F, static_cast<int>(cols),
+                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        }
+    }
+
+    if (pointer_mode != CUBLAS_POINTER_MODE_HOST) {
+        CUBLAS_CHECK(cublasSetPointerMode(handle, pointer_mode));
     }
 }
 
@@ -321,6 +420,15 @@ void ggml_cuda_out_prod_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const bool use_fp16 = precision == GGML_PREC_F16 && fast_fp16_hardware_available(cc);
     const bool use_bf16 = precision == GGML_PREC_BF16 && fast_bf16_hardware_available(cc);
 
+    if (use_fp16) {
+        ggml_cuda_out_prod_id_lowp<half>(ctx, src0, src1, dst, expert_tokens, CUDA_R_16F);
+        return;
+    }
+    if (use_bf16) {
+        ggml_cuda_out_prod_id_lowp<nv_bfloat16>(ctx, src0, src1, dst, expert_tokens, CUDA_R_16BF);
+        return;
+    }
+
     const float * a_base = (const float *) src0->data;
     const float * b_base = (const float *) src1->data;
     float       * d_base = (float       *)  dst->data;
@@ -350,44 +458,10 @@ void ggml_cuda_out_prod_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 rows * sizeof(float), cudaMemcpyDeviceToDevice, stream));
         }
 
-        if (use_fp16) {
-            ggml_cuda_pool_alloc<half> a_gathered_f16(ctx.pool(), static_cast<size_t>(cols * ntoks_e));
-            ggml_cuda_pool_alloc<half> b_gathered_f16(ctx.pool(), static_cast<size_t>(rows * ntoks_e));
-            const int64_t a_count = cols * ntoks_e;
-            const int64_t b_count = rows * ntoks_e;
-            out_prod_id_convert_f32_kernel<<<(a_count + 255) / 256, 256, 0, stream>>>(
-                a_gathered.ptr, a_gathered_f16.ptr, a_count);
-            out_prod_id_convert_f32_kernel<<<(b_count + 255) / 256, 256, 0, stream>>>(
-                b_gathered.ptr, b_gathered_f16.ptr, b_count);
-            CUDA_CHECK(cudaGetLastError());
-            CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_T,
-                (int)cols, (int)rows, (int)ntoks_e,
-                &alpha_one, a_gathered_f16.ptr, CUDA_R_16F, (int)cols,
-                            b_gathered_f16.ptr, CUDA_R_16F, (int)rows,
-                &beta_acc,  d_base + e*dst_stride_e, CUDA_R_32F, (int)cols,
-                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-        } else if (use_bf16) {
-            ggml_cuda_pool_alloc<nv_bfloat16> a_gathered_bf16(ctx.pool(), static_cast<size_t>(cols * ntoks_e));
-            ggml_cuda_pool_alloc<nv_bfloat16> b_gathered_bf16(ctx.pool(), static_cast<size_t>(rows * ntoks_e));
-            const int64_t a_count = cols * ntoks_e;
-            const int64_t b_count = rows * ntoks_e;
-            out_prod_id_convert_f32_kernel<<<(a_count + 255) / 256, 256, 0, stream>>>(
-                a_gathered.ptr, a_gathered_bf16.ptr, a_count);
-            out_prod_id_convert_f32_kernel<<<(b_count + 255) / 256, 256, 0, stream>>>(
-                b_gathered.ptr, b_gathered_bf16.ptr, b_count);
-            CUDA_CHECK(cudaGetLastError());
-            CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_T,
-                (int)cols, (int)rows, (int)ntoks_e,
-                &alpha_one, a_gathered_bf16.ptr, CUDA_R_16BF, (int)cols,
-                            b_gathered_bf16.ptr, CUDA_R_16BF, (int)rows,
-                &beta_acc,  d_base + e*dst_stride_e, CUDA_R_32F, (int)cols,
-                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-        } else {
-            CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
-                (int)cols, (int)rows, (int)ntoks_e,
-                &alpha_one, a_gathered.ptr,         (int)cols,
-                            b_gathered.ptr,         (int)rows,
-                &beta_acc,  d_base + e*dst_stride_e, (int)cols));
-        }
+        CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
+            (int)cols, (int)rows, (int)ntoks_e,
+            &alpha_one, a_gathered.ptr, (int)cols,
+                        b_gathered.ptr, (int)rows,
+            &beta_acc,  d_base + e*dst_stride_e, (int)cols));
     }
 }

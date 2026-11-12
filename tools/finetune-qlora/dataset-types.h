@@ -58,12 +58,6 @@ struct training_sample {
     bool text_continuation = false;
 };
 
-struct training_window {
-    std::vector<int32_t> data;
-    std::vector<int32_t> labels;
-    std::vector<float> weights;
-};
-
 struct dataset_stats {
     size_t records_read = 0;
     size_t records_accepted = 0;

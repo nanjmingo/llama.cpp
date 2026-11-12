@@ -1,4 +1,4 @@
-#include "dataset-template.h"
+#include "dataset-renderer.h"
 
 #include "common.h"
 
@@ -90,9 +90,9 @@ rendered_example render_assistant_turn(common_chat_templates * templates,
 
 }
 
-dataset_template_result render_dataset_example(const dataset_example & example,
+dataset_render_result render_dataset_example(const dataset_example & example,
                                                 common_chat_templates * templates) {
-    dataset_template_result result;
+    dataset_render_result result;
     if (const auto * chat = std::get_if<chat_example>(&example)) {
         if (!templates) {
             result.diagnostics.push_back("no model chat template is available; chat records cannot be rendered");

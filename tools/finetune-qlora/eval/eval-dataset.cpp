@@ -1,6 +1,6 @@
-#include "dataset-format.h"
+#include "dataset-parser.h"
 #include "dataset-reader.h"
-#include "dataset-template.h"
+#include "dataset-renderer.h"
 #include "dataset-tokenize.h"
 
 #include "common.h"
@@ -255,7 +255,7 @@ void write_record(std::ofstream & output,
     output << "# record=" << sourced.record_number
            << " format=" << format_name(sourced.example) << '\n';
 
-    const dataset_template_result rendered = render_dataset_example(sourced.example, templates);
+    const dataset_render_result rendered = render_dataset_example(sourced.example, templates);
     for (const std::string & diagnostic : rendered.diagnostics) {
         output << "[RENDER DIAGNOSTIC] " << diagnostic << '\n';
     }

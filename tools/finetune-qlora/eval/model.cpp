@@ -1,4 +1,4 @@
-#include "eval-model-precision-model-internal.h"
+#include "model-internal.h"
 
 #include <chrono>
 #include <filesystem>
@@ -40,15 +40,6 @@ TemporaryAdapterFile::~TemporaryAdapterFile() {
     if (!path.empty()) {
         std::error_code ec;
         std::filesystem::remove(path, ec);
-    }
-}
-
-AdapterContextDetacher::~AdapterContextDetacher() {
-    if (train) {
-        llama_set_adapters_lora(train, nullptr, 0, nullptr);
-    }
-    if (eval) {
-        llama_set_adapters_lora(eval, nullptr, 0, nullptr);
     }
 }
 
@@ -194,58 +185,6 @@ Model::Impl::Impl(ModelOptions opts, ModelPrecisionConfig precision_config)
                     "model-training fixture must contain one window");
 }
 
-EvaluationRun::Impl::Impl(Model::Impl & shared, EvaluationMode mode) : model(&shared) {
-    adapter.reset(llama_adapter_lora_init(model->model.get(), model->temporary_adapter_file.path.string().c_str()));
-    detail::require(static_cast<bool>(adapter), "failed to load an independent LoRA adapter instance");
-
-    if (mode != EvaluationMode::InferenceOnly) {
-        const llama_context_params train_params = detail::context_params(
-            GGML_TYPE_F32, GGML_TYPE_F32, model->options.flash_attention, model->options.n_gpu_layers != 0);
-        train_ctx.reset(llama_init_from_model(model->model.get(), train_params));
-        detail::require(static_cast<bool>(train_ctx), "failed to create a training context");
-    }
-    const llama_context_params eval_params = detail::context_params(
-        model->precision.inference_cache_type_k, model->precision.inference_cache_type_v,
-        model->options.flash_attention, model->options.n_gpu_layers != 0);
-    eval_ctx.reset(llama_init_from_model(model->model.get(), eval_params));
-    detail::require(static_cast<bool>(eval_ctx), "failed to create an inference context");
-
-    llama_adapter_lora * adapter_ptr = adapter.get();
-    float adapter_scale = 1.0f;
-    if (train_ctx) {
-        detail::require(llama_set_adapters_lora(train_ctx.get(), &adapter_ptr, 1, &adapter_scale) == 0,
-                        "failed to attach LoRA to the training context");
-        detacher.train = train_ctx.get();
-    }
-    detail::require(llama_set_adapters_lora(eval_ctx.get(), &adapter_ptr, 1, &adapter_scale) == 0,
-                    "failed to attach LoRA to the inference context");
-    detacher.eval = eval_ctx.get();
-
-    detail::require(!adapter->ab_map.empty(), "loaded LoRA has no tensor pairs");
-    for (const auto & entry : adapter->ab_map) {
-        detail::require(entry.second.a && entry.second.b,
-                        "loaded LoRA pair is incomplete: " + entry.first);
-        if (train_ctx) {
-            ggml_set_param(entry.second.a);
-            ggml_set_param(entry.second.b);
-        }
-    }
-
-    if (train_ctx) {
-        optimizer_params = ggml_opt_get_default_optimizer_params(nullptr);
-        optimizer_params.sgd.alpha = 1.0e-2f;
-        optimizer_params.sgd.wd = 0.0f;
-        llama_opt_params opt_params = {};
-        opt_params.n_ctx_train = model->context_length;
-        opt_params.param_filter = lora_param_filter;
-        opt_params.param_filter_ud = nullptr;
-        opt_params.get_opt_pars = ggml_opt_get_constant_optimizer_params;
-        opt_params.get_opt_pars_ud = &optimizer_params;
-        opt_params.optimizer_type = GGML_OPT_OPTIMIZER_TYPE_SGD;
-        llama_opt_init(train_ctx.get(), model->model.get(), opt_params);
-    }
-}
-
 Model::Model(ModelOptions options, ModelPrecisionConfig precision)
     : impl_(std::make_unique<Impl>(std::move(options), std::move(precision))) {}
 Model::~Model() = default;
@@ -263,12 +202,6 @@ void Model::Impl::set_forward_precision(ggml_prec forward_precision) {
 void Model::set_forward_precision(ggml_prec precision) {
     impl_->set_forward_precision(precision);
 }
-
-EvaluationRun::EvaluationRun(Model & model, EvaluationMode mode)
-    : impl_(std::make_unique<Impl>(*model.impl_, mode)) {}
-EvaluationRun::~EvaluationRun() = default;
-EvaluationRun::EvaluationRun(EvaluationRun &&) noexcept = default;
-EvaluationRun & EvaluationRun::operator=(EvaluationRun &&) noexcept = default;
 
 
 }

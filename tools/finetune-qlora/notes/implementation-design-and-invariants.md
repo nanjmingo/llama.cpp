@@ -24,7 +24,7 @@ While QLoRA uses the shared `ggml_opt_*` optimizer engine, its architecture diff
 
 ## 2. Dataset Pipeline Architecture
 
-Data processing runs in three stages inside `dataset.cpp`:
+Data processing runs in three stages inside `dataset-pipeline.cpp`:
 
 ```text
 JSONL Lines (up to 128 lines per batch)

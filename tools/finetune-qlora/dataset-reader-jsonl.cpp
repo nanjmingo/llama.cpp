@@ -1,6 +1,6 @@
 #include "dataset-reader.h"
 
-#include "dataset-format.h"
+#include "dataset-parser.h"
 #include "dataset-thread-pool.h"
 
 #include <exception>
@@ -153,24 +153,4 @@ dataset_read_summary read_jsonl_dataset_batched(const std::string & path,
     }
     summary.success = true;
     return summary;
-}
-
-dataset_read_result read_jsonl_dataset(const std::string & path, const dataset_options & options) {
-    dataset_read_result result;
-    result.success = true;
-    const dataset_read_summary summary = read_jsonl_dataset_batched(path, options, [&](dataset_read_result && batch) {
-        result.stats.records_read += batch.stats.records_read;
-        result.stats.records_accepted += batch.stats.records_accepted;
-        result.stats.invalid_records += batch.stats.invalid_records;
-        result.examples.insert(result.examples.end(),
-                               std::make_move_iterator(batch.examples.begin()),
-                               std::make_move_iterator(batch.examples.end()));
-        result.diagnostics.insert(result.diagnostics.end(),
-                                  std::make_move_iterator(batch.diagnostics.begin()),
-                                  std::make_move_iterator(batch.diagnostics.end()));
-        result.success = result.success && batch.success;
-    });
-    result.success = summary.success;
-    result.stats = summary.stats;
-    return result;
 }

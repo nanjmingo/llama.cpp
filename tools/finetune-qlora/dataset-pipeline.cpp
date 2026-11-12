@@ -1,6 +1,7 @@
-#include "dataset.h"
+#include "dataset-pipeline.h"
 
-#include "dataset-template.h"
+#include "dataset-reader.h"
+#include "dataset-renderer.h"
 #include "dataset-tokenize.h"
 #include "dataset-thread-pool.h"
 #include "log.h"
@@ -57,7 +58,7 @@ void append_tokenized_batch(const std::vector<sourced_dataset_example> & example
     std::vector<size_t> pending_record_indices;
     for (size_t record_index = 0; record_index < examples.size(); ++record_index) {
         try {
-            dataset_template_result rendered = render_dataset_example(examples[record_index].example, templates);
+            dataset_render_result rendered = render_dataset_example(examples[record_index].example, templates);
             records[record_index].diagnostics = std::move(rendered.diagnostics);
             for (rendered_example & example : rendered.examples) {
                 pending.push_back({std::move(example)});

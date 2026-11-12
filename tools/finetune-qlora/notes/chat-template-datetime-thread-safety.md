@@ -23,7 +23,7 @@ Both call sites share the same underlying storage on platforms where `std::local
 
 ## Current QLoRA Implementation
 
-In `tools/finetune-qlora/dataset.cpp`:
+In `tools/finetune-qlora/dataset-pipeline.cpp`:
 
 ```text
 JSONL Batch (up to 128 lines)
@@ -47,7 +47,7 @@ JSONL Batch (up to 128 lines)
 
 1. **Do not parallelize template rendering** without fixing both call sites first.
 2. **Fixing only one helper is insufficient:** Wrapping `format_time()` with a mutex does not protect against concurrent calls from `strftime_now`. Both call sites must be migrated to reentrant storage (such as POSIX `localtime_r()` or Windows `localtime_s()`) or share a common lock across `common/`.
-3. **Preserve serial rendering:** Keep the serial loop in `dataset.cpp` unless a comprehensive thread-safe time library is integrated project-wide.
+3. **Preserve serial rendering:** Keep the serial loop in `dataset-pipeline.cpp` unless a comprehensive thread-safe time library is integrated project-wide.
 
 ---
 

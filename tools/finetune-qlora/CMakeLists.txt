@@ -1,16 +1,20 @@
 set(TARGET llama-finetune-qlora)
 set(QLORA_SOURCES
     finetune-qlora.cpp
+    training.cpp
+    training-callback.cpp
+    checkpoint.cpp
     save-worker.cpp
     args.cpp
     adapter.cpp
+    adapter-save.cpp
     schedule.cpp
-    dataset.cpp
+    dataset-pipeline.cpp
     dataset-reader.cpp
     dataset-reader-jsonl.cpp
     dataset-thread-pool.cpp
-    dataset-format.cpp
-    dataset-template.cpp
+    dataset-parser.cpp
+    dataset-renderer.cpp
     dataset-tokenize.cpp
     dataset-window.cpp
 )

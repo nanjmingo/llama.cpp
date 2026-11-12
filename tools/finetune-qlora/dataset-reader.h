@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <string>
 
 struct dataset_read_result {
     std::vector<sourced_dataset_example> examples;
@@ -23,8 +24,6 @@ class dataset_thread_pool;
 
 using dataset_batch_callback = std::function<void(dataset_read_result &&)>;
 
-dataset_read_result read_dataset_records(const dataset_options & options);
-dataset_read_result read_jsonl_dataset(const std::string & path, const dataset_options & options);
 dataset_read_summary read_dataset_records_batched(const dataset_options & options,
                                                     const dataset_batch_callback & consume_batch,
                                                     dataset_thread_pool * pool = nullptr);

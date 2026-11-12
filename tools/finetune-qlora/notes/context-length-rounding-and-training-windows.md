@@ -32,7 +32,7 @@ When these conditions hold:
 
 ## 2. Dataset Window Construction and Padding
 
-Context capacity is an internal buffer size. Dataset windowing is a separate process in `dataset.cpp`:
+Context capacity is an internal buffer size. Dataset windowing is a separate process in `dataset-pipeline.cpp`:
 
 | Sample Length | Packing Behavior |
 |---|---|

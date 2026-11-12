@@ -1,5 +1,5 @@
-#include "eval-model-precision-format.h"
-#include "eval-model-precision-options.h"
+#include "format.h"
+#include "options.h"
 
 #include <chrono>
 #include <iomanip>

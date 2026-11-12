@@ -1,6 +1,6 @@
 #pragma once
 
-#include "eval-model-precision-model.h"
+#include "model.h"
 
 #include <vector>
 
