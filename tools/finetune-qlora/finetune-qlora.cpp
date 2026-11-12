@@ -1972,7 +1972,7 @@ int main(int argc, char ** argv) {
     model->prec_policy.prec_src1.clear();
     model->prec_policy.prec_src1_default = qparams.forward_precision;
     model->prec_policy.prec_bwd = qparams.backward_precision;
-    LOG_INF("%s: requested forward precision=%s; configured model tensors=%zu (adapter tensors also use type-based fallback); requested backward precision=%s (clamped per weight type)\n",
+    LOG_INF("%s: requested forward precision=%s; configured model tensors=%zu; requested backward precision=%s\n",
             __func__, qparams.forward_precision_name.c_str(), forward_precision_tensors,
             qparams.backward_precision_name.c_str());
 

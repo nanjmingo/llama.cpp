@@ -110,13 +110,13 @@ Train a LoRA adapter with context size 512:
 | `--val-windows` | all remaining | Max windows evaluated after training range (`0` disables validation). |
 | `--grad-stats-interval` | `0` | Log gradient norm/stats every N updates (`0` disables logging). |
 
-#### Precision Clamping Rule
+#### Precision Selection
 
-`--forward-precision` and `--backward-precision` are clamped according to each weight tensor's storage type:
-- **F32 weights**: Always compute in F32.
-- **F16 weights**: Use F16 for F16/Q8 requests; use F32 for BF16/F32 requests.
-- **BF16 weights**: Use BF16 for BF16/Q8 requests; use F32 for F16/F32 requests.
-- **Quantized weights (Q8_0, Q4_K, etc.)**: Use the requested precision as-is.
+On CUDA, `f32`, `f16`, and `bf16` requests are independent of the weight tensor storage type. The existing cuBLAS and backward matrix-multiplication paths convert supported inputs and weights to the requested compute type. If the GPU does not support the requested low-precision type efficiently, CUDA falls back to F32.
+
+`q8` is a separate quantized-activation mode. It remains available for quantized-weight kernels; with floating-point weights it uses the weight's native floating-point precision.
+
+CPU support for applying F16/BF16 precision to F32 weights is not included in this change.
 
 ---
 

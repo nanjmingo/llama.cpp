@@ -135,6 +135,7 @@ add_executable(test-qlora-forward-precision
 )
 target_include_directories(test-qlora-forward-precision PRIVATE
     "${CMAKE_SOURCE_DIR}/ggml/include"
+    "${CMAKE_SOURCE_DIR}/src"
 )
 target_link_libraries(test-qlora-forward-precision PRIVATE llama-common llama)
 target_compile_features(test-qlora-forward-precision PRIVATE cxx_std_17)

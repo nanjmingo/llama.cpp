@@ -1376,24 +1376,16 @@ struct llama_model::impl {
     std::vector<float> tensor_split_owned;
 };
 
-static ggml_prec llama_prec_policy_clamp(ggml_prec requested, ggml_type weight_type) {
-    if (requested == GGML_PREC_UNDEFINED) {
-        return requested;
-    }
-
-    if (ggml_is_quantized(weight_type)) {
+static ggml_prec llama_prec_policy_resolve(ggml_prec requested, ggml_type weight_type) {
+    if (requested != GGML_PREC_Q8 || ggml_is_quantized(weight_type)) {
         return requested;
     }
 
     switch (weight_type) {
-        case GGML_TYPE_F32:
-            return GGML_PREC_F32;
         case GGML_TYPE_F16:
-            if (requested == GGML_PREC_F32 || requested == GGML_PREC_F16) return requested;
-            return requested == GGML_PREC_Q8 ? GGML_PREC_F16 : GGML_PREC_F32;
+            return GGML_PREC_F16;
         case GGML_TYPE_BF16:
-            if (requested == GGML_PREC_F32 || requested == GGML_PREC_BF16) return requested;
-            return requested == GGML_PREC_Q8 ? GGML_PREC_BF16 : GGML_PREC_F32;
+            return GGML_PREC_BF16;
         default:
             return GGML_PREC_F32;
     }
@@ -1412,12 +1404,12 @@ bool llama_prec_policy::apply(ggml_tensor * res) const {
         return false;
     }
 
-    return ggml_prec_set_src(res, llama_prec_policy_clamp(requested, res->src[0]->type), 1);
+    return ggml_prec_set_src(res, llama_prec_policy_resolve(requested, res->src[0]->type), 1);
 }
 
 void llama_prec_policy::apply_backward(ggml_tensor * res) const {
     if (res && res->src[0] && prec_bwd != GGML_PREC_UNDEFINED) {
-        const ggml_prec precision = llama_prec_policy_clamp(prec_bwd, res->src[0]->type);
+        const ggml_prec precision = llama_prec_policy_resolve(prec_bwd, res->src[0]->type);
         GGML_ASSERT(ggml_prec_set_bwd(res, precision));
     }
 }

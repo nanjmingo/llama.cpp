@@ -1,5 +1,6 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
+#include "llama-model.h"
 
 #include <algorithm>
 #include <cmath>
@@ -115,6 +116,36 @@ void check_matches_reference(const char * name,
                     << " tolerance=" << tolerance;
             throw std::runtime_error(message.str());
         }
+    }
+}
+
+void test_precision_policy_is_independent_of_weight_type() {
+    context_ptr ctx(ggml_init({ 16 * 1024 * 1024, nullptr, false }), &ggml_free);
+    require(static_cast<bool>(ctx), "failed to allocate model precision policy test context");
+
+    const ggml_type weight_types[] = {
+        GGML_TYPE_F32,
+        GGML_TYPE_F16,
+        GGML_TYPE_BF16,
+        GGML_TYPE_Q8_0,
+    };
+
+    for (ggml_type weight_type : weight_types) {
+        ggml_tensor * weights = ggml_new_tensor_2d(ctx.get(), weight_type, input_dim, output_dim);
+        ggml_tensor * inputs = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, input_dim, batch_size);
+        require(weights && inputs, "failed to allocate model precision policy tensors");
+
+        ggml_tensor * output = ggml_mul_mat(ctx.get(), weights, inputs);
+        require(output != nullptr, "failed to create model precision policy matmul");
+
+        llama_prec_policy policy;
+        policy.prec_src1_default = GGML_PREC_F16;
+        policy.prec_bwd = GGML_PREC_BF16;
+        require(policy.apply(output), "model precision policy did not apply to matmul");
+        require(ggml_prec_get_src(output, 1) == GGML_PREC_F16,
+                "forward precision was changed based on weight storage type");
+        require(ggml_prec_get_bwd(output) == GGML_PREC_BF16,
+                "backward precision was changed based on weight storage type");
     }
 }
 
@@ -324,6 +355,7 @@ void test_quantized_matmul_forward_precision() {
 
 int main() {
     try {
+        test_precision_policy_is_independent_of_weight_type();
         test_backward_precision_hint_propagation();
         test_moe_backward_precision_hint_propagation();
         test_quantized_moe_backward_precision_hint_propagation();

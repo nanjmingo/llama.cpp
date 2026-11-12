@@ -119,7 +119,7 @@ const std::vector<qlora_arg> & get_qlora_arg_defs() {
         ));
         add_opt(qlora_arg(
             {"--forward-precision"}, "TYPE",
-            "Requested forward matrix-multiplication input precision, clamped to each weight tensor type: f32, f16, bf16, or q8",
+            "Requested CUDA forward matrix-multiplication input precision: f32, f16, bf16, or q8",
             [](qlora_params & params, const std::string & value) {
                 params.forward_precision_name = value;
                 if (value == "f32") {
@@ -137,7 +137,7 @@ const std::vector<qlora_arg> & get_qlora_arg_defs() {
         ));
         add_opt(qlora_arg(
             {"--backward-precision"}, "TYPE",
-            "Requested backward matrix-multiplication input precision, clamped to each weight tensor type: f32, f16, or bf16 (default: f32)",
+            "Requested CUDA backward matrix-multiplication input precision: f32, f16, or bf16 (default: f32)",
             [](qlora_params & params, const std::string & value) {
                 params.backward_precision_name = value;
                 if (value == "f32") {
