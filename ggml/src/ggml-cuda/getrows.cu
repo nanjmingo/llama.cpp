@@ -458,36 +458,27 @@ if (src1->type != GGML_TYPE_I32) {
         "\n"
         "========== GET_ROWS TYPE ERROR ==========\n"
         "dst:\n"
-        "  ptr  = %p\n"
         "  name = %s\n"
         "  op   = %d\n"
         "  type = %d\n"
         "\n"
         "src0:\n"
-        "  ptr  = %p\n"
         "  name = %s\n"
         "  type = %d\n"
         "\n"
         "src1:\n"
-        "  ptr  = %p\n"
         "  name = %s\n"
         "  op   = %d\n"
         "  type = %d\n"
         "  ne   = [%lld, %lld, %lld, %lld]\n"
         "  nb   = [%zu, %zu, %zu, %zu]\n"
         "  flags = 0x%x\n"
-        "  view_src = %p\n"
-        "  data = %p\n"
-        "  buffer = %p\n"
         "==========================================\n",
-        (void *) dst,
         dst->name,
         (int) dst->op,
         (int) dst->type,
-        (void *) src0,
         src0->name,
         (int) src0->type,
-        (void *) src1,
         src1->name,
         (int) src1->op,
         (int) src1->type,
@@ -499,10 +490,7 @@ if (src1->type != GGML_TYPE_I32) {
         src1->nb[1],
         src1->nb[2],
         src1->nb[3],
-        src1->flags,
-        (void *) src1->view_src,
-        src1->data,
-        (void *) src1->buffer
+        src1->flags
     );
 }
 
