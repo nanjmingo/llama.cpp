@@ -453,47 +453,6 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
-if (src1->type != GGML_TYPE_I32) {
-    GGML_LOG_ERROR(
-        "\n"
-        "========== GET_ROWS TYPE ERROR ==========\n"
-        "dst:\n"
-        "  name = %s\n"
-        "  op   = %d\n"
-        "  type = %d\n"
-        "\n"
-        "src0:\n"
-        "  name = %s\n"
-        "  type = %d\n"
-        "\n"
-        "src1:\n"
-        "  name = %s\n"
-        "  op   = %d\n"
-        "  type = %d\n"
-        "  ne   = [%lld, %lld, %lld, %lld]\n"
-        "  nb   = [%zu, %zu, %zu, %zu]\n"
-        "  flags = 0x%x\n"
-        "==========================================\n",
-        dst->name,
-        (int) dst->op,
-        (int) dst->type,
-        src0->name,
-        (int) src0->type,
-        src1->name,
-        (int) src1->op,
-        (int) src1->type,
-        (long long) src1->ne[0],
-        (long long) src1->ne[1],
-        (long long) src1->ne[2],
-        (long long) src1->ne[3],
-        src1->nb[0],
-        src1->nb[1],
-        src1->nb[2],
-        src1->nb[3],
-        src1->flags
-    );
-}
-
     GGML_ASSERT(src1->type == GGML_TYPE_I32);
     GGML_ASSERT(ne13 == 1);
 
