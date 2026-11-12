@@ -235,7 +235,7 @@ jobs:
               "llamango-cache-ubuntu-cuda-13.0.3-22.04",
               "llamango-cache-ubuntu-cuda-12.8.2-22.04",
             ];
-            const keepCount = 2;
+            const keepCount = 1;
             const { owner, repo } = context.repo;
             const ref = context.ref;
 
