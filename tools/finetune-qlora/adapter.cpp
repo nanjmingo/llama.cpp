@@ -109,8 +109,8 @@ static bool tensor_matches_targets(const char * name, const std::vector<std::str
         }
     }
 
-    const std::string tensor_name(name);
-    return std::any_of(targets.begin(), targets.end(), [&tensor_name](const std::string & target) {
+    const std::string bounded_tensor_name = "." + std::string(name) + ".";
+    return std::any_of(targets.begin(), targets.end(), [&bounded_tensor_name](const std::string & target) {
         if (target.empty()) {
             return false;
         }
@@ -122,7 +122,7 @@ static bool tensor_matches_targets(const char * name, const std::vector<std::str
         if (pattern.back() != '.') {
             pattern.push_back('.');
         }
-        return tensor_name.find(pattern) != std::string::npos;
+        return bounded_tensor_name.find(pattern) != std::string::npos;
     });
 }
 
