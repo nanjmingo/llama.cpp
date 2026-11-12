@@ -161,10 +161,6 @@ namespace {
             opt_ctx->forward_node_indices[i] = i;
         }
 
-// DEBUG:
-// Disable F16 backward activation cache transformation.
-return;
-
         std::unordered_set<ggml_tensor *> seen;
         std::vector<ggml_opt_f16_cache_candidate> candidates;
 

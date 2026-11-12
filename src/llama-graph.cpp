@@ -1813,7 +1813,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         // validates the activation's type, aliases, backward users, and backend support
         // before replacing any F32 activation with its F16 cache.
         if (training_graph && ggml_prec_get_bwd(lora_a_cur) == GGML_PREC_F16) {
-            cur->flags |= GGML_TENSOR_FLAG_F16_BACKWARD_CACHE;
+            // cur->flags |= GGML_TENSOR_FLAG_F16_BACKWARD_CACHE;
         }
 
         ggml_tensor * ab_cur = ggml_mul_mat(ctx0, lw->b, lora_a_cur);
@@ -1913,7 +1913,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
             prec_policy->apply_backward(lora_a_cur);
         }
         if (training_graph && ggml_prec_get_bwd(lora_a_cur) == GGML_PREC_F16) {
-            cur->flags |= GGML_TENSOR_FLAG_F16_BACKWARD_CACHE;
+            // cur->flags |= GGML_TENSOR_FLAG_F16_BACKWARD_CACHE;
         }
 
         ggml_tensor * ab_cur = ggml_mul_mat_id(ctx0, lw->b, lora_a_cur, ids);
