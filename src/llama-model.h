@@ -705,10 +705,8 @@ struct llama_prec_policy {
     // the key is the weight tensor `res->src[0]`, stores the recommended forward activation precision
     std::unordered_map<const ggml_tensor *, ggml_prec> prec_src1;
 
-    // Default requested precision, clamped to the storage type of each weight tensor.
     ggml_prec prec_src1_default = GGML_PREC_UNDEFINED;
 
-    // Optional precision hint propagated to matrix multiplications generated during backpropagation.
     ggml_prec prec_bwd = GGML_PREC_UNDEFINED;
 
     bool apply(ggml_tensor * res) const;

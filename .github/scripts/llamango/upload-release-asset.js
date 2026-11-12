@@ -19,9 +19,6 @@ module.exports = async ({ github, core }) => {
 
     const assetName = path.basename(assetPath);
 
-    // getReleaseByTag only returns published releases. The workflow creates a
-    // draft release first, so locate it through listReleases instead. GitHub
-    // includes draft releases in this endpoint for users with push access.
     const releases = await github.paginate(github.rest.repos.listReleases, {
         owner,
         repo,

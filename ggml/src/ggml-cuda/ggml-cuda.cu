@@ -2621,10 +2621,6 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_ASSERT(nb12 % nb11 == 0);
     GGML_ASSERT(nb2  % nb1  == 0);
 
-    // Preserve the original F32 activations until the cuBLAS precision path
-    // applies the requested F32/F16/BF16 conversion. In particular, converting
-    // to F16 here would lose range before GGML_PREC_F32 or GGML_PREC_BF16 is
-    // handled by ggml_cuda_mul_mat_cublas().
     const bool use_cublas_src1_precision = ggml_cuda_mul_mat_use_cublas_for_src1_precision(src0, dst);
     const ggml_type type_src1_sorted = use_cublas_src1_precision ||
         ((src0->type == GGML_TYPE_F16 && !fast_fp16_hardware_available(cc)) || ggml_is_quantized(src0->type) ||
@@ -3271,10 +3267,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             continue;
         }
 
-        // [TAG_OUT_PROD_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_OUT_PROD_ID || node->op == GGML_OP_MUL_MAT_ID_BACK) {
-            // These operations use host-side, data-dependent routing work and synchronize the stream,
-            // so they cannot be captured or replayed safely.
             use_cuda_graph = false;
             if (ggml_cuda_graph_debug_enabled()) {
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);

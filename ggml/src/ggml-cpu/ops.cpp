@@ -4854,15 +4854,14 @@ void ggml_compute_forward_out_prod(
     }
 }
 
-// ggml_compute_forward_out_prod_id
 
 static void ggml_compute_forward_out_prod_id_f32(
         const ggml_compute_params * params,
               ggml_tensor * dst) {
 
-    const ggml_tensor * src0 = dst->src[0]; // a [cols, n_exp_used, n_tokens]
-    const ggml_tensor * src1 = dst->src[1]; // b [rows, n_exp_used, n_tokens]
-    const ggml_tensor * ids  = dst->src[2]; // ids [n_exp_used, n_tokens] I32
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
@@ -4878,25 +4877,20 @@ static void ggml_compute_forward_out_prod_id_f32(
     const int64_t rows       = src1->ne[0];
     const int64_t n_expert   = dst->ne[2];
 
-    // zero dst
     if (ith == 0) {
         ggml_vec_set_f32(ggml_nelements(dst), (float *)dst->data, 0);
     }
     ggml_barrier(params->threadpool);
 
-    // total dispatch slots: n_exp_used * n_tokens
     const int64_t n_slots = n_exp_used * n_tokens;
 
-    // strides for src0 (a): [cols, n_exp_used, n_tokens]
-    const size_t a_nb_exp = src0->nb[1]; // stride per expert slot (cols * sizeof(float))
-    const size_t a_nb_tok = src0->nb[2]; // stride per token
+    const size_t a_nb_exp = src0->nb[1];
+    const size_t a_nb_tok = src0->nb[2];
 
-    // strides for src1 (b): [rows, n_exp_used, n_tokens]
-    const size_t b_nb_exp = src1->nb[1]; // stride per expert slot
-    const size_t b_nb_tok = src1->nb[2]; // stride per token
+    const size_t b_nb_exp = src1->nb[1];
+    const size_t b_nb_tok = src1->nb[2];
 
-    // stride for dst per expert: [cols, rows, n_expert]
-    const size_t d_nb_exp = dst->nb[2];  // stride per expert
+    const size_t d_nb_exp = dst->nb[2];
 
     for (int64_t is = 0; is < n_slots; ++is) {
         const int64_t iexp = is / n_tokens;
@@ -4909,7 +4903,6 @@ static void ggml_compute_forward_out_prod_id_f32(
             continue;
         }
         GGML_ASSERT(eid >= 0 && eid < (int32_t)n_expert);
-        // all updates for an expert must be owned by one thread
         if (eid % nth != ith) {
             continue;
         }
@@ -4918,7 +4911,6 @@ static void ggml_compute_forward_out_prod_id_f32(
         const float * b_col = (const float *)((const char *)src1->data + iexp * b_nb_exp + itok * b_nb_tok);
         float       * d_mat = (float       *)((char       *) dst->data + eid  * d_nb_exp);
 
-        // rank-1 update: d_mat[:, :] += a_col[:] ⊗ b_col[:]
         for (int64_t r = 0; r < rows; ++r) {
             const float b_val = b_col[r];
             for (int64_t c = 0; c < cols; ++c) {
@@ -4943,7 +4935,6 @@ void ggml_compute_forward_out_prod_id(
     }
 }
 
-// ggml_compute_forward_mul_mat_id_back
 void ggml_compute_forward_mul_mat_id_back(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -5021,9 +5012,6 @@ void ggml_compute_forward_mul_mat_id_back(
         }
     }
 
-    // Use a row-major GEMM for each expert: [routes, output_dim] x
-    // [output_dim, input_dim] -> [routes, input_dim]. Dequantize only a small
-    // band of quantized weight rows at a time to bound temporary memory.
     constexpr int64_t weight_rows_per_chunk = 32;
     constexpr int64_t routes_per_chunk = 32;
     constexpr size_t max_result_bytes = 64u * 1024u * 1024u;
@@ -9824,17 +9812,12 @@ void ggml_compute_forward_flash_attn_ext(
 
 // ggml_compute_forward_flash_attn_back
 
-// scratch floats per thread: K and V of one KV head as F32, the scores and tanh values of one row, dQ of one row
 size_t ggml_flash_attn_back_work_per_thread(const ggml_tensor * dst) {
     const ggml_tensor * k = dst->src[1];
     const ggml_tensor * v = dst->src[2];
     return (size_t) k->ne[1]*(k->ne[0] + v->ne[0] + 2) + k->ne[0] + CACHE_LINE_SIZE_F32;
 }
 
-// Gradients of flash attention, recomputing the softmax from q and k (no stored probabilities):
-//   p_ij = softmax_j(s_ij), D_i = dO_i . O_i, ds_ij = p_ij (dO_i . v_j - D_i)
-//   dQ_i = sum_j ds_ij ds/dqk k_j, dK_j = sum_i ds_ij ds/dqk q_i, dV_j = sum_i p_ij dO_i, dSink_h = -sum_i p_i,sink D_i
-// Each thread owns whole KV heads, so dK, dV and the dQ/dSinks of their query heads have no other writer.
 static void ggml_compute_forward_flash_attn_back_f32(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
@@ -9868,7 +9851,6 @@ static void ggml_compute_forward_flash_attn_back_f32(const ggml_compute_params *
     const float scale         = ggml_get_op_params_f32(dst, 0);
     const float max_bias      = ggml_get_op_params_f32(dst, 1);
     const float logit_softcap = ggml_get_op_params_f32(dst, 2);
-    // the forward op computes s = softcap*tanh(qk*scale/softcap); ds/dqk = scale*(1 - tanh^2)
     const float scale_qk = logit_softcap != 0.0f ? scale/logit_softcap : scale;
 
     const uint32_t n_head      = neq2;
@@ -9884,8 +9866,8 @@ static void ggml_compute_forward_flash_attn_back_f32(const ggml_compute_params *
     float * w  = (float *) params->wdata + params->ith*ggml_flash_attn_back_work_per_thread(dst);
     float * Kf = w;
     float * Vf = Kf + NK*DK;
-    float * S  = Vf + NK*DV; // scores, then probabilities
-    float * T  = S + NK;     // tanh of the softcapped scores
+    float * S  = Vf + NK*DV;
+    float * T  = S + NK;
     float * dq = T + NK;
 
     for (int64_t ik2 = params->ith; ik2 < nek2; ik2 += params->nth) {
@@ -9925,7 +9907,6 @@ static void ggml_compute_forward_flash_attn_back_f32(const ggml_compute_params *
                         const ggml_fp16_t * mp = mask ? (const ggml_fp16_t *) ((const char *) mask->data + iq1*mask->nb[1] +
                             (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : nullptr;
 
-                        // scores and their maximum
                         float M = sink;
                         for (int64_t j = 0; j < NK; ++j) {
                             const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[j]) : 0.0f;
@@ -9946,7 +9927,7 @@ static void ggml_compute_forward_flash_attn_back_f32(const ggml_compute_params *
                         float * dqr = dq_all + ((iq3*neq2 + iq2)*N + iq1)*DK;
                         if (M == -INFINITY) {
                             memset(dqr, 0, DK*sizeof(float));
-                            continue; // fully masked row: no output, no gradient
+                            continue;
                         }
                         float sum = sinks ? expf(sink - M) : 0.0f;
                         for (int64_t j = 0; j < NK; ++j) {
@@ -11526,7 +11507,6 @@ static void ggml_compute_forward_dsv4_hc_comb_f32(
     }
 }
 
-// ggml_compute_forward_gated_delta_net_back
 
 static void ggml_compute_forward_gated_delta_net_back_f32(
         const ggml_compute_params * params,
@@ -11559,9 +11539,7 @@ static void ggml_compute_forward_gated_delta_net_back_f32(
     GGML_TENSOR_LOCALS(size_t,  nbb, src_beta, nb);
 
     const bool    kda = (neg0 == S_v);
-    // K (snapshot slot count) is set as an op param by ggml_gated_delta_net_back().
     const int64_t K   = ggml_get_op_params_i32(dst, 0);
-    // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride.
     const int64_t state_seq_stride = src_state->nb[3] / sizeof(float);
 
     const int64_t H_k = neq1;
@@ -11637,13 +11615,11 @@ static void ggml_compute_forward_gated_delta_net_back_f32(
                     if (kda) {
                         for (int64_t i = 0; i < S_v; ++i) { eg[i] = expf(g_d[i]); }
                     }
-                    // S' = diag(exp(g)) S_{t-1}
                     for (int64_t j = 0; j < S_v; ++j) {
                         for (int64_t i = 0; i < S_v; ++i) {
                             St[j * S_v + i] = (kda ? eg[i] : eg0) * prev[j * S_v + i];
                         }
                     }
-                    // delta = beta (v - S'^T k); S_t = S' + k delta^T
                     for (int64_t j = 0; j < S_v; ++j) {
                         float s = 0.0f;
                         for (int64_t i = 0; i < S_v; ++i) { s += St[j * S_v + i] * k_d[i]; }
@@ -11669,7 +11645,6 @@ static void ggml_compute_forward_gated_delta_net_back_f32(
                     float * dk = dk_base + S_v * (iqh + H_k * (t + n_tokens * iq3));
                     float * dv = dv_base + S_v * (iv1 + H * (t + n_tokens * iv3));
 
-                    // d_q = scale S_t d_o ; A += scale q (x) d_o
                     for (int64_t i = 0; i < S_v; ++i) {
                         float s = 0.0f;
                         for (int64_t j = 0; j < S_v; ++j) { s += St[j * S_v + i] * do_d[j]; }
@@ -11680,14 +11655,12 @@ static void ggml_compute_forward_gated_delta_net_back_f32(
                         for (int64_t i = 0; i < S_v; ++i) { Am[j * S_v + i] += q_d[i] * sdo; }
                     }
 
-                    // matches the forward op's slot mapping: slot 0 = most recent state (t = n_tokens-1).
                     const int64_t target_slot = n_tokens - 1 - t;
                     if (target_slot >= 0 && target_slot < K) {
                         const float * dss = d_state_base + target_slot * state_size_per_snap + (iv3 * H + iv1) * S_v * S_v;
                         for (int64_t idx = 0; idx < S_v * S_v; ++idx) { Am[idx] += dss[idx]; }
                     }
 
-                    // recompute S'_t and exp(g) from S_{t-1}
                     const float eg0 = kda ? 0.0f : expf(g_d[0]);
                     if (kda) {
                         for (int64_t i = 0; i < S_v; ++i) { eg[i] = expf(g_d[i]); }
@@ -11697,7 +11670,6 @@ static void ggml_compute_forward_gated_delta_net_back_f32(
                             Spm[j * S_v + i] = (kda ? eg[i] : eg0) * prev[j * S_v + i];
                         }
                     }
-                    // u = v - S'^T k ; delta = beta u ; d_delta = A^T k ; w = beta d_delta
                     for (int64_t j = 0; j < S_v; ++j) {
                         float su = 0.0f, sd = 0.0f;
                         for (int64_t i = 0; i < S_v; ++i) {
@@ -11708,14 +11680,12 @@ static void ggml_compute_forward_gated_delta_net_back_f32(
                         dvec[j]  = beta_val * uvec[j];
                         ddvec[j] = sd;
                         wvec[j]  = beta_val * sd;
-                        dv[j]    = wvec[j];     // d_v = w
+                        dv[j]    = wvec[j];
                     }
-                    // d_beta = <d_delta, u>
                     float dbeta = 0.0f;
                     for (int64_t j = 0; j < S_v; ++j) { dbeta += ddvec[j] * uvec[j]; }
                     db_base[iv1 + H * (t + n_tokens * iv3)] = dbeta;
 
-                    // d_k = A delta - S' w
                     for (int64_t i = 0; i < S_v; ++i) {
                         float a = 0.0f, b = 0.0f;
                         for (int64_t j = 0; j < S_v; ++j) {
@@ -11724,7 +11694,6 @@ static void ggml_compute_forward_gated_delta_net_back_f32(
                         }
                         dk[i] += a - b;
                     }
-                    // d_g (using dS' = A - k w^T), then A_{t-1} = diag(exp(g)) dS'
                     if (kda) {
                         float * dg = dg_base + S_v * (iv1 + H * (t + n_tokens * iv3));
                         for (int64_t i = 0; i < S_v; ++i) {
@@ -11749,7 +11718,6 @@ static void ggml_compute_forward_gated_delta_net_back_f32(
                     }
                 }
 
-                // state's gradient has layout [S_v, S_v, H, n_seqs] (no K factor, unlike the forward output).
                 float * ds0 = ds_base + (iv3 * H + iv1) * S_v * S_v;
                 memcpy(ds0, Am, S_v * S_v * sizeof(float));
             }
@@ -12489,7 +12457,6 @@ static void ggml_compute_forward_cross_entropy_loss_back_f32(
         ggml_vec_scale_f32(nc, ds0, 1.0/sum);
 
         // grad(src0f) = (softmax(src0f) * sum(labels) - src1f) * grad / nr
-        // Multiplying by sum(labels) ensures zero-label rows produce zero gradient.
         ggml_vec_scale_f32(nc, ds0, labels_sum);
         ggml_vec_sub_f32(nc, ds0, ds0, s1);
         ggml_vec_scale_f32(nc, ds0, d_by_nr);

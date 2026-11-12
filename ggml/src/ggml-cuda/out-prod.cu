@@ -264,25 +264,10 @@ static __global__ void out_prod_id_convert_f32_kernel(
     }
 }
 
-// ggml_cuda_out_prod_id
-//
-// Scattered outer-product for the MUL_MAT_ID backward pass (gradient w.r.t. expert weights).
-//
-//   src0 = a   [cols, n_expert_used, n_tokens]  F32  — token activations
-//   src1 = b   [rows, n_expert_used, n_tokens]  F32  — upstream gradient
-//   src2 = ids [n_expert_used, n_tokens]        I32  — expert dispatch indices
-//   dst        [cols, rows, n_expert, 1]         F32  — gradient w.r.t. expert weight matrices
-//
-//   dst[:, :, e] += sum_{(i,t): ids[i,t]==e} a[:, i, t] ⊗ b[:, i, t]
-//
-// Algorithm:
-//   For each expert e: gather the token columns where ids[i,t]==e into contiguous
-//   GPU buffers, then use cublasSgemm (beta=1) to accumulate the outer product.
-//   ids may be CPU-resident (common in backward graphs where they are leaf tensors).
 void ggml_cuda_out_prod_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * src0 = dst->src[0]; // a   [cols, n_exp_used, n_tokens]
-    const ggml_tensor * src1 = dst->src[1]; // b   [rows, n_exp_used, n_tokens]
-    const ggml_tensor * ids  = dst->src[2]; // ids [n_exp_used, n_tokens]  i32
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
@@ -299,22 +284,17 @@ void ggml_cuda_out_prod_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     cublasHandle_t handle = ctx.cublas_handle();
     CUBLAS_CHECK(cublasSetStream(handle, stream));
 
-    // Zero destination tensor before accumulating
     CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
 
-    // Read ids to host — ids may be CPU-resident (backward graph leaf) or GPU-resident
     const size_t ids_nbytes = ggml_nbytes(ids);
     std::vector<char> ids_host(ids_nbytes);
     if (ids->buffer && !ggml_backend_buffer_is_host(ids->buffer)) {
-        // GPU-resident: copy to host and synchronize so we can inspect the values
         CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ids_nbytes, cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
     } else {
         memcpy(ids_host.data(), ids->data, ids_nbytes);
     }
 
-    // Build per-expert token list: expert_tokens[e] = list of flat indices (iexp*n_tokens+itok)
-    // whose dispatch id equals e.
     std::vector<std::vector<int64_t>> expert_tokens(n_expert);
     for (int64_t itok = 0; itok < n_tokens; ++itok) {
         for (int64_t iexp = 0; iexp < n_exp_used; ++iexp) {
@@ -328,15 +308,14 @@ void ggml_cuda_out_prod_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         }
     }
 
-    // Strides (in elements, not bytes)
-    const int64_t a_stride_exp = src0->nb[1] / sizeof(float); // cols
-    const int64_t a_stride_tok = src0->nb[2] / sizeof(float); // cols * n_exp_used
-    const int64_t b_stride_exp = src1->nb[1] / sizeof(float); // rows
-    const int64_t b_stride_tok = src1->nb[2] / sizeof(float); // rows * n_exp_used
-    const int64_t dst_stride_e = dst->nb[2]  / sizeof(float); // cols * rows
+    const int64_t a_stride_exp = src0->nb[1] / sizeof(float);
+    const int64_t a_stride_tok = src0->nb[2] / sizeof(float);
+    const int64_t b_stride_exp = src1->nb[1] / sizeof(float);
+    const int64_t b_stride_tok = src1->nb[2] / sizeof(float);
+    const int64_t dst_stride_e = dst->nb[2]  / sizeof(float);
 
     const float alpha_one = 1.0f;
-    const float beta_acc  = 1.0f; // accumulate — dst is already zeroed above
+    const float beta_acc  = 1.0f;
     const ggml_prec precision = ggml_prec_get_bwd(dst);
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     const bool use_fp16 = precision == GGML_PREC_F16 && fast_fp16_hardware_available(cc);
@@ -354,11 +333,9 @@ void ggml_cuda_out_prod_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
         const int64_t ntoks_e = (int64_t) toks.size();
 
-        // Allocate contiguous gather buffers on GPU: a_e [cols, ntoks_e], b_e [rows, ntoks_e]
         ggml_cuda_pool_alloc<float> a_gathered(ctx.pool(), cols * ntoks_e);
         ggml_cuda_pool_alloc<float> b_gathered(ctx.pool(), rows * ntoks_e);
 
-        // Gather token vectors from GPU src0/src1 into contiguous buffers
         for (int64_t ti = 0; ti < ntoks_e; ++ti) {
             const int64_t flat = toks[ti];
             const int64_t iexp = flat / n_tokens;
@@ -373,8 +350,6 @@ void ggml_cuda_out_prod_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 rows * sizeof(float), cudaMemcpyDeviceToDevice, stream));
         }
 
-        // dst[:, :, e] += a_gathered @ b_gathered^T
-        // cuBLAS column-major: A=[cols, ntoks_e] lda=cols, B=[rows, ntoks_e] ldb=rows
         if (use_fp16) {
             ggml_cuda_pool_alloc<half> a_gathered_f16(ctx.pool(), static_cast<size_t>(cols * ntoks_e));
             ggml_cuda_pool_alloc<half> b_gathered_f16(ctx.pool(), static_cast<size_t>(rows * ntoks_e));

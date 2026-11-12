@@ -427,7 +427,7 @@ void test_output_options_reject_negative_values() {
     }
 }
 
-} // namespace
+}
 
 int main() {
     test_default_lora_targets();

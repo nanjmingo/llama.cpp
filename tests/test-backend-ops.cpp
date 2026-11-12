@@ -5258,7 +5258,6 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
-// GGML_OP_GATED_DELTA_NET_BACK
 struct test_gated_delta_net_back : public test_case {
     const ggml_type type;
 
@@ -5269,7 +5268,7 @@ struct test_gated_delta_net_back : public test_case {
     const int     v_repeat;
     const bool    permuted;
     const bool    kda;
-    const int64_t K; // snapshot slot count: 1 = final-only, >1 = last K states
+    const int64_t K;
 
     std::string vars() override {
         return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
@@ -5280,7 +5279,6 @@ struct test_gated_delta_net_back : public test_case {
         return "GATED_DELTA_NET_BACK";
     }
 
-    // Compare only the packed gradient slices, excluding the scratch tail in the raw op output.
     bool run_whole_graph() override { return true; }
 
     test_gated_delta_net_back(ggml_type type = GGML_TYPE_F32,
@@ -5294,7 +5292,6 @@ struct test_gated_delta_net_back : public test_case {
         ggml_tensor * k;
         ggml_tensor * v;
         if (permuted) {
-            // create with dims 1 and 2 swapped, then permute back to get non-contiguous layout
             q = ggml_permute(ctx, ggml_new_tensor_4d(ctx, type, head_size, n_seq_tokens, head_count, n_seqs), 0, 2, 1, 3);
             k = ggml_permute(ctx, ggml_new_tensor_4d(ctx, type, head_size, n_seq_tokens, head_count, n_seqs), 0, 2, 1, 3);
             v = ggml_permute(ctx, ggml_new_tensor_4d(ctx, type, head_size, n_seq_tokens, head_count * v_repeat, n_seqs), 0, 2, 1, 3);
@@ -5314,18 +5311,15 @@ struct test_gated_delta_net_back : public test_case {
         ggml_set_name(beta,  "beta");
         ggml_set_name(state, "state");
 
-        // q/k are L2-normalised in qwen35/kimi-linear before delta_net
         q = ggml_l2_norm(ctx, q, 1e-6f);
         k = ggml_l2_norm(ctx, k, 1e-6f);
 
-        // d: incoming gradient, matching the packed [attn_out | K state snapshots] layout of the forward output
         const int64_t state_rows = K * head_size * n_seqs;
         ggml_tensor * d = ggml_new_tensor_2d(ctx, type, head_size * head_count * v_repeat, n_seq_tokens * n_seqs + state_rows);
         ggml_set_name(d, "d");
 
         ggml_tensor * back = ggml_gated_delta_net_back(ctx, q, k, v, g, beta, state, d);
 
-        // sum of GGML_MEM_ALIGN-padded nelements(q,k,v,g,beta,state), i.e. everything before the scratch tail
         const size_t tsize = ggml_type_size(GGML_TYPE_F32);
         size_t n_meaningful_bytes = 0;
         n_meaningful_bytes += GGML_PAD(ggml_nelements(q)     * tsize, GGML_MEM_ALIGN);
@@ -5994,9 +5988,6 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
-// Explicit src1 precision for MUL_MAT_ID must be applied after expert sorting.
-// Using values outside the F16 range catches an accidental F32 -> F16 conversion
-// in the CUDA sorting path before the cuBLAS precision conversion is applied.
 struct test_mul_mat_id_prec_src1 : public test_mul_mat_id {
     const ggml_prec src1_prec;
 
@@ -6257,7 +6248,6 @@ struct test_out_prod : public test_case {
     }
 };
 
-// GGML_OP_OUT_PROD_ID
 struct test_out_prod_id : public test_case {
     const int64_t cols;
     const int64_t rows;
@@ -12330,7 +12320,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F32, GGML_TYPE_F32, 4, 2, false, 8,  1, 64, 64));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 4, 2, false, 8, 16, 64, 64));
 
-    // Explicit src1 precision must be preserved through the MUL_MAT_ID sorting path.
     test_cases.emplace_back(new test_mul_mat_id_prec_src1(GGML_PREC_F32));
     test_cases.emplace_back(new test_mul_mat_id_prec_src1(GGML_PREC_BF16));
 
@@ -12547,7 +12536,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                   256, 16, 16, {1, 1}, {nr2, 1}));
     }
 
-    // OUT_PROD_ID: small, multi-token, and larger expert routing layouts.
     test_cases.emplace_back(new test_out_prod_id(16, 12, 4, 2, 5));
     test_cases.emplace_back(new test_out_prod_id(32, 24, 8, 4, 10));
     test_cases.emplace_back(new test_out_prod_id(64, 32, 16, 4, 16));
@@ -13586,13 +13574,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,   4, 2, 1, false, true,  /*K=*/4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32,   4, 2, 2, false, true,  /*K=*/4));
 
-    // GATED_DELTA_NET_BACK: scalar/vector gates, strided inputs, multiple sequences, and state snapshots.
     test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 16, 1, 1));
-    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 16, 2, 1, 1, false, false, /*K=*/2));
-    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 32, 4, 1, 1, false, false, /*K=*/4));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 16, 2, 1, 1, false, false, 2));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 32, 4, 1, 1, false, false, 4));
     test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 16, 4, 2, 1, true));
     test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 32, 4, 2, 2, false, true));
-    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 16, 8, 1, 1, false, false, /*K=*/3));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 16, 8, 1, 1, false, false, 3));
     test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 16, 65, 1));
 
     // gdn + cache cpy fusion (K > 1)

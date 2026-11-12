@@ -417,7 +417,7 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
-        bool no_alloc_kv_cache; // do not allocate KV data buffers for full-context training
+        bool no_alloc_kv_cache;
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -1733,21 +1733,16 @@ extern "C" {
         void * get_opt_pars_ud;                     // userdata for calculating optimizer parameters
 
         enum ggml_opt_optimizer_type optimizer_type;
-        enum ggml_type optimizer_state_type;        // AdamW moment storage type; defaults to F32
+        enum ggml_type optimizer_state_type;
     };
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
-    // Set the optimizer RNG seed before training; optimizer-state import restores the checkpoint RNG state.
     LLAMA_API void llama_opt_set_seed(struct llama_context * lctx, uint32_t seed);
-    // Set the gradient accumulation period between optimizer steps. Only supported for dynamic graphs.
     LLAMA_API void llama_opt_set_opt_period(struct llama_context * lctx, int32_t opt_period);
-    // Collect trainable-parameter gradient statistics every N optimizer updates; 0 disables collection.
     LLAMA_API void llama_opt_set_grad_stats_interval(struct llama_context * lctx, int32_t interval);
-    // Export or import optimizer state at an optimizer-step boundary. The state is opaque and versioned.
     LLAMA_API size_t llama_opt_state_size(const struct llama_context * lctx);
     LLAMA_API bool llama_opt_state_export(const struct llama_context * lctx, void * data, size_t size);
     LLAMA_API bool llama_opt_state_import(struct llama_context * lctx, const void * data, size_t size);
-    // Shuffle the first idata dataset entries with the optimizer RNG, or all entries if idata is negative.
     LLAMA_API void llama_opt_dataset_shuffle(
             struct llama_context * lctx,
             ggml_opt_dataset_t     dataset,
@@ -1762,7 +1757,6 @@ extern "C" {
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
 
-    // Train on [idata_start, idata_split), then evaluate only on [idata_split, idata_eval_end).
     LLAMA_API void llama_opt_epoch_range(
             struct llama_context    * lctx,
             ggml_opt_dataset_t        dataset,
@@ -1774,7 +1768,6 @@ extern "C" {
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
 
-    // Returns false when the abort callback requests cancellation or epoch execution fails.
     LLAMA_API bool llama_opt_epoch_range_ex(
             struct llama_context    * lctx,
             ggml_opt_dataset_t        dataset,

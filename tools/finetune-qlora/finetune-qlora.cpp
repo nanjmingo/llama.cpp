@@ -1,8 +1,3 @@
-// QLoRA fine-tuning for quantized GGUF models.
-//
-// LoRA A/B tensors can use F32, F16, or BF16 storage. QLoRA-only arguments are parsed
-// locally so this example does not need to modify common/arg.h or common/arg.cpp.
-// Resumable checkpoints keep optimizer and training progress separate from adapter weights.
 
 #include "arg.h"
 #include "chat.h"
@@ -22,7 +17,6 @@
 #include "schedule.h"
 #include "save-worker.h"
 
-// Internal adapter struct is needed to mark the loaded LoRA tensors trainable.
 #include "../../src/llama-adapter.h"
 #include "../../src/llama-model.h"
 
@@ -852,8 +846,8 @@ struct save_context {
     int32_t gradient_accumulation_steps = 1;
     int64_t dataset_windows = 0;
     std::vector<int64_t> dataset_permutation;
-    int64_t epoch = 0; // one-based
-    int64_t window_start = 0; // windows already consumed in this epoch
+    int64_t epoch = 0;
+    int64_t window_start = 0;
     int64_t validation_window_start = 0;
     bool validation_progress_started = false;
     double training_loss_sum = 0.0;
@@ -872,8 +866,6 @@ struct save_context {
     std::shared_ptr<qlora_save_job> active_job;
 };
 
-// The callback is intentionally an orchestrator only: progress, logical-step
-// updates, and snapshot writes stay separate so each can be extended in place.
 static thread_local save_context * g_save_context = nullptr;
 
 struct save_context_scope {
@@ -1807,14 +1799,12 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // Settings required for training.
     params.load_mode = LLAMA_LOAD_MODE_NONE;
     params.warmup = false;
     params.no_alloc_kv_cache = true;
 
     const float lora_alpha = qparams.lora_alpha > 0.0f ? qparams.lora_alpha : static_cast<float>(qparams.lora_rank);
 
-    // Step 1: read architecture metadata before loading the model.
     std::string arch;
     {
         ggml_context * meta_ctx_raw = nullptr;
@@ -1842,8 +1832,6 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // Load the base model without an adapter. Both new and existing adapters are
-    // prepared as a temporary GGUF and then loaded through the upstream loader.
     lora_tensor_refs output_refs;
     lora_tensor_refs training_refs;
 

@@ -19,4 +19,4 @@ qlora_model_experiment::StepResult run_training_step_check(qlora_model_experimen
 bool run_update_gradient_check(const GradientReference & reference,
                                const qlora_model_experiment::StepResult & step);
 
-} // namespace qlora_model_test
+}

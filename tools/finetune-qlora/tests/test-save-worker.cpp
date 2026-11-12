@@ -60,7 +60,7 @@ void test_worker_reports_failure_and_can_be_reused() {
             "worker did not complete the task submitted after a failure");
 }
 
-} // namespace
+}
 
 int main() {
     try {

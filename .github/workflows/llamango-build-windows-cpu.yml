@@ -63,9 +63,6 @@ jobs:
           }
 
           if ($env:TARGET_ARCHITECTURE -eq 'arm64') {
-            # Keep the shared requirements unchanged. NumPy 2.2.6 has no
-            # CPython 3.12 Windows ARM64 wheel, so replace only its constraint
-            # for this job and require the published ARM64 wheel.
             $requirementsFile = Join-Path $env:RUNNER_TEMP 'requirements-convert_legacy_llama-windows-arm64.txt'
             Get-Content -LiteralPath 'requirements/requirements-convert_legacy_llama.txt' |
               Where-Object { $_ -notmatch '^\s*numpy(?:\s|[<=>~!;]|$)' } |
@@ -86,8 +83,6 @@ jobs:
             exit $LASTEXITCODE
           }
 
-          # PyTorch 2.11.0 does not publish Windows ARM64 wheels. 2.12.0
-          # publishes CPU wheels for both win_amd64 and win_arm64 (Python 3.12).
           python -m pip install --disable-pip-version-check `
             --extra-index-url https://download.pytorch.org/whl/cpu `
             'torch==2.12.0'
@@ -159,9 +154,6 @@ jobs:
         id: verify_ccache
         shell: pwsh
         run: |
-          # Multiple ccache.exe binaries may be present on Windows runners
-          # (for example, the downloaded release and Strawberry Perl). Select
-          # the first match on PATH instead of treating all matches as one path.
           $ccache = Get-Command ccache -CommandType Application -ErrorAction Stop |
             Select-Object -First 1
           Write-Host "Using ccache: $($ccache.Source)"
@@ -266,9 +258,6 @@ jobs:
             }
           }
 
-          # GGML_OPENMP_FETCH looks for these files before attempting its own
-          # CMake file(DOWNLOAD). Pre-populate that directory and retry the
-          # GitHub asset request here, validating all downloaded content.
           $root = Join-Path $env:GITHUB_WORKSPACE "build/_deps/llvm-openmp-$version-$openmpArch"
           $libraryDir = Join-Path $root 'lib'
           $runtimeDir = Join-Path $root 'bin'
@@ -346,8 +335,6 @@ jobs:
             Remove-Item -LiteralPath $extractDir -Recurse -Force
           }
 
-          # CMake also downloads this license when GGML_OPENMP_FETCH is enabled.
-          # Fetch it here through PowerShell and verify the upstream-pinned hash.
           $licensePath = Join-Path $root 'LICENSE.TXT'
           $licenseSha256 = 'fdad1758a9e1f9d5a81e18879b3406772115edc92c24bfa36b70c654f325e8e4'
           $licenseValid = $false
@@ -424,7 +411,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
-          # llamango-tests is a custom target and is intentionally not part of the default ALL target.
           cmake --build build --config Release --target llamango-tests --parallel $env:NUMBER_OF_PROCESSORS
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
@@ -456,7 +442,6 @@ jobs:
           $stageDir = Join-Path $env:RUNNER_TEMP "llamango-windows-$env:ARCH"
           $distDir = Join-Path $env:GITHUB_WORKSPACE "dist"
           New-Item -ItemType Directory -Force -Path $stageDir, $distDir | Out-Null
-          # Preserve all CMake runtime outputs and their relative paths, not only the QLoRA executable.
           Copy-Item -Path (Join-Path $binDir "*") -Destination $stageDir -Recurse -Force
           Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE "LICENSE") -Destination $stageDir
 
@@ -491,7 +476,6 @@ jobs:
         if: always() && steps.install_ccache.outcome == 'success' && steps.verify_ccache.outcome == 'success'
         shell: pwsh
         run: |
-          # Match the selection logic used by the verification step above.
           $ccache = Get-Command ccache -CommandType Application -ErrorAction Stop |
             Select-Object -First 1
           & $ccache.Source --show-stats

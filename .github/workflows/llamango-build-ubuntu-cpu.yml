@@ -108,7 +108,6 @@ jobs:
         run: |
           set -euo pipefail
           cmake --build build --parallel "$(nproc)"
-          # llamango-tests is a custom target and is intentionally not part of the default ALL target.
           cmake --build build --target llamango-tests --parallel "$(nproc)"
 
       - name: Package Ubuntu CPU build

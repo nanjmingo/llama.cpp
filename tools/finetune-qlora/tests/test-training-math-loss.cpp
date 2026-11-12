@@ -66,8 +66,6 @@ void test_cross_entropy_gradient_matches_reference() {
         0.1f,  0.2f, 0.3f,
        -1.0f,  2.0f, 0.5f,
     };
-    // Include fractional token weights and a fully masked position. The loss
-    // implementation accepts weighted one-hot labels, not just {0, 1} labels.
     const std::vector<float> labels_values = {
         0.75f, 0.0f, 0.0f,
         0.0f,  0.0f, 0.0f,
@@ -121,8 +119,6 @@ void test_cross_entropy_gradient_matches_reference() {
                 "cross-entropy logits gradient differs from (softmax * sum(labels) - labels) / positions");
     }
 
-    // Check the CPU backward implementation against central finite differences
-    // for every logit, including logits in the masked position.
     float * logits_data = static_cast<float *>(t.logits->data);
     constexpr float epsilon = 1e-3f;
     for (size_t i = 0; i < logits_values.size(); ++i) {
@@ -140,11 +136,11 @@ void test_cross_entropy_gradient_matches_reference() {
 }
 
 
-} // namespace
+}
 
 void run_training_math_loss_tests() {
     test_cross_entropy_masking_and_normalization();
     test_cross_entropy_gradient_matches_reference();
 }
 
-} // namespace qlora_training_math
+}

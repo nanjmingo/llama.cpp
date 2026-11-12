@@ -325,8 +325,6 @@ void test_ggml_opt_cross_entropy_gradient_accumulation() {
     const std::vector<float> a_values = { -0.3f, 0.1f, 0.4f, -0.2f };
     const std::vector<float> b_values = { 0.1f, -0.2f, 0.05f, 0.3f, -0.1f, 0.2f };
 
-    // The direct logical-batch graph is the reference for ggml-opt's internal
-    // scaled-loss and gradient-accumulation path.
     const std::vector<float> base_logits_values(logical_positions * 3, 0.0f);
     lora_batch_graph logical = make_lora_batch_graph(
         input_values, labels_values, base_logits_values, logical_positions,
@@ -437,8 +435,6 @@ void test_ggml_opt_normalizes_accumulated_gradient_by_target_weight() {
                 "normalized accumulated B update differs from the target-weight mean reference");
     }
 
-    // A one-window final accumulation group with one target must still produce
-    // the same token-mean gradient, rather than a context-length-scaled update.
     const std::vector<float> single_inputs(input_values.begin(), input_values.begin() + input_dim * physical_positions);
     const std::vector<float> single_labels = {
         0.0f, 1.0f, 0.0f,
@@ -941,7 +937,7 @@ void test_adamw_supports_parameter_and_state_types() {
 }
 
 
-} // namespace
+}
 
 void run_training_math_ggml_opt_tests() {
     test_ggml_opt_cross_entropy_gradient_accumulation();
@@ -959,4 +955,4 @@ void run_training_math_adamw_test() {
     test_adamw_supports_parameter_and_state_types();
 }
 
-} // namespace qlora_training_math
+}

@@ -66,7 +66,6 @@ void test_lora_initial_backward_and_finite_difference() {
             "a small negative-gradient step should lower the fixed-batch loss");
     std::fill(b_data, b_data + ggml_nelements(t.b), 0.0f);
 
-    // Move away from B=0 so both A and B have nontrivial gradients for finite-difference comparison.
     const float b_initial[] = { 0.1f, -0.2f, 0.05f, 0.3f, -0.1f, 0.2f };
     std::copy(std::begin(b_initial), std::end(b_initial), b_data);
     ggml_graph_reset(t.backward);
@@ -160,7 +159,7 @@ void test_rank_sweep_first_update_invariants() {
 }
 
 
-} // namespace
+}
 
 void run_training_math_lora_gradient_tests() {
     test_lora_initial_backward_and_finite_difference();
@@ -170,4 +169,4 @@ void run_training_math_lora_rank_tests() {
     test_rank_sweep_first_update_invariants();
 }
 
-} // namespace qlora_training_math
+}

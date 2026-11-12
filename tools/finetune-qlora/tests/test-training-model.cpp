@@ -29,7 +29,7 @@ ModelOptions parse_regression_options(int argc, char ** argv) {
     return options;
 }
 
-} // namespace
+}
 
 int main(int argc, char ** argv) {
     try {

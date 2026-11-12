@@ -276,7 +276,6 @@ static __global__ void mul_mat_id_back_scatter_kernel(
 
     for (int64_t col = blockIdx.x * blockDim.x + threadIdx.x;
          col < input_dim; col += gridDim.x * blockDim.x) {
-        // Several routed slots may contribute to one broadcast input vector.
         atomicAdd(dst_route + col, src_route[col]);
     }
 }
@@ -334,8 +333,6 @@ void ggml_cuda_mul_mat_id_back(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 
     CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
 
-    // Group routing pairs on the GPU. Only the expert boundaries are copied
-    // back to the host, avoiding a full routing-ID round trip and CPU sort.
     if (n_routes == 0) {
         return;
     }
@@ -345,7 +342,6 @@ void ggml_cuda_mul_mat_id_back(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     ggml_cuda_pool_alloc<int32_t> ids_src(ctx.pool(), static_cast<size_t>(n_routes));
 
     const int si1 = static_cast<int>(ids->nb[1] / sizeof(int32_t));
-    // The helper may leave tile_spec[0] unused when no expert owns column 0.
     const size_t n_tile_specs = static_cast<size_t>(n_experts + 1);
     CUDA_CHECK(cudaMemsetAsync(tile_spec.ptr, 0xFF,
         n_tile_specs * sizeof(ggml_cuda_mm_id_tile_spec), stream));
@@ -361,7 +357,7 @@ void ggml_cuda_mul_mat_id_back(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         static_cast<int>(n_routes),
         si1,
         static_cast<int>(n_used),
-        /*write_inverse =*/ false,
+         false,
         stream);
     CUDA_CHECK(cudaGetLastError());
 
@@ -418,9 +414,6 @@ void ggml_cuda_mul_mat_id_back(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     GGML_ASSERT(!use_fp16 || as->type == GGML_TYPE_F16 || to_fp16 != nullptr || to_fp32 != nullptr);
     GGML_ASSERT(!use_bf16 || as->type == GGML_TYPE_BF16 || to_bf16 != nullptr || to_fp32 != nullptr);
     GGML_ASSERT(!use_fp32 || as->type == GGML_TYPE_F32 || to_fp32 != nullptr);
-    // Convert only a bounded slice of each expert matrix at a time. This is
-    // important for large quantized experts, where a full FP16/FP32 copy can
-    // require hundreds of megabytes of additional device memory.
     constexpr int64_t min_weight_chunk_dim = 1024;
     constexpr int64_t max_weight_chunk_dim = 8192;
     constexpr int64_t max_batch_routes = 64;
@@ -450,8 +443,6 @@ void ggml_cuda_mul_mat_id_back(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         weights_f32.alloc(static_cast<size_t>(input_dim * weight_chunk_capacity));
     }
 
-    // Bound temporary memory independently of the number of tokens routed to
-    // one expert. Large expert batches are processed as several GEMM chunks.
     ggml_cuda_pool_alloc<float> gathered(ctx.pool());
     ggml_cuda_pool_alloc<half> gathered_f16(ctx.pool());
     ggml_cuda_pool_alloc<nv_bfloat16> gathered_bf16(ctx.pool());

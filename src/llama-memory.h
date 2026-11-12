@@ -30,7 +30,6 @@ struct llama_memory_params {
     // only simulate the memory allocations
     bool no_alloc;
 
-    // skip KV data buffer allocations when the cache is not read or written
     bool no_alloc_kv_cache;
 };
 

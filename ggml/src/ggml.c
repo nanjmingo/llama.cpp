@@ -3526,7 +3526,6 @@ struct ggml_tensor * ggml_mul_mat_id(
     return result;
 }
 
-// ggml_mul_mat_id_back
 struct ggml_tensor * ggml_mul_mat_id_back(
         struct ggml_context * ctx,
         struct ggml_tensor  * as,
@@ -3582,8 +3581,6 @@ struct ggml_tensor * ggml_out_prod(
     result->src[0] = a;
     result->src[1] = b;
 
-    // Keep low-precision weights only when the selected backend supports this operation.
-    // CPU_REPACK data cannot be cast through the ordinary quantized format.
     if (a->type != GGML_TYPE_F32) {
         bool keep_type = false;
         bool a_is_cpu_repacked = false;
@@ -3612,18 +3609,6 @@ struct ggml_tensor * ggml_out_prod(
     return result;
 }
 
-// ggml_out_prod_id
-//
-// Scattered outer-product for the MUL_MAT_ID backward pass.
-//
-//   a:   [cols, n_expert_used, n_tokens]  F32  — activations (src1 of MUL_MAT_ID)
-//   b:   [rows, n_expert_used, n_tokens]  F32  — upstream gradient
-//   ids: [n_expert_used, n_tokens]        I32  — expert dispatch indices (src2 of MUL_MAT_ID)
-//   result: [cols, rows, n_expert, 1]     F32
-//
-//   result[:, :, e] += sum_{(i,t): ids[i,t]==e} a[:, i, t] ⊗ b[:, i, t]
-//
-// Computes the gradient w.r.t. the expert weight matrices (src0) of MUL_MAT_ID.
 struct ggml_tensor * ggml_out_prod_id(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
@@ -3633,10 +3618,10 @@ struct ggml_tensor * ggml_out_prod_id(
     GGML_ASSERT(a->type   == GGML_TYPE_F32);
     GGML_ASSERT(b->type   == GGML_TYPE_F32);
     GGML_ASSERT(ids->type == GGML_TYPE_I32);
-    GGML_ASSERT(a->ne[1]  == b->ne[1]);   // n_expert_used matches
-    GGML_ASSERT(a->ne[2]  == b->ne[2]);   // n_tokens matches
-    GGML_ASSERT(ids->ne[0] == a->ne[1]);  // n_expert_used matches ids
-    GGML_ASSERT(ids->ne[1] == a->ne[2]);  // n_tokens matches ids
+    GGML_ASSERT(a->ne[1]  == b->ne[1]);
+    GGML_ASSERT(a->ne[2]  == b->ne[2]);
+    GGML_ASSERT(ids->ne[0] == a->ne[1]);
+    GGML_ASSERT(ids->ne[1] == a->ne[2]);
     GGML_ASSERT(n_expert > 0);
 
     const int64_t ne[4] = { a->ne[0], b->ne[0], n_expert, 1 };
@@ -4186,7 +4171,6 @@ struct ggml_tensor * ggml_get_rows_back(
     GGML_ASSERT(b->type == GGML_TYPE_I32);
     GGML_ASSERT(a->ne[0] == c->ne[0]);
 
-    // Support both 2D and 3D: result shape matches c (the source tensor shape)
     // TODO: implement non F32 return
     struct ggml_tensor * result;
     if (c->ne[2] > 1) {
@@ -5872,7 +5856,6 @@ struct ggml_tensor * ggml_flash_attn_back(
 
     struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
 
-    // scale, max_bias, logit_softcap of the forward op, then the offsets
     memcpy(result->op_params, fa->op_params, 3*sizeof(float));
     ggml_set_op_params_i32(result, 3, (int32_t) offs_k);
     ggml_set_op_params_i32(result, 4, (int32_t) offs_v);
@@ -6666,7 +6649,6 @@ struct ggml_tensor * ggml_gated_delta_net(
     return result;
 }
 
-// ggml_gated_delta_net_back
 
 struct ggml_tensor * ggml_gated_delta_net_back(
         struct ggml_context * ctx,
@@ -6689,9 +6671,6 @@ struct ggml_tensor * ggml_gated_delta_net_back(
     GGML_ASSERT(q->ne[3] == k->ne[3]);
     GGML_ASSERT(v->ne[1] % q->ne[1] == 0);
 
-    // Gradients of all six inputs are packed as contiguous, MEM_ALIGN-padded
-    // slices of a single 1D result, in src order: q, k, v, g, beta, state.
-    // ggml_compute_backward re-derives the same offsets to scatter into grads.
     const size_t tsize = ggml_type_size(GGML_TYPE_F32);
     size_t end = 0;
     end += GGML_PAD(ggml_nelements(q)     * tsize, GGML_MEM_ALIGN);
@@ -6713,10 +6692,6 @@ struct ggml_tensor * ggml_gated_delta_net_back(
 
     struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nelements);
 
-    // d holds the grad of the forward output, packed as [attn_out (S_v*H, n_tokens*n_seqs) |
-    // K state snapshots (S_v*H, K*S_v*n_seqs)]. The state input's ne[1] is always S_v so it can't
-    // carry K; recover K from d's layout once here (validating the shape) and store it as an op
-    // param so every backend reads it uniformly, mirroring the forward op.
     GGML_ASSERT(d->ne[0] == gdn_S_v * gdn_H);
     const int64_t gdn_state_rows = d->ne[1] - gdn_n_tokens * gdn_n_seqs;
     GGML_ASSERT(gdn_state_rows > 0);
@@ -7326,22 +7301,6 @@ static void ggml_compute_backward(
             }
         } break;
         case GGML_OP_MUL_MAT_ID: {
-            // Backward pass for indirect matrix multiplication (MoE).
-            //
-            // Forward:  dst[rows, n_exp_used, n_tokens] = as[:,:,ids[i,t]] @ b[:,i,t]
-            //   src0 = as  [cols, rows, n_expert]    — expert weight matrices
-            //   src1 = b   [cols, n_exp_used, n_tokens] — token activations
-            //   src2 = ids [n_exp_used, n_tokens]    — expert dispatch indices (I32)
-            //
-            // Gradient w.r.t. src1 (activations):
-            //   grad_b[:,i,t] = as[:,:,ids[i,t]]^T @ grad[:,i,t]
-            //   → computed without transposing packed quantized weights, and reduced for broadcast slots
-            //
-            // Gradient w.r.t. src0 (expert weights, only when F32 i.e. LoRA):
-            //   grad_as[:,:,e] += sum_{(i,t): ids[i,t]==e} b[:,i,t] ⊗ grad[:,i,t]
-            //   → computed via OUT_PROD_ID
-            //
-            // Quantized src0 is frozen; its weight gradient is disabled in grads_needed below.
             if (src0_needs_grads) {
                 const int64_t n_expert = src0->ne[2];
                 struct ggml_tensor * src1_expanded = src1;
@@ -7636,7 +7595,6 @@ static void ggml_compute_backward(
                     }
                 } break;
                 case GGML_UNARY_OP_SIGMOID: {
-                    // d/dx sigmoid(x) = sigmoid(x) * (1 - sigmoid(x)) = tensor - tensor^2
                     if (src0_needs_grads) {
                         struct ggml_tensor * dsigmoid = ggml_sub(ctx, tensor, ggml_sqr(ctx, tensor));
                         ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad, dsigmoid));
@@ -7688,7 +7646,6 @@ static void ggml_compute_backward(
                 break;
             }
             struct ggml_tensor * back = ggml_flash_attn_back(ctx, tensor, ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad));
-            // each part is a contiguous tensor of the shape of its source
             struct ggml_tensor * srcs[4] = { src0, src1, src2, sinks };
             const size_t         idx[4]  = { isrc0, isrc1, isrc2, is };
             const bool           need[4] = { src0_needs_grads, src1_needs_grads, src2_needs_grads, sinks_needs_grads };
@@ -7955,8 +7912,6 @@ void ggml_build_backward_expand(
                 ignore_src[2] = true;
                 break;
 
-            // MUL_MAT_ID: expert dispatch indices are integer — no gradient. Frozen
-            // expert weights still propagate gradients to their input activations.
             case GGML_OP_MUL_MAT_ID:
                 if (ggml_is_quantized(node->src[0]->type)) {
                     ignore_src[0] = true;
@@ -7964,17 +7919,13 @@ void ggml_build_backward_expand(
                 ignore_src[2] = true;
                 break;
 
-            // SET_ROWS is an in-place row scatter write, commonly used for KV-cache updates.
-            // There is no backward path from the destination to the written values or indices.
             case GGML_OP_SET_ROWS:
                 ignore_src[0] = true;
                 ignore_src[1] = true;
                 break;
 
-            // Ops with no backward implementation — stop gradient through all sources so the
-            // backward graph builder never tries to propagate through them.
-            case GGML_OP_SSM_CONV:       // Mamba causal conv1d
-            case GGML_OP_SSM_SCAN:       // Mamba selective scan
+            case GGML_OP_SSM_CONV:
+            case GGML_OP_SSM_SCAN:
                 ignore_src[0] = true;
                 ignore_src[1] = true;
                 ignore_src[2] = true;

@@ -1281,7 +1281,6 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
 void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     const auto * attn_ctx = mctx->get_attn();
 
-    // Inputs that are not used by the allocated graph have no buffer (e.g. during training).
     if (inp_attn->self_k_idxs && inp_attn->self_k_idxs->buffer) {
         attn_ctx->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     }
@@ -1334,7 +1333,6 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
     const auto * attn_ctx = mctx->get_attn();
 
-    // Inputs that are not used by the allocated graph have no buffer (e.g. during training).
     if (inp_attn->self_k_idxs && inp_attn->self_k_idxs->buffer) {
         attn_ctx->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     }
@@ -1701,7 +1699,6 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
         cb_func(ubatch, cur, name, il);
     }
 }
-
 
 
 ggml_tensor * llm_graph_context::build_cvec(

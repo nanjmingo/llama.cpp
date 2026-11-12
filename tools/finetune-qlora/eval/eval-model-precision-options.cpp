@@ -100,7 +100,7 @@ std::vector<float> parse_float_list(const std::string & value, const std::string
     return result;
 }
 
-} // namespace
+}
 
 Options parse_options(int argc, char ** argv) {
     Options options;
@@ -173,4 +173,4 @@ Options parse_options(int argc, char ** argv) {
     return options;
 }
 
-} // namespace qlora_model_eval
+}

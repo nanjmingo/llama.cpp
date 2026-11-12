@@ -47,4 +47,4 @@ inline std::string format_loss_delta(double value) {
     return value > 0.0 ? "+" + result : result;
 }
 
-} // namespace qlora_model_eval
+}

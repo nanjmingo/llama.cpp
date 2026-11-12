@@ -67,7 +67,7 @@ struct ParameterPairState {
     std::vector<float> initial_b;
 };
 
-} // namespace detail
+}
 
 struct Model::Impl {
     ModelOptions options;
@@ -97,4 +97,4 @@ struct Experiment::Impl {
     Impl(Model::Impl & shared, ContextMode mode);
 };
 
-} // namespace qlora_model_experiment
+}

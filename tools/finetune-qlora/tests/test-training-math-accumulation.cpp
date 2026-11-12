@@ -101,9 +101,6 @@ void test_microbatch_gradient_accumulation_matches_logical_batch() {
          0.4f, 1.2f, -0.7f,
          0.1f, 0.2f,  0.3f,
     };
-    // The first physical microbatch is fully masked; the second is fully supervised.
-    // This verifies that gradient accumulation does not accidentally normalize by
-    // the number of supervised tokens in each microbatch.
     const std::vector<float> labels_values = {
         0.0f, 0.0f, 0.0f,
         0.0f, 0.0f, 0.0f,
@@ -149,11 +146,11 @@ void test_microbatch_gradient_accumulation_matches_logical_batch() {
 }
 
 
-} // namespace
+}
 
 void run_training_math_accumulation_tests() {
     test_microbatch_gradient_accumulation_matches_logical_batch();
     test_lora_parameter_gradients_accumulate_across_microbatches();
 }
 
-} // namespace qlora_training_math
+}

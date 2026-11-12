@@ -63,7 +63,7 @@ void test_optimizer_callback_uses_schedule_value() {
     require_close(schedule.current_lr, 5e-5f, "schedule should record the learning rate passed to optimizer");
 }
 
-} // namespace
+}
 
 int main() {
     try {

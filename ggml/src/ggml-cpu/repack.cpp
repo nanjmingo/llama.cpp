@@ -2459,7 +2459,6 @@ void ggml_gemm_q8_0_4x4_q8_0_generic(int                        n,
 }
 
 
-
 void ggml_gemm_q8_0_4x8_q8_0_generic(int                        n,
                                      float * GGML_RESTRICT      s,
                                      size_t                     bs,
@@ -4581,7 +4580,6 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             case GGML_OP_OUT_PROD:
                 if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> ||
                               std::is_same_v<BLOC_TYPE, block_q8_0>) {
-                    // One F32 row per packed row in the repack group, per thread.
                     const size_t row_size = GGML_PAD((size_t) op->src[0]->ne[0] * sizeof(float), 64);
                     size = row_size * NB_COLS * n_threads;
                     return true;
@@ -4661,8 +4659,6 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             const int64_t nblocks = ne00 / qk;
             const size_t repacked_row_group_stride = nb01 * NB_COLS;
 
-            // Each thread owns output rows. Dequantize one repack group at a time,
-            // then reuse its rows for all output rows owned by this thread.
             for (int64_t ir = ir0; ir < ir1; ++ir) {
                 const int64_t i3 = ir / (ne2 * ne1);
                 const int64_t i2 = (ir - i3 * ne2 * ne1) / ne1;
@@ -4687,7 +4683,6 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                                 const int byte_idx = byte_group * (NB_COLS * INTER_SIZE) + p * INTER_SIZE + byte_offset;
                                 const uint8_t byte_value = ((const uint8_t *) blocks[b].qs)[byte_idx];
                                 const uint8_t nibble = (j < qk / 2) ? (byte_value & 0x0F) : (byte_value >> 4);
-                                // Q4_0 repacking XORs each nibble with 8, encoding signed int4 values.
                                 const int8_t q = nibble < 8 ? (int8_t) nibble : (int8_t) nibble - 16;
                                 row[b * qk + j] = (float) q * scale;
                             }

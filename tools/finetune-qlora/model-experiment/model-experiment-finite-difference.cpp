@@ -44,5 +44,4 @@ FiniteDifferenceResult evaluate_finite_difference(Model & model, size_t pair_ind
 }
 
 
-
-} // namespace qlora_model_experiment
+}

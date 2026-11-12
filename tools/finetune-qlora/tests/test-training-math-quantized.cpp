@@ -312,7 +312,7 @@ void test_trainable_mul_mat_id_weight_gradient_with_broadcast() {
 }
 
 
-} // namespace
+}
 
 void run_training_math_quantized_test() {
     test_quantized_matmul_activation_gradient();
@@ -321,4 +321,4 @@ void run_training_math_quantized_test() {
     test_trainable_mul_mat_id_weight_gradient_with_broadcast();
 }
 
-} // namespace qlora_training_math
+}

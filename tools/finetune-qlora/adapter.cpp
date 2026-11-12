@@ -19,7 +19,6 @@
 #include <utility>
 #include <vector>
 
-// Return true for the special embedding tensor layout used by llama.cpp LoRA.
 static bool tensor_is_token_embedding(const std::string & name) {
     static const std::string suffix = "token_embd.weight";
     return name.size() >= suffix.size() &&
@@ -87,14 +86,13 @@ static bool initialize_lora_weights(ggml_tensor * lora_a, ggml_tensor * lora_b, 
     return tensor_write_f32_values(lora_a, data_a) && tensor_write_f32_values(lora_b, data_b);
 }
 
-// Extract the transformer block index from "blk.NN.<rest>"; return -1 on mismatch.
 static int tensor_layer_index(const char * name) {
     const char * block = strstr(name, "blk.");
     if (!block) {
         return -1;
     }
 
-    block += 4;  // Skip "blk.".
+    block += 4;
     char * end         = nullptr;
     long   layer_index = strtol(block, &end, 10);
     if (end == block || (*end != '.' && *end != '\0')) {
@@ -189,9 +187,6 @@ bool validate_lora_targets(const std::vector<std::pair<std::string, ggml_tensor 
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// LoRA tensor allocation
-// ---------------------------------------------------------------------------
 
 lora_tensors alloc_lora_tensors(const std::vector<std::pair<std::string, ggml_tensor *>> & model_tensors,
                                 const std::vector<std::string> & targets,
@@ -273,7 +268,6 @@ lora_tensors alloc_lora_tensors(const std::vector<std::pair<std::string, ggml_te
         }
     }
 
-    // Allocate backend buffer for all LoRA tensors at once
     lt.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(lt.ctx.get(), ggml_backend_cpu_buffer_type()));
     if (!lt.buf) {
         LOG_ERR("%s: failed to allocate LoRA tensor buffer\n", __func__);
@@ -293,9 +287,6 @@ lora_tensors alloc_lora_tensors(const std::vector<std::pair<std::string, ggml_te
     return lt;
 }
 
-// ---------------------------------------------------------------------------
-// Existing adapter conversion
-// ---------------------------------------------------------------------------
 
 namespace {
 
@@ -390,7 +381,6 @@ static bool load_source_lora(const std::string & path,
     for (int64_t i = 0; i < gguf_get_n_tensors(gguf.get()); ++i) {
         const std::string tensor_name = gguf_get_tensor_name(gguf.get(), i);
         if (name_ends_with(tensor_name, "_norm.weight")) {
-            // Match the upstream LoRA loader, which currently ignores norm-vector tensors.
             continue;
         }
         const bool is_a = name_ends_with(tensor_name, ".lora_a");
@@ -476,7 +466,7 @@ static bool load_source_lora(const std::string & path,
     return true;
 }
 
-} // namespace
+}
 
 bool validate_lora_adapter_rank(const std::string & input_path,
                                 const std::string & expected_arch,
@@ -721,11 +711,8 @@ lora_tensors transform_lora_tensors(const std::string & input_path,
     return result;
 }
 
-// ---------------------------------------------------------------------------
-// Param filter: only train lora_a / lora_b tensors
-// ---------------------------------------------------------------------------
 
-bool lora_param_filter(const struct ggml_tensor * t, void * /*ud*/) {
+bool lora_param_filter(const struct ggml_tensor * t, void * ) {
     const char * n   = t->name;
     const size_t len = strlen(n);
     if (len > 7 && strcmp(n + len - 7, ".lora_a") == 0) {
@@ -737,9 +724,6 @@ bool lora_param_filter(const struct ggml_tensor * t, void * /*ud*/) {
     return false;
 }
 
-// ---------------------------------------------------------------------------
-// Save adapter GGUF
-// ---------------------------------------------------------------------------
 
 static std::string basename_from_path(const std::string & path) {
     const size_t pos = path.find_last_of("/\\");
@@ -883,8 +867,6 @@ bool save_lora_adapter_snapshot(const lora_adapter_snapshot & snapshot,
         }
     }
 
-    // Write to a sibling temporary file first so a failed periodic snapshot
-    // does not leave a partly-written GGUF at the requested destination.
     const std::string temp_path = out_path + ".tmp";
     std::remove(temp_path.c_str());
     std::ofstream fout(temp_path, std::ios::binary | std::ios::trunc);
@@ -924,10 +906,6 @@ bool save_lora_adapter_snapshot(const lora_adapter_snapshot & snapshot,
         return false;
     }
 
-    // POSIX rename atomically replaces an existing destination. On platforms
-    // where it does not, temporarily move the old destination aside and restore
-    // it if installing the completed file fails; never delete the old adapter
-    // before the replacement has succeeded.
     if (std::rename(temp_path.c_str(), out_path.c_str()) != 0) {
         const std::string backup_path = out_path + ".previous";
         if (std::rename(out_path.c_str(), backup_path.c_str()) != 0) {

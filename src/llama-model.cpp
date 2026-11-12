@@ -3401,7 +3401,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
-                            /* no_alloc_kv_cache */ params.no_alloc_kv_cache);
+                             params.no_alloc_kv_cache);
                     } else if (needs_mem_idx) {
                         // sparse attention over a per-token indexer cache, in its own memory type
                         res = new llama_memory_hybrid_idx(
@@ -3442,7 +3442,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
-                            /* no_alloc_kv_cache */ params.no_alloc_kv_cache);
+                             params.no_alloc_kv_cache);
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;

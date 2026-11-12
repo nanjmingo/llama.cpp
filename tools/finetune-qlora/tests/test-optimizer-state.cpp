@@ -94,7 +94,7 @@ void test_version_one_payload() {
             "version 1 optimizer-state payload was rejected");
 }
 
-} // namespace
+}
 
 int main() {
     test_finite_and_nonfinite_payloads();

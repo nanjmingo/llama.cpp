@@ -42,8 +42,6 @@ uint32_t compute_lanes_per_col(const uint32_t S_v, const uint32_t warp_size) {
     uint32_t lanes_per_column =
         (S_v >= 128) ? 8u : gdn_min(S_v, warp_size);
 
-    // gated_delta_net.comp relies on S_V % COLS_PER_WG == 0 and
-    // S_V % LANES_PER_COLUMN == 0 to avoid bounds checks.
     while (lanes_per_column > 1u) {
         const bool valid_lanes = (warp_size % lanes_per_column) == 0 &&
                                     (S_v % lanes_per_column) == 0;
@@ -103,9 +101,6 @@ reduce_token_block(float v,
 
         const float warp_sum = warp_reduce_sum<warp_size>(v);
 
-        // the run spans rows_active / warp_size warps: combine via shared memory, relying on
-        // the linear tid -> warp mapping. The leading barrier orders re-use of
-        // shared_warp_sums against the previous call's readers.
         __syncthreads();
         if (lane_id == 0u) {
             shared_warp_sums[warp_id] = warp_sum;
@@ -142,26 +137,23 @@ gated_delta_net_back_cuda(const float * data_q_ptr,
     constexpr const uint32_t warp_size     = ggml_cuda_get_physical_warp_size();
     constexpr const uint32_t lanes_per_col = compute_lanes_per_col(S_v, warp_size);
     constexpr const uint32_t rows_per_lane = S_v / lanes_per_col;
-    constexpr const uint32_t cols_per_step = block_size / lanes_per_col; // columns advanced per wave, across all warps
+    constexpr const uint32_t cols_per_step = block_size / lanes_per_col;
 
-    // Row-pass decomposition: lanes own contiguous rows; spare threads process extra tokens.
-    // At most one of t_tile / row_waves exceeds 1 (both are 1 when block_size == S_v).
-    constexpr const uint32_t rows_active = (block_size < S_v) ? block_size : S_v;  // rows in flight per token
-    constexpr const uint32_t t_tile      = block_size / rows_active;  // tokens in flight
-    constexpr const uint32_t row_waves   = S_v / rows_active;         // row passes per token
+    constexpr const uint32_t rows_active = (block_size < S_v) ? block_size : S_v;
+    constexpr const uint32_t t_tile      = block_size / rows_active;
+    constexpr const uint32_t row_waves   = S_v / rows_active;
 
     static_assert(block_size % warp_size == 0, "block must be a whole number of warps");
     static_assert(cols_per_step <= S_v && S_v % cols_per_step == 0, "A1/A2 wave loop has no bounds check");
     static_assert(S_v % rows_active == 0, "row pass has no bounds check");
 
     const uint32_t tid = threadIdx.x;
-    const uint32_t iq1 = blockIdx.x; // q/k head
-    const uint32_t iq3 = blockIdx.y; // q/k seq
+    const uint32_t iq1 = blockIdx.x;
+    const uint32_t iq3 = blockIdx.y;
 
     const uint32_t lane_id = threadIdx.x & (warp_size-1);
     const uint32_t warp_id = threadIdx.x / warp_size;
 
-    // row-pass (phase B) thread mapping
     const uint32_t i_lane = tid % rows_active;
     const uint32_t t_sub  = tid / rows_active;
 
@@ -194,14 +186,12 @@ gated_delta_net_back_cuda(const float * data_q_ptr,
           float * GGML_CUDA_RESTRICT data_dst   = data_dst_ptr;
 
     for (uint32_t gi = 0; gi < group; gi++) {
-        const uint32_t iv1 = iq1 + gi * neq1;       // v-head (iv1 % neq1 == iq1)
+        const uint32_t iv1 = iq1 + gi * neq1;
         for (uint32_t sgi = 0; sgi < rq3; sgi++) {
-            const uint32_t iv3 = iq3 * rq3 + sgi;   // v-seq
-            // state (the forward op's initial state) has layout [S_v, S_v, H, n_seqs] with no K factor.
+            const uint32_t iv3 = iq3 * rq3 + sgi;
             const uint32_t state_in_base  = (iv3 * H + iv1) * state_size;
             const uint32_t state_out_base = (iv3 * H + iv1) * state_size;
 
-            // ---------- phase A1: forward replay, store S_hist / u ----------
             for (uint32_t wave = 0; wave < S_v / cols_per_step; ++wave) {
                 const uint32_t which_col = tid / lanes_per_col;
                 const uint32_t lane      = tid % lanes_per_col;
@@ -267,10 +257,7 @@ gated_delta_net_back_cuda(const float * data_q_ptr,
                 }
             }
 
-            // No barrier between A1 and A2: A2 reads no scratch (u_hist and S_hist are
-            // consumed by the row pass, after scratch_barrier).
 
-            // ---------- phase A2: reverse scan, store A_hist / sd / d_v / d_state ----------
             for (uint32_t wave = 0; wave < S_v / cols_per_step; ++wave) {
                 const uint32_t which_col = tid / lanes_per_col;
                 const uint32_t lane      = tid % lanes_per_col;
@@ -303,15 +290,12 @@ gated_delta_net_back_cuda(const float * data_q_ptr,
                     const uint32_t do_off = (iv3 * n_tokens * H + iv1) * S_v + ut * S_v * H;
                     const float do_j = data_d[do_off + j];
 
-                    // A += scale * q (x) do ; plus state-output gradient seed (covers K=1 final
-                    // state and K>1 snapshots via target_slot; matches the CPU kernel).
 #pragma unroll
                     for(uint32_t r = 0; r < rows_per_lane; ++r) {
                         carry_shard[r] += scale * q_reg[r] * do_j;
                     }
 
                     {
-                        // matches the forward op's slot mapping: slot 0 = most recent state (t = n_tokens-1).
                         const int target_slot = int(n_tokens) - 1 - int(t);
                         if (target_slot >= 0 && target_slot < int(K)) {
                             const uint32_t dss = args.s_off + uint32_t(target_slot) * state_size_per_snap + state_out_base;
@@ -323,14 +307,12 @@ gated_delta_net_back_cuda(const float * data_q_ptr,
                         }
                     }
 
-                    // store A_hist[t] (adjoint used by the row pass)
 #pragma unroll
                     for(uint32_t r = 0; r < rows_per_lane; ++r) {
                         const uint32_t i = r * lanes_per_col + lane;
                         data_dst[sc_A + (uint64_t ) ut * state_size + j * S_v + i] = carry_shard[r];
                     }
 
-                    // sd = (A^T k)_j ; w = beta * sd  (u/delta come from A1's replay)
                     float sd_shard = 0.0;
 #pragma unroll
                     for(uint32_t r = 0; r < rows_per_lane; ++r) {
@@ -344,7 +326,6 @@ gated_delta_net_back_cuda(const float * data_q_ptr,
                         data_dst[args.off_dv + (iv1 + H * (ut + n_tokens * iv3)) * S_v + j] = w_j;
                     }
 
-                    // propagate A_{t-1} = diag(exp(g)) (A - k w^T)
                     if constexpr (KDA) {
                         const uint32_t g_base = gb_off * S_v;
 #pragma unroll
@@ -360,7 +341,6 @@ gated_delta_net_back_cuda(const float * data_q_ptr,
                     }
                 }
 
-                // initial-state gradient: layout [S_v, S_v, H, n_seqs] (no K factor, unlike the forward output).
 #pragma unroll
                 for(uint32_t r = 0; r < rows_per_lane; ++r) {
                     const uint32_t i = r * lanes_per_col + lane;
@@ -368,26 +348,19 @@ gated_delta_net_back_cuda(const float * data_q_ptr,
                 }
             }
 
-            // A1/A2 scratch (S_hist / A_hist / u / sd) -> phase B handoff: phase B reads
-            // these across all columns, i.e. across threads. This barrier is required.
             __syncthreads();
 
-            // ---------- phase B: row pass for d_q / d_k / d_g / d_beta ----------
-            // t_tile tokens per iteration; tail threads (t >= n_tokens) run on clamped
-            // addresses with discarded results so control flow stays uniform for the
-            // barriers in reduce_token_block.
             for (uint32_t tb = 0; tb < n_tokens; tb += t_tile) {
                 const uint32_t t  = tb + t_sub;
                 const bool t_ok   = (t < n_tokens);
-                const uint32_t tc = t_ok ? t : (n_tokens - 1u);   // clamped for in-bounds addressing
+                const uint32_t tc = t_ok ? t : (n_tokens - 1u);
 
                 const uint32_t k_off  = iq3 * args.sq3 + tc * args.sq2 + iq1 * args.sq1;
                 const uint32_t gb_off = iv3 * args.sb3 + tc * args.sb2 + iv1 * args.sb1;
                 const uint32_t do_off = (iv3 * n_tokens * H + iv1) * S_v + tc * S_v * H;
-                const uint32_t tv     = iv1 + H * (t + n_tokens * iv3);  // (v-head, token) output index
+                const uint32_t tv     = iv1 + H * (t + n_tokens * iv3);
                 const float beta_val  = data_beta[gb_off];
 
-                // this token's scratch
                 const uint64_t  st_base = sc_S  + (uint64_t ) tc * state_size;
                 const uint64_t  a_base  = sc_A  + (uint64_t ) tc * state_size;
                 const uint64_t  u_base  = sc_u  + (uint64_t ) tc * S_v;
@@ -401,7 +374,7 @@ gated_delta_net_back_cuda(const float * data_q_ptr,
                     const float k_i = data_k[k_off + i];
 
                     float dq = 0.0, dk = 0.0, dg = 0.0;
-                    dbeta = 0.0;   // every row wave recomputes the same per-token value
+                    dbeta = 0.0;
                     for (uint32_t jj = 0; jj < S_v; ++jj) {
                         const float st_ij = data_dst[st_base + jj * S_v + i];
                         const float a_ij  = data_dst[a_base  + jj * S_v + i];
@@ -411,7 +384,6 @@ gated_delta_net_back_cuda(const float * data_q_ptr,
 
                         const float delta_j = beta_val * u_j;
                         const float w_j     = beta_val * sd_j;
-                        // exp(g)*S_prev reconstructed from the forward update
                         const float sp_ij   = fma(-k_i, delta_j, st_ij);
 
                         dq    = fma(st_ij, do_j, dq);
@@ -420,9 +392,6 @@ gated_delta_net_back_cuda(const float * data_q_ptr,
                         dbeta = fma(sd_j, u_j, dbeta);
                     }
 
-                    // d_q/d_k accumulate over the v-head group (gi/sgi); the first iteration
-                    // initialises instead of zeroing up front. Row (t, i)'s writer is the same
-                    // thread every iteration, so no cross-thread ordering is needed.
                     if (t_ok) {
                         const uint32_t row = (iq1 + neq1 * (t + n_tokens * iq3)) * S_v + i;
                         if (gi == 0u && sgi == 0u) {
@@ -437,7 +406,6 @@ gated_delta_net_back_cuda(const float * data_q_ptr,
                         }
                     }
                     if constexpr (!KDA) {
-                        // scalar d_g: sum over this token's rows
                         dg_tot += reduce_token_block<rows_active, warp_size>(t_ok ? dg : 0.0f,
                                                                             tid,
                                                                             lane_id,
@@ -445,8 +413,6 @@ gated_delta_net_back_cuda(const float * data_q_ptr,
                     }
                 }
 
-                // dbeta is identical across a token's rows (broadcast operands), so any
-                // row wave's value is the full per-token sum.
                 if (t_ok && i_lane == 0u) {
                     data_dst[args.off_db + tv] = dbeta;
                     if constexpr (!KDA) {
@@ -455,7 +421,6 @@ gated_delta_net_back_cuda(const float * data_q_ptr,
                 }
             }
 
-            // scratch is reused by the next group member; the last iteration needs no barrier
             if (gi + 1u < group || sgi + 1u < rq3) {
                 __syncthreads();
             }
@@ -480,11 +445,8 @@ launch_gated_delta_net_back_impl(const float * data_q,
     const uint32_t warp_size  = (uint32_t)ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const uint32_t block_size = gdn_back_threads_per_block(S_v, warp_size);
 
-    // reduce_token_block's cross-warp stage keeps one float per warp.
     const size_t smem =  KDA ? 0u : (((block_size + warp_size - 1u) / warp_size) * sizeof(float));
 
-    // One block per (q/k head, q/k seq): the block walks its GQA group internally over
-    // gi/sgi, and wg_id = iq1 + neq1*iq3 indexes its private scratch region.
     const dim3 grid_dims (kargs.neq1, neq3, 1);
     const dim3 block_dims(block_size, 1, 1);
 

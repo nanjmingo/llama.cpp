@@ -1,17 +1,11 @@
 #include "fattn-back.cuh"
 
-// Flash attention backward (GGML_OP_FLASH_ATTN_BACK), the math of the CPU reference in ggml-cpu/ops.cpp:
-//   p_ij = exp(s_ij - L_i), D_i = dO_i . O_i, ds_ij = p_ij (dO_i . v_j - D_i) ds/dqk
-//   dQ_i = sum_j ds_ij k_j, dK_j = sum_i ds_ij q_i, dV_j = sum_i p_ij dO_i, dSink_h = -sum_i p_i,sink D_i
-// Two passes without atomics on dK/dV: rows_kernel (one warp per query row) computes L, D and dQ;
-// keys_kernel (one warp per key row) computes dK and dV from them.
 
-#define FATTN_BACK_MAX_CHUNKS 16 // head sizes up to 16*WARP_SIZE = 512
+#define FATTN_BACK_MAX_CHUNKS 16
 #define FATTN_BACK_WARPS      4
 
 struct fattn_back_params {
     int64_t DK, DV, N, KV, HQ, HK, SEQ, rk2, rk3;
-    // strides in elements
     int64_t q1, q2, q3, k1, k2, k3, v1, v2, v3, o1, o2, o3, m1, m2, m3;
     int64_t m_ne2, m_ne3;
     float scale_qk, scale, softcap, max_bias, m0, m1f;
@@ -29,7 +23,6 @@ static __device__ __forceinline__ float fb_slope(const fattn_back_params & P, in
     return h < P.n_head_log2 ? powf(P.m0, h + 1) : powf(P.m1f, 2*(h - P.n_head_log2) + 1);
 }
 
-// score of query row qr against key row kr (lane-strided), returns s and tanh for the softcap derivative
 template <typename TK>
 static __device__ __forceinline__ float fb_score(const fattn_back_params & P, const float * qreg, const TK * kr, float mv, float & t) {
     const int lane = threadIdx.x;
@@ -65,7 +58,7 @@ static __global__ void fattn_back_rows_kernel(const fattn_back_params P,
     const int64_t ik3 = iq3 / P.rk3;
 
     const float * qr = q + iq1*P.q1 + iq2*P.q2 + iq3*P.q3;
-    const float * dr = d + iq2*P.o1 + iq1*P.o2 + iq3*P.o3; // d and o have the layout of the forward output
+    const float * dr = d + iq2*P.o1 + iq1*P.o2 + iq3*P.o3;
     const float * orow = o + iq2*P.o1 + iq1*P.o2 + iq3*P.o3;
     const half  * mr = mask ? mask + iq1*P.m1 + (iq2 % P.m_ne2)*P.m2 + (iq3 % P.m_ne3)*P.m3 : nullptr;
     const float slope = fb_slope(P, iq2);
@@ -83,7 +76,6 @@ static __global__ void fattn_back_rows_kernel(const fattn_back_params P,
     }
     const float D = warp_reduce_sum(Dp);
 
-    // logsumexp of the scores (online)
     float M = sink, S = sinks ? 1.0f : 0.0f;
     for (int64_t j = 0; j < P.KV; ++j) {
         const float mv = mr ? slope*__half2float(mr[j]) : 0.0f;
@@ -274,11 +266,6 @@ static void launch_fattn_back(ggml_backend_cuda_context & ctx, const fattn_back_
         (const float *) d->data, Lbuf.get(), Dbuf.get(), dk, dv);
 }
 
-// ---------------------------------------------------------------------------------------------------------------
-// GEMM path: the same math in blocks of R query rows, with the products done by cuBLAS. Per block and GQA group
-// position: S = K^T Q (KV x R per head), a row kernel turns S into P (mask, ALiBi, softcap, sinks, logsumexp) and
-// computes D = dO.O, dP = V^T dO, dS = P (dP - D) ds/dqk, dV += dO P^T, dQ = K dS, dK += Q dS^T. The memory is
-// O(R x KV x heads) instead of the full attention matrix. GGML_CUDA_FA_BACK_NAIVE=1 uses the kernels above.
 
 static __device__ __forceinline__ float fb_block_reduce(float v, bool is_max, float * sh) {
     v = is_max ? warp_reduce_max(v) : warp_reduce_sum(v);
@@ -294,7 +281,6 @@ static __device__ __forceinline__ float fb_block_reduce(float v, bool is_max, fl
     return v;
 }
 
-// one block per (row i of the block, query head h): S row -> P row (in place), L and D of the row, dSinks
 static __global__ void fattn_back_gemm_rows(const fattn_back_params P, float * S, const half * mask, const float * sinks,
         const float * o, const float * d, float * Lbuf, float * Dbuf, float * dsinks, const int64_t q0, const int64_t R,
         const int64_t iq3) {
@@ -350,7 +336,6 @@ static __global__ void fattn_back_gemm_rows(const fattn_back_params P, float * S
     }
 }
 
-// dS = P (dP - D) scale (1 - t^2 with softcap; t recovered from P: s = log p + L, t = (s - mask)/softcap), into dP
 static __global__ void fattn_back_gemm_ds(const fattn_back_params P, const float * S, float * dP, const half * mask,
         const float * Lbuf, const float * Dbuf, const int64_t q0, const int64_t R, const int64_t rows, const int64_t iq3) {
     const int64_t idx = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
@@ -376,7 +361,6 @@ static __global__ void fattn_back_gemm_ds(const fattn_back_params P, const float
     dP[idx] = g;
 }
 
-// strided (possibly F16) K or V -> contiguous F32 [D, KV, H, SEQ]
 template <typename T>
 static __global__ void fattn_back_to_f32(const T * x, float * y, const int64_t D, const int64_t KV, const int64_t H, const int64_t SEQ,
         const int64_t s1, const int64_t s2, const int64_t s3) {
@@ -408,7 +392,6 @@ static void fattn_back_gemm(ggml_backend_cuda_context & ctx, const fattn_back_pa
     float * ds = out + ggml_flash_attn_back_offset(dst, 3);
     CUDA_CHECK(cudaMemsetAsync(out, 0, ggml_nbytes(dst), stream));
 
-    // K and V as F32 with known strides (training caches are F32 already; the flash attention forward may cast them)
     const int64_t SEQK = P.SEQ / P.rk3;
     const float * kf = (const float *) k->data;
     const float * vf = (const float *) v->data;
@@ -424,7 +407,6 @@ static void fattn_back_gemm(ggml_backend_cuda_context & ctx, const fattn_back_pa
         v1 = P.DV; v2 = P.DV*P.KV; v3 = P.DV*P.KV*P.HK;
     }
 
-    // block of query rows: S and dP of a block take at most ~128 MiB each
     const int64_t R = std::max<int64_t>(1, std::min<int64_t>(P.N, (int64_t(32) << 20) / std::max<int64_t>(1, P.KV*P.HQ)));
     ggml_cuda_pool_alloc<float> S(ctx.pool(), P.KV*R*P.HQ), dP(ctx.pool(), P.KV*R*P.HQ);
     ggml_cuda_pool_alloc<float> Lbuf(ctx.pool(), R*P.HQ), Dbuf(ctx.pool(), R*P.HQ);
@@ -436,7 +418,6 @@ static void fattn_back_gemm(ggml_backend_cuda_context & ctx, const fattn_back_pa
         const int64_t ik3 = iq3 / P.rk3;
         for (int64_t q0 = 0; q0 < P.N; q0 += R) {
             const int64_t rows = std::min(R, P.N - q0);
-            // S = K^T Q, per GQA group position g: query heads j*rk2 + g use K head j
             for (int64_t g = 0; g < P.rk2; ++g) {
                 CUBLAS_CHECK(cublasSgemmStridedBatched(handle, CUBLAS_OP_T, CUBLAS_OP_N, P.KV, rows, P.DK,
                     &one,  kf + ik3*k3, k1, k2,
@@ -447,12 +428,10 @@ static void fattn_back_gemm(ggml_backend_cuda_context & ctx, const fattn_back_pa
                 sinks ? (const float *) sinks->data : nullptr, (const float *) o->data, dd, Lbuf.get(), Dbuf.get(), ds, q0, R, iq3);
             for (int64_t g = 0; g < P.rk2; ++g) {
                 const float * dO = dd + iq3*P.o3 + q0*P.o2 + g*P.DV;
-                // dP = V^T dO
                 CUBLAS_CHECK(cublasSgemmStridedBatched(handle, CUBLAS_OP_T, CUBLAS_OP_N, P.KV, rows, P.DV,
                     &one,  vf + ik3*v3, v1, v2,
                            dO, P.o2, P.rk2*P.DV,
                     &zero, dP.get() + g*P.KV*R, P.KV, P.rk2*P.KV*R, P.HK));
-                // dV += dO P^T
                 CUBLAS_CHECK(cublasSgemmStridedBatched(handle, CUBLAS_OP_N, CUBLAS_OP_T, P.DV, P.KV, rows,
                     &one,  dO, P.o2, P.rk2*P.DV,
                            S.get() + g*P.KV*R, P.KV, P.rk2*P.KV*R,
@@ -462,12 +441,10 @@ static void fattn_back_gemm(ggml_backend_cuda_context & ctx, const fattn_back_pa
             fattn_back_gemm_ds<<<(n + 255)/256, 256, 0, stream>>>(P, S.get(), dP.get(), mask ? (const half *) mask->data : nullptr,
                 Lbuf.get(), Dbuf.get(), q0, R, rows, iq3);
             for (int64_t g = 0; g < P.rk2; ++g) {
-                // dQ = K dS
                 CUBLAS_CHECK(cublasSgemmStridedBatched(handle, CUBLAS_OP_N, CUBLAS_OP_N, P.DK, rows, P.KV,
                     &one,  kf + ik3*k3, k1, k2,
                            dP.get() + g*P.KV*R, P.KV, P.rk2*P.KV*R,
                     &zero, dq + (iq3*P.HQ + g)*P.N*P.DK + q0*P.DK, P.DK, P.rk2*P.N*P.DK, P.HK));
-                // dK += Q dS^T
                 CUBLAS_CHECK(cublasSgemmStridedBatched(handle, CUBLAS_OP_N, CUBLAS_OP_T, P.DK, P.KV, rows,
                     &one,  qd + iq3*P.q3 + q0*P.q1 + g*P.q2, P.q1, P.rk2*P.q2,
                            dP.get() + g*P.KV*R, P.KV, P.rk2*P.KV*R,
@@ -506,7 +483,6 @@ void ggml_cuda_op_flash_attn_back(ggml_backend_cuda_context & ctx, ggml_tensor *
     P.q1 = q->nb[1]/fs; P.q2 = q->nb[2]/fs; P.q3 = q->nb[3]/fs;
     P.k1 = k->nb[1]/tk; P.k2 = k->nb[2]/tk; P.k3 = k->nb[3]/tk;
     P.v1 = v->nb[1]/tv; P.v2 = v->nb[2]/tv; P.v3 = v->nb[3]/tv;
-    // d is contiguous with the shape of o: [DV, HQ, N, SEQ]
     P.o1 = P.DV; P.o2 = P.DV*P.HQ; P.o3 = P.DV*P.HQ*P.N;
     GGML_ASSERT(o->nb[1] == P.o1*fs && o->nb[2] == P.o2*fs && o->nb[3] == P.o3*fs);
     P.m1 = mask ? mask->nb[1]/sizeof(half) : 0; P.m2 = mask ? mask->nb[2]/sizeof(half) : 0; P.m3 = mask ? mask->nb[3]/sizeof(half) : 0;

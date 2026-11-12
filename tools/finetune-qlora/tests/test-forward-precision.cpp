@@ -320,7 +320,7 @@ void test_quantized_matmul_forward_precision() {
             "default activation precision differs from explicit Q8 forward input precision");
 }
 
-} // namespace
+}
 
 int main() {
     try {

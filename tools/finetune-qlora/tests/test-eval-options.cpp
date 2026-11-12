@@ -149,7 +149,7 @@ void test_empty_target_is_rejected() {
     require(rejected, "empty LoRA target should be rejected");
 }
 
-} // namespace
+}
 
 int main() {
     try {

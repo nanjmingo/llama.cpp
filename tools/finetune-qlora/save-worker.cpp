@@ -4,7 +4,6 @@
 #include <utility>
 
 qlora_save_worker::qlora_save_worker() {
-    // Start the worker only after all members have been initialized.
     thread = std::thread(&qlora_save_worker::run, this);
 }
 

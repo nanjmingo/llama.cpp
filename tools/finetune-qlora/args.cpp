@@ -76,8 +76,6 @@ const std::vector<qlora_arg> & get_qlora_arg_defs() {
             result.push_back(opt);
         };
 
-        // Keep each option's spelling, help text and behavior together, using
-        // the same registration style as common/arg.cpp.
         add_opt(qlora_arg(
             {"--train-file"}, "FNAME",
             "Training dataset path; may be repeated [required]",
@@ -349,8 +347,6 @@ bool qlora_parse_args(int argc,
 
             const auto found = arg_to_option.find(option_name);
             if (found == arg_to_option.end()) {
-                // Leave common options and their values untouched for the
-                // shared llama.cpp parser.
                 common_argv.push_back(original_arg);
                 continue;
             }
@@ -398,7 +394,7 @@ bool qlora_parse_args(int argc,
     return true;
 }
 
-void qlora_print_usage(int /*argc*/, char ** /*argv*/) {
+void qlora_print_usage(int , char ** ) {
     std::printf("\n----- QLoRA-specific params -----\n\n");
     for (const qlora_arg & option : get_qlora_arg_defs()) {
         std::printf("%s", option.to_string().c_str());

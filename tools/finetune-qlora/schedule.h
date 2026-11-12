@@ -5,7 +5,6 @@
 #include <cstdint>
 #include <string>
 
-// Keep schedule state and LR calculation independent from the training callback.
 struct qlora_lr_schedule {
     const lr_opt * lr = nullptr;
     std::string    type = "constant";

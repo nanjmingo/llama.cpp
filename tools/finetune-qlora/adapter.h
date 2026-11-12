@@ -44,7 +44,6 @@ lora_tensors alloc_lora_tensors(const std::vector<std::pair<std::string, ggml_te
                                 int32_t freeze_layers = 0,
                                 enum ggml_type lora_type = GGML_TYPE_F32);
 
-// Convert an existing adapter to the requested rank/alpha and add any missing target tensors.
 lora_tensors transform_lora_tensors(const std::string & input_path,
                                     const std::string & expected_arch,
                                     const std::vector<std::pair<std::string, ggml_tensor *>> & model_tensors,

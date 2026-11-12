@@ -3044,7 +3044,6 @@ struct ggml_cplan ggml_graph_plan(
                             if (src1->type != vec_dot_type) {
                                 cur = ggml_row_size(vec_dot_type, ggml_nelements(src1));
                             }
-                            // Workspace for tiled (see tiled.h)
                             cur = GGML_PAD(cur, 64);
                             cur += ggml_tiled_wdata_size(n_tasks, node);
                         }

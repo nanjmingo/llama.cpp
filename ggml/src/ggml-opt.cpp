@@ -70,8 +70,8 @@ struct ggml_opt_context {
     std::vector<struct ggml_tensor *> grad_accs;
     std::vector<struct ggml_tensor *> grad_m;
     std::vector<struct ggml_tensor *> grad_v;
-    std::vector<ggml_backend_buffer_t> bufs_momenta;  // per-param moment buffers (one per param node)
-    std::vector<struct ggml_context *> ctxs_momenta;  // corresponding ggml contexts (keep alive for tensor metadata)
+    std::vector<ggml_backend_buffer_t> bufs_momenta;
+    std::vector<struct ggml_context *> ctxs_momenta;
 
     int64_t iter               = 1;
     int32_t opt_period         = 1;
@@ -195,9 +195,9 @@ namespace {
             }
 
             ggml_opt_f16_cache_candidate candidate = {
-                /*.activation        =*/ activation,
-                /*.last_forward_use  =*/ last_forward_use,
-                /*.backward_users    =*/ {},
+                 activation,
+                 last_forward_use,
+                 {},
             };
             bool safe = true;
             for (int j = n_nodes_f; j < opt_ctx->gb_grad->n_nodes && safe; ++j) {
@@ -432,9 +432,9 @@ ggml_opt_dataset_t ggml_opt_dataset_init_with_weights(
 
     {
         struct ggml_init_params params = {
-            /*.mem_size   =*/ 3*ggml_tensor_overhead(),
-            /*.mem_buffer =*/ nullptr,
-            /*.no_alloc   =*/ true,
+             3*ggml_tensor_overhead(),
+             nullptr,
+             true,
         };
         result->ctx = ggml_init(params);
     }
@@ -646,7 +646,7 @@ struct ggml_opt_params ggml_opt_default_params(
         /*get_opt_pars    =*/ ggml_opt_get_default_optimizer_params,
         /*get_opt_pars_ud =*/ nullptr,
         /*optimizer       =*/ GGML_OPT_OPTIMIZER_TYPE_ADAMW,
-        /*optimizer_state_type =*/ GGML_TYPE_F32,
+         GGML_TYPE_F32,
     };
 }
 
@@ -883,14 +883,10 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             for (int i = 0; i < n_nodes; ++i) {
                 ggml_tensor * node = opt_ctx->gf->nodes[i];
                 if (node->flags & GGML_TENSOR_FLAG_PARAM) {
-                    // Allocate moments on the same buffer type as the param tensor so
-                    // the ADAMW op runs on the correct backend (avoids cross-device mismatch
-                    // when some LoRA tensors are on CPU and others on GPU with partial offload).
                     ggml_backend_buffer_type_t param_buft = node->buffer
                         ? ggml_backend_buffer_get_type(node->buffer)
                         : ggml_backend_cpu_buffer_type();
 
-                    // Allocate a tiny context + buffer for this pair of moment tensors.
                     const size_t sz = 2 * ggml_tensor_overhead();
                     struct ggml_init_params mip = { sz, nullptr, true };
                     struct ggml_context * mctx = ggml_init(mip);
@@ -899,7 +895,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
                     ggml_backend_buffer_t mbuf = ggml_backend_alloc_ctx_tensors_from_buft(mctx, param_buft);
                     ggml_backend_buffer_clear(mbuf, 0);
                     opt_ctx->bufs_momenta.push_back(mbuf);
-                    opt_ctx->ctxs_momenta.push_back(mctx); // keep alive for tensor metadata
+                    opt_ctx->ctxs_momenta.push_back(mctx);
                 } else {
                     opt_ctx->grad_m[i] = nullptr;
                     opt_ctx->grad_v[i] = nullptr;
@@ -943,8 +939,6 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         if (grad && (node->flags & GGML_TENSOR_FLAG_PARAM)) {
             if (opt_ctx->loss_normalizer > 0.0f) {
                 GGML_ASSERT(opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
-                // Cross entropy divides by the positions in each microbatch and by opt_period.
-                // Undo both averages, then normalize once by the target weight of the full group.
                 const float scale = static_cast<float>(
                     ggml_nrows(opt_ctx->outputs) * opt_ctx->opt_period) / opt_ctx->loss_normalizer;
                 grad = ggml_scale(opt_ctx->ctx_compute, grad, scale);
@@ -1298,7 +1292,7 @@ struct opt_state_writer {
     }
 };
 
-} // namespace
+}
 
 size_t ggml_opt_state_size(ggml_opt_context_t opt_ctx) {
     ggml_opt_state_layout layout;
@@ -1654,11 +1648,6 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     if (!opt_ctx->static_graphs) {
         ggml_opt_build(opt_ctx);
 
-        // On the dynamic-graph path the graphs are rebuilt on every call. The reset of gb_grad
-        // above runs before this rebuild, while gb_grad is still null (ggml_opt_eval clears it
-        // after every step on this path), so it has no effect and the gradient accumulators are
-        // never cleared. Reset the rebuilt gb_grad at the start of each accumulation window.
-        // gb_grad holds no optimizer step, so the AdamW moments in gb_opt are left untouched.
         if (opt_ctx->gb_grad && opt_ctx->opt_i == 0) {
             ggml_graph_reset(opt_ctx->gb_grad);
         }
@@ -1788,8 +1777,6 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     ggml_backend_tensor_get(opt_ctx->loss, &loss, 0, ggml_nbytes(opt_ctx->loss));
     result->loss.push_back(loss);
     result->opt_periods.push_back(opt_ctx->opt_period);
-    // Cache aggregates because the progress callback queries loss after every batch.
-    // Re-scanning the full history on each callback makes this O(N^2) per epoch.
     const float loss_scaled = result->loss_per_datapoint ? loss * opt_ctx->opt_period : loss;
     result->loss_sum += loss_scaled;
     result->loss_squared_sum += loss_scaled * loss_scaled;

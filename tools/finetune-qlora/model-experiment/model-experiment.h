@@ -128,4 +128,4 @@ void gradient_error(double estimated_gradient, double numeric_gradient,
 bool gradient_matches(double estimated_gradient, double numeric_gradient,
                       double & absolute_error, double & relative_error);
 
-} // namespace qlora_model_experiment
+}

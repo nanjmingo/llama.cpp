@@ -1,6 +1,3 @@
-// Gradients of ggml_flash_attn_ext (GGML_OP_FLASH_ATTN_BACK through ggml_build_backward_expand) against
-// float64 central differences of a float64 reimplementation of the forward pass. Norm-relative errors, so
-// gradients close to zero do not dominate the result as in the element-wise check of test-backend-ops.
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -12,7 +9,7 @@
 #include <vector>
 
 struct fa_config {
-    int D, DV, H, R, SEQ, KV, N; // head sizes, KV heads, query heads per KV head, sequences, keys, queries
+    int D, DV, H, R, SEQ, KV, N;
     bool mask, sinks;
     float max_bias, softcap;
 };
@@ -20,7 +17,7 @@ struct fa_config {
 struct fa_data {
     fa_config c;
     std::vector<double> q, k, v, w, sinks;
-    std::vector<double> mask; // [SEQ][N][KV], -inf for masked keys
+    std::vector<double> mask;
 
     double loss() const {
         const int HQ = c.H*c.R;
@@ -63,7 +60,7 @@ struct fa_data {
                         for (int j = 0; j < c.KV; ++j) {
                             o += s[j]/sum*v[((sq*c.H + hk)*c.KV + j)*c.DV + e];
                         }
-                        L += w[((sq*c.N + i)*HQ + h)*c.DV + e]*o; // output layout [DV, HQ, N, SEQ]
+                        L += w[((sq*c.N + i)*HQ + h)*c.DV + e]*o;
                     }
                 }
             }
@@ -110,7 +107,6 @@ static double check(const fa_config & c, int seed) {
         fill(s, data.sinks);
     }
     if (m) {
-        // keys after i + KV - N are masked, plus random holes; key 0 stays visible in every row
         data.mask.resize(ggml_nelements(m));
         for (int sq = 0; sq < c.SEQ; ++sq) {
             for (int i = 0; i < c.N; ++i) {
@@ -169,16 +165,15 @@ static double check(const fa_config & c, int seed) {
 
 int main() {
     const fa_config configs[] = {
-        // D  DV  H  R SEQ KV  N   mask   sinks  max_bias softcap
         { 32, 32, 2, 1, 1, 13, 5,  true,  false, 0.0f,    0.0f  },
-        { 32, 32, 2, 4, 1, 13, 5,  true,  false, 0.0f,    0.0f  }, // GQA
-        { 32, 32, 2, 2, 2,  7, 3,  true,  false, 0.0f,    0.0f  }, // two sequences
-        { 32, 32, 2, 1, 1, 13, 5,  true,  false, 0.0f,    2.0f  }, // softcap
-        { 32, 32, 4, 1, 1, 13, 5,  true,  false, 8.0f,    0.0f  }, // ALiBi
-        { 32, 32, 2, 2, 1, 13, 5,  true,  true,  0.0f,    0.0f  }, // sinks
-        { 32, 32, 2, 1, 1,  9, 4,  false, false, 0.0f,    0.0f  }, // no mask
-        { 64, 32, 1, 1, 1, 11, 3,  true,  false, 0.0f,    0.0f  }, // DV != DK
-        {128, 128, 1, 2, 1, 20, 6,  true,  true,  0.0f,    30.0f }, // D 128, everything on
+        { 32, 32, 2, 4, 1, 13, 5,  true,  false, 0.0f,    0.0f  },
+        { 32, 32, 2, 2, 2,  7, 3,  true,  false, 0.0f,    0.0f  },
+        { 32, 32, 2, 1, 1, 13, 5,  true,  false, 0.0f,    2.0f  },
+        { 32, 32, 4, 1, 1, 13, 5,  true,  false, 8.0f,    0.0f  },
+        { 32, 32, 2, 2, 1, 13, 5,  true,  true,  0.0f,    0.0f  },
+        { 32, 32, 2, 1, 1,  9, 4,  false, false, 0.0f,    0.0f  },
+        { 64, 32, 1, 1, 1, 11, 3,  true,  false, 0.0f,    0.0f  },
+        {128, 128, 1, 2, 1, 20, 6,  true,  true,  0.0f,    30.0f },
     };
     int n_fail = 0;
     for (const auto & c : configs) {

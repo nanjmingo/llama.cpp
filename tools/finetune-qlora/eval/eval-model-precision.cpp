@@ -32,7 +32,7 @@ double evaluate_f32_loss(Model & model, Experiment & experiment, ggml_prec train
     }
 }
 
-} // namespace
+}
 
 int main(int argc, char ** argv) {
     try {

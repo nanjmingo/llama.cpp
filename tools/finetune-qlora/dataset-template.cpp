@@ -19,9 +19,6 @@ common_chat_prompt apply_chat_template(common_chat_templates * templates,
     inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_NONE;
     inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
     inputs.enable_thinking = false;
-    // Keep this call serial: the Jinja path in common_chat_templates_apply()
-    // calls common_chat_extra_context() -> format_time(), which uses
-    // non-thread-safe std::localtime() in common/chat.cpp.
     return common_chat_templates_apply(templates, inputs).prompt;
 }
 

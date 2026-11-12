@@ -121,7 +121,6 @@ std::string detokenize_sample(const llama_vocab * vocab, const std::vector<llama
         if (text_tokens.empty()) {
             return;
         }
-        // Decode a complete token run so UTF-8 byte sequences split across token IDs are reassembled.
         result += common_detokenize(vocab, text_tokens, true);
         text_tokens.clear();
     };
@@ -276,7 +275,7 @@ void write_record(std::ofstream & output,
     }
 }
 
-} // namespace
+}
 
 int main(int argc, char ** argv) {
     try {

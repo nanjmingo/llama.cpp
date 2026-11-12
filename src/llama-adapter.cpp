@@ -343,10 +343,8 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
         auto * buft = ggml_backend_buffer_get_type(model_tensor->buffer);
 
         // do not load loras to extra buffer types (i.e. bufts for repacking)
-        // try device-native buft first (keeps LoRA on GPU), fall back to CPU only as last resort
         for (auto & ex : buft_extra) {
             if (ex == buft) {
-                // try to get the device's native (non-repack) buffer type
                 auto * dev = ggml_backend_buft_get_device(buft);
                 auto * native_buft = dev ? ggml_backend_dev_buffer_type(dev) : nullptr;
                 if (native_buft && native_buft != buft) {

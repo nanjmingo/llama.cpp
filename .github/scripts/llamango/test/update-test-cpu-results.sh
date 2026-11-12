@@ -59,7 +59,6 @@ suites = [node for node in root.iter() if local_name(node.tag) == "testsuite"]
 if not suites and local_name(root.tag) == "testsuite":
     suites = [root]
 
-# Avoid double-counting aggregate suites if a producer nests testsuite elements.
 leaf_suites = [
     suite for suite in suites
     if not any(local_name(child.tag) == "testsuite" for child in list(suite))

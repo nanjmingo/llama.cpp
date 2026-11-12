@@ -9,7 +9,7 @@
 
 struct qlora_params {
     int32_t     lora_rank          = 16;
-    float       lora_alpha         = 0.0f; // 0 = use rank
+    float       lora_alpha         = 0.0f;
     std::string lora_type          = "f32";
     std::string optimizer_state_type = "f32";
     std::string forward_precision_name = "f32";
@@ -26,17 +26,15 @@ struct qlora_params {
     int32_t     save_snapshot_limit = 0;
     int32_t     gradient_accumulation_steps = 1;
     int32_t     grad_stats_interval = 0;
-    int32_t     max_steps          = 0; // 0 = use --epochs; otherwise stop after N optimizer updates
-    int32_t     val_windows        = -1; // -1 = all remaining windows; 0 = no validation
+    int32_t     max_steps          = 0;
+    int32_t     val_windows        = -1;
     int32_t     freeze_layers      = 0;
-    std::string lr_scheduler       = "constant"; // constant, cosine
+    std::string lr_scheduler       = "constant";
     int32_t     warmup_steps       = 0;
     float       warmup_init_ratio  = 0.1f;
     bool        shuffle_dataset    = false;
 };
 
-// QLoRA-specific counterpart to common_arg. Keep option metadata and its
-// handler together so adding an option only requires changing one definition.
 struct qlora_arg {
     std::vector<const char *> args;
     const char * value_hint = nullptr;
@@ -62,14 +60,10 @@ struct qlora_arg {
     std::string to_string() const;
 };
 
-// Parse QLoRA-only arguments and copy all remaining arguments to common_argv.
-// This keeps QLoRA options out of common/arg.cpp while following its
-// common_arg-style option-definition format.
 bool qlora_parse_args(int argc,
                       char ** argv,
                       qlora_params & params,
                       std::vector<std::string> & common_argv,
                       std::string & error);
 
-// Appended to the common finetune usage output when --help is requested.
 void qlora_print_usage(int argc, char ** argv);

@@ -589,7 +589,7 @@ void test_moe_expert_lora_allocation_and_transform() {
     std::remove(input_path.c_str());
 }
 
-} // namespace
+}
 
 int main() {
     try {

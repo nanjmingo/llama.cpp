@@ -15,4 +15,4 @@ struct Options {
 
 Options parse_options(int argc, char ** argv);
 
-} // namespace qlora_model_eval
+}

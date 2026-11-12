@@ -176,4 +176,4 @@ lora_batch_graph make_lora_batch_graph(const std::vector<float> & input_values,
 }
 
 
-} // namespace qlora_training_math
+}

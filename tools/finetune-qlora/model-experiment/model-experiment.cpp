@@ -107,7 +107,7 @@ llama_context_params context_params(ggml_type type_k, ggml_type type_v, bool fla
     return params;
 }
 
-} // namespace detail
+}
 
 namespace {
 
@@ -145,7 +145,7 @@ std::string format_lora_targets(const std::vector<std::string> & targets) {
     return output.str();
 }
 
-} // namespace
+}
 
 Model::Impl::Impl(ModelOptions opts, ModelPrecisionConfig precision_config)
     : options(std::move(opts)), precision(std::move(precision_config)), quiet_logs(options.verbose_library_logs) {
@@ -355,4 +355,4 @@ bool gradient_matches(double estimated_gradient, double numeric_gradient,
         (relative_error <= 0.15 || absolute_error <= 2.0e-3);
 }
 
-} // namespace qlora_model_experiment
+}

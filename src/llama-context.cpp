@@ -412,7 +412,6 @@ llama_context::llama_context(
         }
     }
 
-    // Keep the requested context for full-context training without an extra KV-cache capacity pad.
     if (!full_context_training) {
         // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
         cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
@@ -549,7 +548,7 @@ llama_context::llama_context(
             /*.ctx_type         =*/ cparams.ctx_type,
             /*.mem_other        =*/ llama_get_memory(cparams.ctx_other),
             /*.no_alloc         =*/ model.no_alloc(),
-            /*.no_alloc_kv_cache=*/ no_alloc_kv_cache,
+             no_alloc_kv_cache,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -3103,7 +3102,7 @@ llm_graph_params llama_context::graph_params(
         /*.cparams     =*/ cparams,
         /*.ubatch      =*/ ubatch,
         /*.gtype       =*/ gtype,
-        /*.training_graph =*/ training_graph,
+         training_graph,
         /*.sched       =*/ sched.get(),
         /*.backend_cpu =*/ backend_cpu,
         /*.cvec        =*/ cvec.get(),
@@ -4295,22 +4294,19 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     sched_need_reserve = true;
     sched_reserve();
 
-    // Size the scheduler for the forward, backward, and optimizer graphs before opt_ctx stores its pointer.
     {
         uint32_t train_fwd_nodes = 0;
 
-        // Measure a training graph without reallocating compute buffers.
         if (memory) {
             auto mctx_tmp = memory->init_full();
             if (mctx_tmp) {
-                // Both graph results must hold the temporary graph.
                 const uint32_t tmp_cap = std::max<uint32_t>(4096u, 16u * model->n_tensors());
                 for (auto & res : gf_res_prev) {
                     res.reset(new llm_graph_result(tmp_cap));
                 }
                 gf_res_reserve.reset(new llm_graph_result(tmp_cap));
                 gf_res_prev_active = nullptr;
-                auto * gf_train = graph_reserve(n_ubatch, 1, n_ubatch, mctx_tmp.get(), /*split_only=*/true);
+                auto * gf_train = graph_reserve(n_ubatch, 1, n_ubatch, mctx_tmp.get(), true);
                 if (gf_train) {
                     train_fwd_nodes = (uint32_t)ggml_graph_n_nodes(gf_train);
                     LLAMA_LOG_INFO("%s: measured training graph nodes = %u (n_ubatch=%u)\n",
@@ -4325,10 +4321,8 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
                            __func__, train_fwd_nodes);
         }
 
-        // Allow four forward graphs and both nodes and leafs.
         const int64_t inflated   = (int64_t)std::max<uint32_t>(train_fwd_nodes, 1024u) * 4;
         const int64_t sched_size = inflated * 2;
-        // Both graph results can build the backward graph.
         for (auto & res : gf_res_prev) {
             res.reset(new llm_graph_result(inflated));
         }
@@ -4336,7 +4330,6 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
         gf_res_prev_active = nullptr;
         sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
                                            sched_size, cparams.pipeline_parallel, cparams.op_offload));
-        // Keep the scheduler pointer stored by opt_ctx valid.
         sched_need_reserve = false;
         LLAMA_LOG_INFO("%s: training graph capacity = %lld (train_fwd_nodes=%u x4)\n",
                        __func__, (long long)inflated, train_fwd_nodes);
@@ -4506,9 +4499,6 @@ bool llama_context::opt_epoch_iter(
 
             auto * gf = model.build_graph(gparams);
 
-            // Allocate the tensor metadata context once, then reset it each iteration.
-            // ggml_reset() is much cheaper than ggml_free()+ggml_init() — it just resets the
-            // allocation pointer without freeing/reallocating the backing memory buffer.
             if (!ctx_compute_opt) {
                 const size_t size_gf = ggml_graph_size(gf);
                 const size_t size_meta = 4*size_gf*ggml_tensor_overhead() + 3*ggml_graph_overhead_custom(size_gf, /*grads = */ true);
@@ -4667,8 +4657,6 @@ bool llama_context::opt_epoch(
         const int64_t train_index = idata - idata_start;
         const int64_t idata_in_loop = train_index*ubatch_per_ctx;
 
-        // QLoRA supplies an explicit period to accumulate full windows. Shorten only the
-        // final group of each epoch so its remaining windows still produce an optimizer step.
         if (opt_accumulation_period > 0 && ubatch_per_ctx == 1 &&
             train_index % opt_accumulation_period == 0) {
             const int64_t remaining = idata_split - idata;
@@ -4787,7 +4775,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
-        /*.no_alloc_kv_cache           =*/ false,
+         false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

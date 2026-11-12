@@ -606,8 +606,7 @@ extern "C" {
 
         GGML_OP_GLU,
 
-        // New operations are appended to preserve existing GGML_OP numeric values.
-        GGML_OP_OUT_PROD_ID, // scattered outer-product for MUL_MAT_ID backward (MoE LoRA)
+        GGML_OP_OUT_PROD_ID,
         GGML_OP_GATED_DELTA_NET_BACK,
         GGML_OP_MUL_MAT_ID_BACK,
 
@@ -675,7 +674,7 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
-        GGML_TENSOR_FLAG_F16_BACKWARD_CACHE = 32, // ...may be stored as F16 for backward use
+        GGML_TENSOR_FLAG_F16_BACKWARD_CACHE = 32,
     };
 
     enum ggml_tri_type {
@@ -1288,7 +1287,6 @@ extern "C" {
             struct ggml_tensor  * a);
 
 
-
     // xIELU activation function
     // x = x * (c_a(alpha_n) + c_b(alpha_p, beta) * sigmoid(beta * x)) + eps * (x > 0)
     // where c_a = softplus and c_b(a, b) = softplus(a) + b are constraining functions
@@ -1498,9 +1496,6 @@ extern "C" {
             const struct ggml_tensor * a,
             int                        idx);
 
-    // Set the requested input precision for matrix multiplications generated during backpropagation.
-    // The hint is carried by forward MUL_MAT / MUL_MAT_ID nodes and copied to their backward nodes.
-    // Supported values are F32, F16, and BF16. GGML_PREC_UNDEFINED keeps backend defaults.
     GGML_API bool ggml_prec_set_bwd(
             struct ggml_tensor * a,
             enum ggml_prec       prec);
@@ -1542,8 +1537,6 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
 
-    // Gradient of MUL_MAT_ID with respect to its input activations. The result
-    // has the shape of b and sums gradients for broadcast expert slots.
     GGML_API struct ggml_tensor * ggml_mul_mat_id_back(
             struct ggml_context * ctx,
             struct ggml_tensor  * as,
@@ -1559,14 +1552,6 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
-    // Scattered outer-product for the MUL_MAT_ID backward pass (MoE LoRA gradient).
-    //
-    //   a:   [cols, n_expert_used, n_tokens]  F32  — activations
-    //   b:   [rows, n_expert_used, n_tokens]  F32  — upstream gradient
-    //   ids: [n_expert_used, n_tokens]        I32  — expert dispatch indices
-    //   result: [cols, rows, n_expert, 1]     F32
-    //
-    //   result[:, :, e] += sum_{(i,t): ids[i,t]==e} a[:, i, t] ⊗ b[:, i, t]
     GGML_API struct ggml_tensor * ggml_out_prod_id(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -2594,7 +2579,6 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
-    // Returns dQ, dK, dV, and optional dSinks as contiguous F32 segments.
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
            struct ggml_tensor  * fa,
@@ -2739,8 +2723,6 @@ extern "C" {
             struct ggml_tensor  * state,
             int64_t               K);
 
-    // Backward operation for ggml_gated_delta_net. The returned tensor packs gradients
-    // for q, k, v, g, beta and state, followed by backend scratch space.
     GGML_API struct ggml_tensor * ggml_gated_delta_net_back(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
