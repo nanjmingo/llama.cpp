@@ -606,6 +606,10 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_OUT_PROD_ID,
+        GGML_OP_GATED_DELTA_NET_BACK,
+        GGML_OP_MUL_MAT_ID_BACK,
+
         GGML_OP_COUNT,
     };
 
@@ -670,6 +674,7 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+        GGML_TENSOR_FLAG_F16_BACKWARD_CACHE = 32,
     };
 
     enum ggml_tri_type {
@@ -1282,7 +1287,6 @@ extern "C" {
             struct ggml_tensor  * a);
 
 
-
     // xIELU activation function
     // x = x * (c_a(alpha_n) + c_b(alpha_p, beta) * sigmoid(beta * x)) + eps * (x > 0)
     // where c_a = softplus and c_b(a, b) = softplus(a) + b are constraining functions
@@ -1492,6 +1496,13 @@ extern "C" {
             const struct ggml_tensor * a,
             int                        idx);
 
+    GGML_API bool ggml_prec_set_bwd(
+            struct ggml_tensor * a,
+            enum ggml_prec       prec);
+
+    GGML_API enum ggml_prec ggml_prec_get_bwd(
+            const struct ggml_tensor * a);
+
     // A: k columns, n rows => [ne03, ne02, n, k]
     // B: k columns, m rows  (i.e. we transpose it internally) => [ne03 * x, ne02 * y, m, k]
     // result is n columns, m rows => [ne03 * x, ne02 * y, m, n]
@@ -1526,6 +1537,13 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
 
+    GGML_API struct ggml_tensor * ggml_mul_mat_id_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as,
+            struct ggml_tensor  * grad,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * b_like);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows
@@ -1533,6 +1551,13 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
+
+    GGML_API struct ggml_tensor * ggml_out_prod_id(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids,
+            int64_t               n_expert);
 
     //
     // operations on tensors without backpropagation
@@ -2554,14 +2579,10 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
-    // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
-           struct ggml_tensor  * q,
-           struct ggml_tensor  * k,
-           struct ggml_tensor  * v,
-           struct ggml_tensor  * d,
-           bool                  masked);
+           struct ggml_tensor  * fa,
+           struct ggml_tensor  * d);
 
     GGML_API struct ggml_tensor * ggml_ssm_conv(
             struct ggml_context * ctx,
@@ -2701,6 +2722,16 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K);
+
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * d);
 
     // DSA lightning indexer
     //

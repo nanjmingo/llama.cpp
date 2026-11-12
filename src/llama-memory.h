@@ -29,6 +29,8 @@ struct llama_memory_params {
 
     // only simulate the memory allocations
     bool no_alloc;
+
+    bool no_alloc_kv_cache;
 };
 
 // the tensor contexts and backend buffers of a memory instance
