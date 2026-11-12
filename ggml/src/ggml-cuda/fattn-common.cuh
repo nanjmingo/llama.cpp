@@ -1059,6 +1059,21 @@ void launch_fattn(
     GGML_ASSERT(K->nb[0] == ggml_element_size(K));
     GGML_ASSERT(V->nb[0] == ggml_element_size(V));
 
+if (mask && mask->type != GGML_TYPE_F16) {
+    GGML_LOG_ERROR(
+        "[FATTN MASK ERROR] dst=%s mask=%s type=%s "
+        "op=%s ne=[%lld,%lld,%lld,%lld]\n",
+        dst->name,
+        mask->name,
+        ggml_type_name(mask->type),
+        ggml_op_name(mask->op),
+        (long long) mask->ne[0],
+        (long long) mask->ne[1],
+        (long long) mask->ne[2],
+        (long long) mask->ne[3]
+    );
+}
+
     GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16);
 
     ggml_cuda_pool & pool = ctx.pool();
