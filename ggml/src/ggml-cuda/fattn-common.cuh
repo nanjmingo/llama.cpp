@@ -1059,6 +1059,32 @@ void launch_fattn(
     GGML_ASSERT(K->nb[0] == ggml_element_size(K));
     GGML_ASSERT(V->nb[0] == ggml_element_size(V));
 
+    if (mask && mask->type != GGML_TYPE_F16) {
+        GGML_LOG_ERROR(
+            "[FATTN-MASK-ERROR] dst=%s op=%s type=%s "
+            "Q={name=%s type=%s ne=[%lld,%lld,%lld,%lld]} "
+            "K={name=%s type=%s ne=[%lld,%lld,%lld,%lld]} "
+            "V={name=%s type=%s ne=[%lld,%lld,%lld,%lld]} "
+            "mask={name=%s op=%s type=%s ne=[%lld,%lld,%lld,%lld] "
+            "nb=[%zu,%zu,%zu,%zu] flags=0x%x view_src=%s} "
+            "kv_rows=%s\n",
+            dst->name, ggml_op_name(dst->op), ggml_type_name(dst->type),
+            Q->name, ggml_type_name(Q->type),
+            (long long) Q->ne[0], (long long) Q->ne[1],
+            (long long) Q->ne[2], (long long) Q->ne[3],
+            K->name, ggml_type_name(K->type),
+            (long long) K->ne[0], (long long) K->ne[1],
+            (long long) K->ne[2], (long long) K->ne[3],
+            V->name, ggml_type_name(V->type),
+            (long long) V->ne[0], (long long) V->ne[1],
+            (long long) V->ne[2], (long long) V->ne[3],
+            mask->name, ggml_op_name(mask->op), ggml_type_name(mask->type),
+            (long long) mask->ne[0], (long long) mask->ne[1],
+            (long long) mask->ne[2], (long long) mask->ne[3],
+            mask->nb[0], mask->nb[1], mask->nb[2], mask->nb[3],
+            mask->flags, mask->view_src ? mask->view_src->name : "<null>",
+            kv_rows ? kv_rows->name : "<null>");
+    }
     GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16);
 
     ggml_cuda_pool & pool = ctx.pool();
