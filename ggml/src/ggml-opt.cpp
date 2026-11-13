@@ -273,8 +273,36 @@ namespace {
             return;
         }
 
+        // Splitting a graph is not a read-only operation: the scheduler rewires
+        // node sources to backend-local copies, and backend graph optimizers may
+        // reorder the node array. Preserve the original graph while querying the
+        // backend assignment of the OUT_PROD nodes below.
+        const int n_nodes = opt_ctx->gb_grad->n_nodes;
+        const uint64_t graph_uid = opt_ctx->gb_grad->uid;
+        std::vector<ggml_tensor *> original_nodes(
+            opt_ctx->gb_grad->nodes, opt_ctx->gb_grad->nodes + n_nodes);
+        std::vector<ggml_tensor *> original_sources;
+        original_sources.reserve(static_cast<size_t>(n_nodes) * GGML_MAX_SRC);
+        for (ggml_tensor * node : original_nodes) {
+            for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                original_sources.push_back(node->src[k]);
+            }
+        }
+
         ggml_backend_sched_reset(opt_ctx->backend_sched);
         ggml_backend_sched_split_graph(opt_ctx->backend_sched, opt_ctx->gb_grad);
+
+        // Restore the graph before the scheduler's temporary context is freed
+        // by the next split. Keep the backend assignments in the scheduler; they
+        // are keyed by the original tensor pointers and remain valid.
+        for (int i = 0; i < n_nodes; ++i) {
+            for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                original_nodes[i]->src[k] = original_sources[static_cast<size_t>(i) * GGML_MAX_SRC + k];
+            }
+        }
+        std::copy(original_nodes.begin(), original_nodes.end(), opt_ctx->gb_grad->nodes);
+        opt_ctx->gb_grad->uid = graph_uid;
+
         candidates.erase(std::remove_if(candidates.begin(), candidates.end(), [&](const auto & candidate) {
             for (const ggml_opt_f16_cache_user & backward_user : candidate.backward_users) {
                 if (!backward_user.backend_node) {
