@@ -416,6 +416,7 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool no_alloc_kv_cache;
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -1717,9 +1718,20 @@ extern "C" {
         void * get_opt_pars_ud;                     // userdata for calculating optimizer parameters
 
         enum ggml_opt_optimizer_type optimizer_type;
+        enum ggml_type optimizer_state_type;
     };
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
+    LLAMA_API void llama_opt_set_seed(struct llama_context * lctx, uint32_t seed);
+    LLAMA_API void llama_opt_set_opt_period(struct llama_context * lctx, int32_t opt_period);
+    LLAMA_API void llama_opt_set_grad_stats_interval(struct llama_context * lctx, int32_t interval);
+    LLAMA_API size_t llama_opt_state_size(const struct llama_context * lctx);
+    LLAMA_API bool llama_opt_state_export(const struct llama_context * lctx, void * data, size_t size);
+    LLAMA_API bool llama_opt_state_import(struct llama_context * lctx, const void * data, size_t size);
+    LLAMA_API void llama_opt_dataset_shuffle(
+            struct llama_context * lctx,
+            ggml_opt_dataset_t     dataset,
+            int64_t                idata);
 
     LLAMA_API void llama_opt_epoch(
             struct llama_context    * lctx,
@@ -1729,6 +1741,30 @@ extern "C" {
             int64_t                   idata_split,
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
+
+    LLAMA_API void llama_opt_epoch_range(
+            struct llama_context    * lctx,
+            ggml_opt_dataset_t        dataset,
+            ggml_opt_result_t         result_train,
+            ggml_opt_result_t         result_eval,
+            int64_t                   idata_start,
+            int64_t                   idata_split,
+            int64_t                   idata_eval_end,
+            ggml_opt_epoch_callback   callback_train,
+            ggml_opt_epoch_callback   callback_eval);
+
+    LLAMA_API bool llama_opt_epoch_range_ex(
+            struct llama_context    * lctx,
+            ggml_opt_dataset_t        dataset,
+            ggml_opt_result_t         result_train,
+            ggml_opt_result_t         result_eval,
+            int64_t                   idata_start,
+            int64_t                   idata_split,
+            int64_t                   idata_eval_end,
+            ggml_opt_epoch_callback   callback_train,
+            ggml_opt_epoch_callback   callback_eval,
+            ggml_abort_callback       abort_callback,
+            void                    * abort_callback_data);
 
 #ifdef __cplusplus
 }

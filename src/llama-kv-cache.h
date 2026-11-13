@@ -116,8 +116,8 @@ public:
         // a model can hold more than one cache, so the tensor names have to stay unique
                  const char *   name_tag = "",
         // lightning indexer keys are rotated with the indexer RoPE parameters
-                       bool   is_indexer = false);
-
+                         bool   is_indexer = false,
+                         bool   no_alloc_kv_cache = false);
     ~llama_kv_cache() = default;
 
     //
@@ -317,6 +317,7 @@ private:
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
+    const bool no_alloc_kv_cache_data = false;
     llama_memory_bufs ctxs_bufs;
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
