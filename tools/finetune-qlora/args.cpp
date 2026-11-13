@@ -91,6 +91,13 @@ const std::vector<qlora_arg> & get_qlora_arg_defs() {
             }
         ));
         add_opt(qlora_arg(
+            {"--grad-checkpoint", "--gradient-checkpointing"},
+            "Recompute layer activations during backpropagation to reduce training memory",
+            [](qlora_params & params) {
+                params.grad_checkpoint = true;
+            }
+        ));
+        add_opt(qlora_arg(
             {"--lora-rank"}, "N",
             "LoRA rank (default: 16; existing adapters are converted to this rank; rank reduction is rejected)",
             [](qlora_params & params, const std::string & value) {

@@ -33,6 +33,7 @@ struct qlora_params {
     int32_t     warmup_steps       = 0;
     float       warmup_init_ratio  = 0.1f;
     bool        shuffle_dataset    = false;
+    bool        grad_checkpoint    = false;
 };
 
 struct qlora_arg {

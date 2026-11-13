@@ -161,6 +161,8 @@ extern "C" {
         enum ggml_opt_optimizer_type optimizer;
 
         enum ggml_type optimizer_state_type;
+
+        bool checkpoint; // recompute forward activations between tensors marked with GGML_TENSOR_FLAG_CHECKPOINT
     };
 
     // get parameters for an optimization context with defaults set where possible
@@ -202,6 +204,9 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_opt_grad_acc(ggml_opt_context_t opt_ctx, struct ggml_tensor * node);
 
     GGML_API bool ggml_opt_has_grad(ggml_opt_context_t opt_ctx, const struct ggml_tensor * node);
+
+    GGML_API int32_t ggml_opt_checkpoint_count(ggml_opt_context_t opt_ctx);
+    GGML_API int32_t ggml_opt_recompute_nodes(ggml_opt_context_t opt_ctx);
 
     GGML_API enum ggml_opt_optimizer_type ggml_opt_context_optimizer_type(ggml_opt_context_t); //TODO consistent naming scheme
 

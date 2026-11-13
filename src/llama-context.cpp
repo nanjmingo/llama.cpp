@@ -3256,6 +3256,10 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_set_name(cur, name);
         }
 
+        if (opt_grad_checkpoint && cparams.training && strcmp(name, "l_out") == 0) {
+            cur->flags |= GGML_TENSOR_FLAG_CHECKPOINT;
+        }
+
         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
         // FIXME: fix in ggml_backend_sched
@@ -4266,6 +4270,7 @@ static void llama_warn_shared_kv_lora_gradients(const llama_model & model, const
 
 void llama_context::opt_init(struct llama_model * model, struct llama_opt_params lopt_params) {
     GGML_ASSERT(!opt_ctx);
+    opt_grad_checkpoint = lopt_params.grad_checkpoint;
     cparams.pipeline_parallel = false;
     model->hparams.n_ctx_train = lopt_params.n_ctx_train > 0 ? lopt_params.n_ctx_train : n_ctx();
     const uint32_t n_batch     = std::min(this->n_batch(),  model->hparams.n_ctx_train);
@@ -4328,6 +4333,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     opt_params.get_opt_pars_ud = lopt_params.get_opt_pars_ud;
     opt_params.optimizer       = lopt_params.optimizer_type;
     opt_params.optimizer_state_type = lopt_params.optimizer_state_type;
+    opt_params.checkpoint      = lopt_params.grad_checkpoint;
     opt_ctx = ggml_opt_init(opt_params);
     if (opt_accumulation_period > 0) {
         ggml_opt_set_opt_period(opt_ctx, opt_accumulation_period);
@@ -4488,7 +4494,20 @@ bool llama_context::opt_epoch_iter(
 
             if (!ctx_compute_opt) {
                 const size_t size_gf = ggml_graph_size(gf);
-                const size_t size_meta = 4*size_gf*ggml_tensor_overhead() + 3*ggml_graph_overhead_custom(size_gf, /*grads = */ true);
+                const size_t graph_factor = opt_grad_checkpoint ? 2 : 1;
+                const size_t tensor_factor = opt_grad_checkpoint ? 6 : 4;
+                GGML_ASSERT(size_gf <= SIZE_MAX / graph_factor);
+                GGML_ASSERT(size_gf <= SIZE_MAX / tensor_factor);
+                const size_t graph_size = graph_factor * size_gf;
+                const size_t tensor_count = tensor_factor * size_gf;
+                const size_t tensor_overhead = ggml_tensor_overhead();
+                const size_t graph_overhead = ggml_graph_overhead_custom(graph_size, /*grads = */ true);
+                GGML_ASSERT(tensor_count <= SIZE_MAX / tensor_overhead);
+                GGML_ASSERT(graph_overhead <= SIZE_MAX / 3);
+                const size_t tensor_meta_size = tensor_count * tensor_overhead;
+                const size_t graph_meta_size = 3 * graph_overhead;
+                GGML_ASSERT(tensor_meta_size <= SIZE_MAX - graph_meta_size);
+                const size_t size_meta = tensor_meta_size + graph_meta_size;
                 struct ggml_init_params params = {
                     /*.mem_size   =*/ size_meta,
                     /*.mem_buffer =*/ nullptr,
@@ -4501,6 +4520,19 @@ bool llama_context::opt_epoch_iter(
 
             ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
             ggml_opt_alloc(opt_ctx, train);
+            if (train && opt_grad_checkpoint) {
+                const int32_t checkpoints = ggml_opt_checkpoint_count(opt_ctx);
+                if (checkpoints == 0) {
+                    LLAMA_LOG_ERROR("%s: gradient checkpointing is enabled, but the training graph has no checkpoint tensors\n",
+                            __func__);
+                    execution_failed = true;
+                    break;
+                }
+                if (n_train_graphs == 0) {
+                    LLAMA_LOG_INFO("%s: gradient checkpointing retained %d layer outputs and replayed %d forward nodes\n",
+                            __func__, checkpoints, ggml_opt_recompute_nodes(opt_ctx));
+                }
+            }
             if (train) {
                 ++n_train_graphs;
                 if (loras) {

@@ -6,7 +6,7 @@ Base model weights stay **frozen**. Training updates only the LoRA adapter weigh
 
 - **Supported precision**: Trainable LoRA weights support F32, F16, and BF16 storage (gradients accumulate in F32).
 - **Optimizers**: AdamW (F32, F16, or BF16 moment states) and SGD (F32 only).
-- **Features**: Full-context causal training, gradient accumulation, Flash Attention (CPU and CUDA), MoE expert training, and crash-safe checkpoint/resume.
+- **Features**: Full-context causal training, gradient accumulation, activation checkpointing, Flash Attention (CPU and CUDA), MoE expert training, and crash-safe checkpoint/resume.
 
 ---
 
@@ -99,6 +99,7 @@ Train a LoRA adapter with context size 512:
 | `-epochs`, `--epochs` | `2` | Number of training epochs (ignored when `--max-steps` is set). |
 | `--max-steps` | disabled | Stop after N optimizer updates. Loops the dataset if needed. |
 | `--gradient-accumulation-steps` | `1` | Accumulate gradients across N windows before each optimizer update. |
+| `--grad-checkpoint` | off | Retain each layer output and recompute intermediate activations during backpropagation to reduce memory use. |
 | `--optimizer-state-type` | `f32` | AdamW moment storage type: `f32`, `f16`, or `bf16`. (SGD is F32 only). |
 | `--lr-scheduler` | `constant` | Schedule: `constant` or `cosine`. |
 | `--warmup-steps` | `0` | Linear warmup duration in optimizer updates. |
@@ -299,4 +300,4 @@ The output file shows token counts, target token counts, and target ranges (e.g.
 | **SSM / Mamba** | `SSM_CONV` and `SSM_SCAN` do not have backward implementations. | Gradients stop at SSM layers. Upstream `ssm_in` cannot receive gradients; downstream `ssm_out` works. |
 | **GLU Variants** | Backward supports `SWIGLU` and `GEGLU` splits. Other GLU variants are not supported. | Standard models (Llama, Mistral, Qwen) use supported SwiGLU. |
 | **MTP / NextN** | Multi-Token Prediction heads are not optimized. | MTP prediction layers are skipped during training and kept frozen in output adapters. |
-| **Activation Memory** | Each training window is processed as a complete graph. | Cannot split a window into smaller microbatches. If out of memory, reduce context size `-c`. |
+| **Activation Memory** | Each training window is processed as a complete graph. | `--grad-checkpoint` retains layer outputs and recomputes intermediate activations during backpropagation. Windows still cannot be split into smaller microbatches; reduce context size `-c` if memory is still insufficient. |

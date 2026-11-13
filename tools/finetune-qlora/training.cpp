@@ -116,6 +116,7 @@ bool train_adapter(const qlora_params & qparams,
         &schedule,
         params.optimizer,
         qlora_type_from_name(qparams.optimizer_state_type),
+        qparams.grad_checkpoint,
     };
     const int64_t dataset_windows = ggml_opt_dataset_ndata(dataset.get());
     if (dataset_windows <= 0) {
@@ -242,6 +243,10 @@ bool train_adapter(const qlora_params & qparams,
     if (qparams.grad_stats_interval > 0) {
         LOG_INF("%s: logging global LoRA gradient statistics every %d optimizer updates\n",
                 __func__, qparams.grad_stats_interval);
+    }
+    if (qparams.grad_checkpoint) {
+        LOG_INF("%s: gradient checkpointing enabled; layer outputs are retained and intermediate activations are recomputed during backpropagation\n",
+                __func__);
     }
     LOG_INF("%s: lr scheduler=%s warmup_steps=%d warmup_init_ratio=%.3g total_steps=%ld lr=%.3g lr_min=%.3g\n",
             __func__, qparams.lr_scheduler.c_str(), qparams.warmup_steps, static_cast<double>(qparams.warmup_init_ratio),

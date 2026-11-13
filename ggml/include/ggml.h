@@ -498,6 +498,7 @@ extern "C" {
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
         GGML_TENSOR_FLAG_F16_BACKWARD_CACHE = 32,
+        GGML_TENSOR_FLAG_CHECKPOINT = 64, // ...is retained as an activation checkpoint during backward recomputation
     };
 
     enum ggml_tri_type {

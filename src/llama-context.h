@@ -455,6 +455,7 @@ private:
     // training
     ggml_opt_context_t opt_ctx = nullptr;
     int32_t opt_accumulation_period = 0;
+    bool opt_grad_checkpoint = false;
     std::unordered_set<const ggml_tensor *> opt_lora_grad_warned;
 
     ggml_threadpool_t threadpool       = nullptr;
