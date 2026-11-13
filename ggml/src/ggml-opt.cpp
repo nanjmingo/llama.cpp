@@ -78,8 +78,10 @@ struct ggml_opt_context {
     int32_t opt_period         = 1;
     int32_t opt_i              = 0;
     int32_t grad_stats_interval = 0;
-    uint64_t f16_cache_diag_launch_events = 0;
-    int64_t f16_cache_diag_last_launch_step = -1;
+    bool f16_cache_diag_cache_reported = false;
+    std::unordered_map<ggml_backend_dev_t, size_t> f16_cache_diag_last_logged_free;
+    std::unordered_map<ggml_backend_dev_t, uint32_t> f16_cache_diag_startup_samples;
+    std::unordered_set<ggml_backend_dev_t> f16_cache_diag_low_memory_reported;
     float   loss_normalizer    = 0.0f;
     bool    loss_per_datapoint = false;
 
@@ -175,36 +177,42 @@ namespace {
         }
     }
 
-    // Keep diagnostics useful without producing one line for every training batch:
-    // report the first eight events, then one event every 512 optimizer steps.
-    static bool ggml_opt_f16_cache_should_report(
-            uint64_t & event_count,
-            int64_t step,
-            int64_t & last_periodic_step) {
-        const uint64_t event = event_count++;
-        if (event < 8) {
-            return true;
-        }
-        if (step > 0 && step % 512 == 0 && last_periodic_step != step) {
-            last_periodic_step = step;
-            return true;
-        }
-        return false;
-    }
-
+    // Report the initial free memory, significant drops, and the first low-memory
+    // observation per CUDA device. This keeps logs small while retaining the
+    // information needed to identify growing allocations before a graph launch.
     static void ggml_opt_f16_cache_log_launch_memory(ggml_opt_context_t opt_ctx) {
         const std::vector<ggml_opt_f16_cache_device_memory> current_memory =
             ggml_opt_f16_cache_get_device_memory(opt_ctx);
+        constexpr size_t drop_threshold = size_t(256) * 1024 * 1024;
+        constexpr size_t low_memory_threshold = size_t(1024) * 1024 * 1024;
         constexpr double mib = 1024.0 * 1024.0;
 
         for (const ggml_opt_f16_cache_device_memory & current : current_memory) {
+            const auto last = opt_ctx->f16_cache_diag_last_logged_free.find(current.device);
+            const bool first = last == opt_ctx->f16_cache_diag_last_logged_free.end();
+            uint32_t & startup_samples = opt_ctx->f16_cache_diag_startup_samples[current.device];
+            const bool startup = startup_samples < 3;
+            ++startup_samples;
+            const bool low_memory = current.free_bytes <= low_memory_threshold &&
+                opt_ctx->f16_cache_diag_low_memory_reported.insert(current.device).second;
+            const bool significant_drop = !first && last->second > current.free_bytes &&
+                last->second - current.free_bytes >= drop_threshold;
+
+            if (!startup && !low_memory && !significant_drop) {
+                continue;
+            }
+
+            const char * reason = low_memory ? "low_memory" :
+                (first ? "initial" : (startup ? "startup" : "free_drop"));
+            opt_ctx->f16_cache_diag_last_logged_free[current.device] = current.free_bytes;
+
             const double free = current.free_bytes / mib;
             const double used = current.total_bytes >= current.free_bytes
                 ? (current.total_bytes - current.free_bytes) / mib : 0.0;
-            GGML_LOG_INFO("F16 backward cache diagnostic: event=before_graph_launch step=%" PRId64
+            GGML_LOG_INFO("F16 backward cache diagnostic: event=before_graph_launch reason=%s step=%" PRId64
                           " phase=%s accumulation=%d/%d device=%s free=%.1fMiB"
                           " used=%.1fMiB total=%.1fMiB\n",
-                          opt_ctx->iter, ggml_opt_f16_cache_build_type_name(opt_ctx->build_type),
+                          reason, opt_ctx->iter, ggml_opt_f16_cache_build_type_name(opt_ctx->build_type),
                           opt_ctx->opt_i + 1, opt_ctx->opt_period, current.backend_name,
                           free, used, current.total_bytes / mib);
         }
@@ -369,11 +377,12 @@ namespace {
 
         const size_t n_candidates_before_backend = candidates.size();
         if (candidates.empty() || !opt_ctx->backend_sched) {
-            if (diagnostics_enabled) {
+            if (diagnostics_enabled && !opt_ctx->f16_cache_diag_cache_reported) {
                 GGML_LOG_INFO("F16 backward cache diagnostic: event=cache marked=%zu candidates=%zu"
                               " supported=0 inserted=0 reason=%s\n",
                               n_marked, n_candidates_before_backend,
                               candidates.empty() ? "no_candidates" : "no_backend_scheduler");
+                opt_ctx->f16_cache_diag_cache_reported = true;
             }
             return;
         }
@@ -480,7 +489,7 @@ namespace {
 
         }
 
-        if (diagnostics_enabled) {
+        if (diagnostics_enabled && !opt_ctx->f16_cache_diag_cache_reported) {
             constexpr double mib = 1024.0 * 1024.0;
             GGML_LOG_INFO("F16 backward cache diagnostic: event=cache marked=%zu candidates=%zu"
                           " supported=%zu inserted=%zu inserted_f32=%.1fMiB cache_f16=%.1fMiB"
@@ -488,6 +497,7 @@ namespace {
                           n_marked, n_candidates_before_backend, candidates.size(), n_inserted,
                           inserted_f32_bytes / mib, inserted_f16_bytes / mib,
                           n_nodes_before_cache, opt_ctx->gb_grad->n_nodes);
+            opt_ctx->f16_cache_diag_cache_reported = true;
         }
     }
 
@@ -1941,11 +1951,7 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
         }
     }
 
-    const bool log_launch_memory = ggml_opt_f16_cache_diagnostics_enabled() &&
-        ggml_opt_f16_cache_should_report(opt_ctx->f16_cache_diag_launch_events,
-                                         opt_ctx->iter,
-                                         opt_ctx->f16_cache_diag_last_launch_step);
-    if (log_launch_memory) {
+    if (ggml_opt_f16_cache_diagnostics_enabled()) {
         ggml_opt_f16_cache_log_launch_memory(opt_ctx);
     }
     ggml_backend_sched_graph_compute(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);

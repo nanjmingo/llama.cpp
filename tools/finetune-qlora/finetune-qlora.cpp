@@ -147,10 +147,6 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // Keep F16-cache diagnostics visible at the normal log level without enabling
-    // the unrelated verbose library messages controlled by -v.
-    qlora_diagnostic_log_scope diagnostic_log_scope;
-
     qparams.dataset.threads = params.cpuparams.n_threads > 0
         ? static_cast<size_t>(params.cpuparams.n_threads)
         : 0;
@@ -249,6 +245,9 @@ int main(int argc, char ** argv) {
     }
 
     common_init();
+    // Install after common_init(), which replaces the llama log callback.
+    // Keep tagged F16-cache diagnostics visible without enabling unrelated -v logs.
+    qlora_diagnostic_log_scope diagnostic_log_scope;
     llama_backend_init();
     llama_backend_scope backend_scope;
     llama_numa_init(params.numa);
