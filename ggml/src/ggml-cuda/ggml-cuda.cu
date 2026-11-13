@@ -6488,23 +6488,12 @@ static bool ggml_backend_cuda_device_supports_op_impl(ggml_backend_dev_t dev, co
             return ggml_is_quantized(src0_type) && ggml_is_contiguous(op->src[0]) &&
                 ggml_get_to_fp16_cuda(src0_type) != nullptr && fast_fp16_hardware_available(cc);
         }
-        case GGML_OP_OUT_PROD_ID: {
-            if (op->src[0] == nullptr || op->src[1] == nullptr || op->src[2] == nullptr ||
-                    op->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32 ||
-                    op->src[2]->type != GGML_TYPE_I32) {
-                return false;
-            }
-            if (op->src[0]->type == GGML_TYPE_F32) {
-                return true;
-            }
-            if (op->src[0]->type == GGML_TYPE_F16) {
-                const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
-                return op->src[0]->nb[0] == ggml_type_size(GGML_TYPE_F16) &&
-                    op->src[0]->nb[1] % ggml_type_size(GGML_TYPE_F16) == 0 &&
-                    fast_fp16_hardware_available(cc);
-            }
-            return false;
-        }
+        case GGML_OP_OUT_PROD_ID:
+            return op->src[0] != nullptr && op->src[1] != nullptr && op->src[2] != nullptr
+                && op->type        == GGML_TYPE_F32
+                && op->src[0]->type == GGML_TYPE_F32
+                && op->src[1]->type == GGML_TYPE_F32
+                && op->src[2]->type == GGML_TYPE_I32;
         case GGML_OP_GET_ROWS:
             {
                 switch (op->src[0]->type) {
