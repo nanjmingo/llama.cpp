@@ -839,6 +839,116 @@ static std::pair<int, int> test_regression(
     return std::make_pair(npass, ntest);
 }
 
+static bool run_gradient_checkpoint_case(
+        ggml_backend_sched_t backend_sched,
+        ggml_backend_t backend,
+        enum ggml_opt_optimizer_type optim,
+        bool checkpoint,
+        float & weight_after,
+        float & loss_after,
+        int32_t & checkpoint_count,
+        int32_t & recompute_nodes) {
+    struct ggml_init_params static_params = {
+        /*.mem_size   =*/ 4*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx_static = ggml_init(static_params);
+    ggml_tensor * inputs = ggml_new_tensor_1d(ctx_static, GGML_TYPE_F32, 1);
+    ggml_set_input(inputs);
+    ggml_tensor * weights = ggml_new_tensor_1d(ctx_static, GGML_TYPE_F32, 1);
+    ggml_set_param(weights);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx_static, backend);
+    const float input_value = 1.0f;
+    const float weight_value = 2.0f;
+    ggml_backend_tensor_set(inputs, &input_value, 0, sizeof(input_value));
+    ggml_backend_tensor_set(weights, &weight_value, 0, sizeof(weight_value));
+
+    struct ggml_init_params graph_params = {
+        /*.mem_size   =*/ 128*ggml_tensor_overhead() + ggml_graph_overhead_custom(128, true),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx_graph = ggml_init(graph_params);
+    ggml_tensor * hidden_input = ggml_add(ctx_graph, inputs, weights);
+    ggml_tensor * hidden = ggml_sqr(ctx_graph, hidden_input);
+    ggml_tensor * hidden_view = ggml_view_1d(ctx_graph, hidden, 1, 0);
+    ggml_tensor * checkpoint_tensor = ggml_sqr(ctx_graph, hidden_view);
+    if (checkpoint) {
+        checkpoint_tensor->flags |= GGML_TENSOR_FLAG_CHECKPOINT;
+    }
+    ggml_tensor * outputs = ggml_sqr(ctx_graph, checkpoint_tensor);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx_graph, 128, true);
+    ggml_build_forward_expand(gf, outputs);
+
+    struct ggml_init_params compute_params = {
+        /*.mem_size   =*/ 4096*ggml_tensor_overhead() +
+            3*ggml_graph_overhead_custom(checkpoint ? 256 : 128, true),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx_compute = ggml_init(compute_params);
+    ggml_opt_params opt_params = ggml_opt_default_params(backend_sched, GGML_OPT_LOSS_TYPE_SUM);
+    opt_params.optimizer = optim;
+    opt_params.get_opt_pars = helper_get_test_opt_pars;
+    opt_params.checkpoint = checkpoint;
+    ggml_opt_context_t opt_ctx = ggml_opt_init(opt_params);
+    ggml_opt_result_t result = ggml_opt_result_init();
+
+    ggml_opt_prepare_alloc(opt_ctx, ctx_compute, gf, inputs, outputs);
+    ggml_opt_alloc(opt_ctx, true);
+    checkpoint_count = ggml_opt_checkpoint_count(opt_ctx);
+    recompute_nodes = ggml_opt_recompute_nodes(opt_ctx);
+    ggml_opt_eval(opt_ctx, result);
+
+    ggml_backend_tensor_get(weights, &weight_after, 0, sizeof(weight_after));
+    double loss_value = 0.0;
+    ggml_opt_result_last_loss(result, &loss_value);
+    loss_after = static_cast<float>(loss_value);
+
+    ggml_opt_result_free(result);
+    ggml_opt_free(opt_ctx);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx_compute);
+    ggml_free(ctx_graph);
+    ggml_free(ctx_static);
+
+    return true;
+}
+
+static std::pair<int, int> test_gradient_checkpointing(
+        enum ggml_opt_optimizer_type optim,
+        ggml_backend_sched_t backend_sched,
+        ggml_backend_t backend) {
+    float weight_plain = 0.0f;
+    float weight_checkpoint = 0.0f;
+    float loss_plain = 0.0f;
+    float loss_checkpoint = 0.0f;
+    int32_t checkpoints = 0;
+    int32_t nodes = 0;
+    int32_t unused_checkpoints = 0;
+    int32_t unused_nodes = 0;
+
+    const bool plain_ok = run_gradient_checkpoint_case(
+            backend_sched, backend, optim, false, weight_plain, loss_plain,
+            unused_checkpoints, unused_nodes);
+    const bool checkpoint_ok = run_gradient_checkpoint_case(
+            backend_sched, backend, optim, true, weight_checkpoint, loss_checkpoint,
+            checkpoints, nodes);
+    const float expected_weight = optim == GGML_OPT_OPTIMIZER_TYPE_ADAMW ? 1.0f : -17494.0f;
+    const bool subtest_ok = plain_ok && checkpoint_ok &&
+        unused_checkpoints == 0 && unused_nodes == 0 && checkpoints == 1 && nodes == 3 &&
+        almost_equal(loss_plain, 6561.0, 1e-5) &&
+        almost_equal(loss_plain, loss_checkpoint, 1e-5) &&
+        almost_equal(weight_plain, expected_weight, 1e-4) &&
+        almost_equal(weight_plain, weight_checkpoint, 1e-5);
+
+    printf("  %s(): ", __func__);
+    print_ok(subtest_ok);
+    return std::make_pair(subtest_ok ? 1 : 0, 1);
+}
+
 static std::pair<int, int> test_backend(
     ggml_backend_sched_t backend_sched, ggml_backend_t backend, enum ggml_opt_optimizer_type optim) {
     int npass = 0;
@@ -851,6 +961,11 @@ static std::pair<int, int> test_backend(
     }
     {
         std::pair<int, int> partial = test_grad(optim, backend_sched, backend);
+        npass += partial.first;
+        ntest += partial.second;
+    }
+    {
+        std::pair<int, int> partial = test_gradient_checkpointing(optim, backend_sched, backend);
         npass += partial.first;
         ntest += partial.second;
     }
