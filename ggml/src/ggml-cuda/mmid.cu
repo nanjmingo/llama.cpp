@@ -1,5 +1,12 @@
 #include "common.cuh"
+#include "convert.cuh"
 #include "mmid.cuh"
+
+#include <algorithm>
+#include <cstdint>
+#include <limits>
+#include <type_traits>
+#include <vector>
 
 // To reduce shared memory use, store "it" and "iex_used" with 22/10 bits each.
 struct mm_ids_helper_store {
@@ -201,5 +208,461 @@ void ggml_cuda_launch_mm_ids_helper(
             launch_mm_ids_helper< 0>(ids, ids_src1, ids_dst, tile_spec,
                 n_experts, n_tokens, n_expert_used, nchannels_y, tile_width, si1, sis1, write_inverse, stream);
             break;
+    }
+}
+
+
+static __global__ void mul_mat_id_back_gather_kernel(
+        const float * __restrict__ grad,
+        const int32_t * __restrict__ pairs,
+        float * __restrict__ gathered,
+        const int64_t output_dim,
+        const int64_t n_used,
+        const int64_t grad_nb0,
+        const int64_t grad_nb1,
+        const int64_t grad_nb2) {
+    const int64_t route_idx = blockIdx.y;
+    const int64_t route = pairs[route_idx];
+    const int64_t used = route % n_used;
+    const int64_t token = route / n_used;
+
+    const float * grad_route = grad + used * grad_nb1 + token * grad_nb2;
+    float * gathered_route = gathered + route_idx * output_dim;
+
+    for (int64_t row = blockIdx.x * blockDim.x + threadIdx.x;
+         row < output_dim; row += gridDim.x * blockDim.x) {
+        gathered_route[row] = grad_route[row * grad_nb0];
+    }
+}
+
+template<typename dst_t>
+static __global__ void mul_mat_id_back_gather_lowp_kernel(
+        const float * __restrict__ grad,
+        const int32_t * __restrict__ pairs,
+        dst_t * __restrict__ gathered,
+        const int64_t output_offset,
+        const int64_t chunk_dim,
+        const int64_t n_used,
+        const int64_t grad_nb0,
+        const int64_t grad_nb1,
+        const int64_t grad_nb2) {
+    const int64_t route_idx = blockIdx.y;
+    const int64_t route = pairs[route_idx];
+    const int64_t used = route % n_used;
+    const int64_t token = route / n_used;
+
+    const float * grad_route = grad + used * grad_nb1 + token * grad_nb2;
+    dst_t * gathered_route = gathered + route_idx * chunk_dim;
+
+    for (int64_t row = blockIdx.x * blockDim.x + threadIdx.x;
+         row < chunk_dim; row += gridDim.x * blockDim.x) {
+        const float value = grad_route[(output_offset + row) * grad_nb0];
+        if constexpr (std::is_same_v<dst_t, half>) {
+            gathered_route[row] = __float2half_rn(value);
+        } else {
+            gathered_route[row] = __float2bfloat16(value);
+        }
+    }
+}
+
+template<typename dst_t>
+static void mul_mat_id_back_gather_lowp(
+        const float * grad,
+        const int32_t * pairs,
+        dst_t * gathered,
+        const int64_t output_offset,
+        const int64_t chunk_dim,
+        const int64_t route_count,
+        const int64_t n_used,
+        const int64_t grad_nb0,
+        const int64_t grad_nb1,
+        const int64_t grad_nb2,
+        cudaStream_t stream) {
+    const dim3 grid((chunk_dim + 255) / 256, route_count, 1);
+    mul_mat_id_back_gather_lowp_kernel<<<grid, 256, 0, stream>>>(
+        grad, pairs, gathered, output_offset, chunk_dim, n_used,
+        grad_nb0, grad_nb1, grad_nb2);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static __global__ void mul_mat_id_back_scatter_kernel(
+        const float * __restrict__ input_gradient,
+        const int32_t * __restrict__ pairs,
+        float * __restrict__ dst,
+        const int64_t input_dim,
+        const int64_t n_used,
+        const int64_t n_slots,
+        const int64_t dst_nb1,
+        const int64_t dst_nb2) {
+    const int64_t route_idx = blockIdx.y;
+    const int64_t route = pairs[route_idx];
+    const int64_t used = route % n_used;
+    const int64_t token = route / n_used;
+    const int64_t slot = used % n_slots;
+    float * dst_route = (float *) ((char *) dst + slot * dst_nb1 + token * dst_nb2);
+    const float * src_route = input_gradient + route_idx * input_dim;
+
+    for (int64_t col = blockIdx.x * blockDim.x + threadIdx.x;
+         col < input_dim; col += gridDim.x * blockDim.x) {
+        atomicAdd(dst_route + col, src_route[col]);
+    }
+}
+
+
+template<typename lowp_t>
+static __global__ void mul_mat_id_back_convert_weights_f32_kernel(
+        const float * src, lowp_t * dst, const int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    if constexpr (std::is_same_v<lowp_t, half>) {
+        dst[i] = __float2half_rn(src[i]);
+    } else {
+        dst[i] = __float2bfloat16(src[i]);
+    }
+}
+
+void ggml_cuda_mul_mat_id_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * as = dst->src[0];
+    const ggml_tensor * grad = dst->src[1];
+    const ggml_tensor * ids = dst->src[2];
+    const ggml_tensor * b_like = dst->src[3];
+
+    GGML_ASSERT(grad->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(ids->nb[0] == sizeof(int32_t) && ids->nb[1] % sizeof(int32_t) == 0);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst));
+    GGML_ASSERT(as->ne[0] == b_like->ne[0] && as->ne[1] == grad->ne[0]);
+    GGML_ASSERT(grad->ne[1] == ids->ne[0] && grad->ne[2] == ids->ne[1]);
+    GGML_ASSERT(ids->ne[0] % b_like->ne[1] == 0);
+
+    const int64_t input_dim = as->ne[0];
+    const int64_t output_dim = as->ne[1];
+    const int64_t n_used = ids->ne[0];
+    const int64_t n_tokens = ids->ne[1];
+    const int64_t n_slots = b_like->ne[1];
+    const int64_t n_experts = as->ne[2];
+    const int64_t n_routes = n_used * n_tokens;
+    GGML_ASSERT(input_dim > 0 && output_dim > 0 && n_slots > 0);
+    GGML_ASSERT(n_routes <= std::numeric_limits<int32_t>::max());
+    GGML_ASSERT(input_dim <= std::numeric_limits<int>::max());
+    GGML_ASSERT(output_dim <= std::numeric_limits<int>::max());
+
+    cudaStream_t stream = ctx.stream();
+
+    ggml_cuda_pool_alloc<int32_t> ids_device(ctx.pool());
+    const bool ids_on_device = ids->buffer && !ggml_backend_buffer_is_host(ids->buffer);
+    const int32_t * ids_ptr = (const int32_t *) ids->data;
+    if (!ids_on_device) {
+        ids_device.alloc(ggml_nbytes(ids) / sizeof(int32_t));
+        CUDA_CHECK(cudaMemcpyAsync(ids_device.ptr, ids->data, ggml_nbytes(ids), cudaMemcpyHostToDevice, stream));
+        ids_ptr = ids_device.ptr;
+    }
+
+    CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
+
+    if (n_routes == 0) {
+        return;
+    }
+
+    ggml_cuda_pool_alloc<int32_t> pairs(ctx.pool(), static_cast<size_t>(n_routes));
+    ggml_cuda_pool_alloc<ggml_cuda_mm_id_tile_spec> tile_spec(ctx.pool(), static_cast<size_t>(n_experts + 1));
+    ggml_cuda_pool_alloc<int32_t> ids_src(ctx.pool(), static_cast<size_t>(n_routes));
+
+    const int si1 = static_cast<int>(ids->nb[1] / sizeof(int32_t));
+    const size_t n_tile_specs = static_cast<size_t>(n_experts + 1);
+    CUDA_CHECK(cudaMemsetAsync(tile_spec.ptr, 0xFF,
+        n_tile_specs * sizeof(ggml_cuda_mm_id_tile_spec), stream));
+    ggml_cuda_launch_mm_ids_helper(
+        ids_ptr,
+        ids_src.ptr,
+        pairs.ptr,
+        tile_spec.ptr,
+        static_cast<int>(n_experts),
+        static_cast<int>(n_tokens),
+        static_cast<int>(n_used),
+        static_cast<int>(n_used),
+        static_cast<int>(n_routes),
+        si1,
+        static_cast<int>(n_used),
+         false,
+        stream);
+    CUDA_CHECK(cudaGetLastError());
+
+    std::vector<ggml_cuda_mm_id_tile_spec> tile_spec_host(n_tile_specs);
+    CUDA_CHECK(cudaMemcpyAsync(tile_spec_host.data(), tile_spec.ptr,
+        tile_spec_host.size() * sizeof(ggml_cuda_mm_id_tile_spec), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::vector<int32_t> offsets_host(static_cast<size_t>(n_experts + 1));
+    for (int64_t expert = 0; expert < n_experts; ++expert) {
+        int32_t col_low  = std::numeric_limits<int32_t>::max();
+        int32_t col_high = 0;
+        bool found = false;
+        for (const ggml_cuda_mm_id_tile_spec & spec : tile_spec_host) {
+            if (spec.expert != expert) {
+                continue;
+            }
+            col_low  = std::min(col_low, spec.col_low);
+            col_high = std::max(col_high, spec.col_high);
+            found = true;
+        }
+        GGML_ASSERT(found);
+        offsets_host[expert]     = col_low;
+        offsets_host[expert + 1] = col_high;
+    }
+
+    const int64_t n_active_routes = offsets_host.back();
+    if (n_active_routes == 0) {
+        return;
+    }
+
+    const float * grad_ptr = (const float *) grad->data;
+    float * dst_ptr = (float *) dst->data;
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const ggml_prec backward_precision = ggml_prec_get_bwd(dst);
+    const bool use_fp16 = backward_precision == GGML_PREC_F16
+        ? fast_fp16_hardware_available(cc)
+        : backward_precision == GGML_PREC_UNDEFINED && as->type != GGML_TYPE_F32 && as->type != GGML_TYPE_BF16 &&
+            fast_fp16_hardware_available(cc);
+    const bool use_bf16 = backward_precision == GGML_PREC_BF16
+        ? fast_bf16_hardware_available(cc)
+        : backward_precision == GGML_PREC_UNDEFINED && as->type == GGML_TYPE_BF16 &&
+            fast_bf16_hardware_available(cc);
+    const bool use_fp32 = !use_fp16 && !use_bf16;
+    const to_fp16_cuda_t to_fp16 = use_fp16 && as->type != GGML_TYPE_F16
+        ? ggml_get_to_fp16_cuda(as->type) : nullptr;
+    const to_bf16_cuda_t to_bf16 = use_bf16 && as->type != GGML_TYPE_BF16
+        ? ggml_get_to_bf16_cuda(as->type) : nullptr;
+    const bool use_fp32_staging =
+        (use_fp16 && as->type != GGML_TYPE_F16 && to_fp16 == nullptr) ||
+        (use_bf16 && as->type != GGML_TYPE_BF16 && to_bf16 == nullptr);
+    const to_fp32_cuda_t to_fp32 = (use_fp32 && as->type != GGML_TYPE_F32) || use_fp32_staging
+        ? ggml_get_to_fp32_cuda(as->type) : nullptr;
+    GGML_ASSERT(!use_fp16 || as->type == GGML_TYPE_F16 || to_fp16 != nullptr || to_fp32 != nullptr);
+    GGML_ASSERT(!use_bf16 || as->type == GGML_TYPE_BF16 || to_bf16 != nullptr || to_fp32 != nullptr);
+    GGML_ASSERT(!use_fp32 || as->type == GGML_TYPE_F32 || to_fp32 != nullptr);
+    constexpr int64_t min_weight_chunk_dim = 1024;
+    constexpr int64_t max_weight_chunk_dim = 8192;
+    constexpr int64_t max_batch_routes = 64;
+    constexpr size_t max_weight_temp_bytes = 64u * 1024u * 1024u;
+
+    size_t free_memory = 0;
+    size_t total_memory = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free_memory, &total_memory));
+    const size_t weight_temp_budget = std::min(max_weight_temp_bytes, free_memory / 16);
+    const size_t compute_type_size = use_fp16 || use_bf16 ? sizeof(half) : sizeof(float);
+    const size_t bytes_per_output = static_cast<size_t>(input_dim) * compute_type_size;
+    const int64_t memory_limited_chunk = bytes_per_output == 0 ? min_weight_chunk_dim :
+        static_cast<int64_t>(weight_temp_budget / bytes_per_output);
+    const int64_t max_chunk_dim = std::max(min_weight_chunk_dim,
+        std::min(max_weight_chunk_dim, memory_limited_chunk));
+    const int64_t weight_chunk_capacity = std::min(output_dim, max_chunk_dim);
+
+    ggml_cuda_pool_alloc<float> weights_f32(ctx.pool());
+    ggml_cuda_pool_alloc<half> weights_f16(ctx.pool());
+    ggml_cuda_pool_alloc<nv_bfloat16> weights_bf16(ctx.pool());
+    if (use_fp16 && as->type != GGML_TYPE_F16) {
+        weights_f16.alloc(static_cast<size_t>(input_dim * weight_chunk_capacity));
+    } else if (use_bf16 && as->type != GGML_TYPE_BF16) {
+        weights_bf16.alloc(static_cast<size_t>(input_dim * weight_chunk_capacity));
+    }
+    if ((use_fp32 && as->type != GGML_TYPE_F32) || use_fp32_staging) {
+        weights_f32.alloc(static_cast<size_t>(input_dim * weight_chunk_capacity));
+    }
+
+    ggml_cuda_pool_alloc<float> gathered(ctx.pool());
+    ggml_cuda_pool_alloc<half> gathered_f16(ctx.pool());
+    ggml_cuda_pool_alloc<nv_bfloat16> gathered_bf16(ctx.pool());
+    ggml_cuda_pool_alloc<float> input_gradient(ctx.pool());
+    if (use_fp32) {
+        gathered.alloc(static_cast<size_t>(max_batch_routes * output_dim));
+    } else if (use_fp16) {
+        gathered_f16.alloc(static_cast<size_t>(max_batch_routes * weight_chunk_capacity));
+    } else if (use_bf16) {
+        gathered_bf16.alloc(static_cast<size_t>(max_batch_routes * weight_chunk_capacity));
+    }
+    input_gradient.alloc(static_cast<size_t>(max_batch_routes * input_dim));
+
+    cublasHandle_t handle = ctx.cublas_handle();
+    CUBLAS_CHECK(cublasSetStream(handle, stream));
+    const float alpha = 1.0f;
+    const float beta_zero = 0.0f;
+    const float beta_one = 1.0f;
+
+    const int64_t grad_nb0 = grad->nb[0] / sizeof(float);
+    const int64_t grad_nb1 = grad->nb[1] / sizeof(float);
+    const int64_t grad_nb2 = grad->nb[2] / sizeof(float);
+    const int64_t dst_nb1 = dst->nb[1] / sizeof(float);
+    const int64_t dst_nb2 = dst->nb[2] / sizeof(float);
+
+    for (int64_t expert = 0; expert < n_experts; ++expert) {
+        const int64_t route_begin = offsets_host[static_cast<size_t>(expert)];
+        const int64_t route_end = offsets_host[static_cast<size_t>(expert + 1)];
+        const int64_t expert_routes = route_end - route_begin;
+        if (expert_routes == 0) {
+            continue;
+        }
+
+        const char * expert_weights = (const char *) as->data + expert * as->nb[2];
+        const float * weights_ptr = as->type == GGML_TYPE_F32 ? (const float *) expert_weights : nullptr;
+
+        const ggml_type compute_weight_type = use_fp16 ? GGML_TYPE_F16 :
+            use_bf16 ? GGML_TYPE_BF16 : GGML_TYPE_F32;
+        const bool cache_full_weights = expert_routes > max_batch_routes &&
+            weight_chunk_capacity == output_dim && ggml_is_contiguous(as) &&
+            as->type != compute_weight_type;
+        const half * cached_weights_f16 = nullptr;
+        const nv_bfloat16 * cached_weights_bf16 = nullptr;
+        const float * cached_weights_f32 = nullptr;
+        if (cache_full_weights) {
+            const int64_t n_weights = input_dim * output_dim;
+            if (use_fp16) {
+                if (to_fp16 != nullptr) {
+                    to_fp16(expert_weights, weights_f16.ptr, n_weights, stream);
+                } else {
+                    GGML_ASSERT(to_fp32 != nullptr);
+                    to_fp32(expert_weights, weights_f32.ptr, n_weights, stream);
+                    const int threads = 256;
+                    mul_mat_id_back_convert_weights_f32_kernel<half><<<(n_weights + threads - 1) / threads, threads, 0, stream>>>(
+                        weights_f32.ptr, weights_f16.ptr, n_weights);
+                    CUDA_CHECK(cudaGetLastError());
+                }
+                cached_weights_f16 = weights_f16.ptr;
+            } else if (use_bf16) {
+                if (to_bf16 != nullptr) {
+                    to_bf16(expert_weights, weights_bf16.ptr, n_weights, stream);
+                } else {
+                    GGML_ASSERT(to_fp32 != nullptr);
+                    to_fp32(expert_weights, weights_f32.ptr, n_weights, stream);
+                    const int threads = 256;
+                    mul_mat_id_back_convert_weights_f32_kernel<nv_bfloat16><<<(n_weights + threads - 1) / threads, threads, 0, stream>>>(
+                        weights_f32.ptr, weights_bf16.ptr, n_weights);
+                    CUDA_CHECK(cudaGetLastError());
+                }
+                cached_weights_bf16 = weights_bf16.ptr;
+            } else {
+                to_fp32(expert_weights, weights_f32.ptr, n_weights, stream);
+                cached_weights_f32 = weights_f32.ptr;
+            }
+        }
+
+        const int32_t * expert_pairs = pairs.ptr + route_begin;
+        for (int64_t route_offset = 0; route_offset < expert_routes; route_offset += max_batch_routes) {
+            const int64_t route_count = std::min(max_batch_routes, expert_routes - route_offset);
+            const int32_t * route_pairs = expert_pairs + route_offset;
+            if (use_fp32) {
+                const dim3 gather_grid((output_dim + 255) / 256, route_count, 1);
+                mul_mat_id_back_gather_kernel<<<gather_grid, 256, 0, stream>>>(
+                    grad_ptr, route_pairs, gathered.ptr, output_dim, n_used,
+                    grad_nb0, grad_nb1, grad_nb2);
+                CUDA_CHECK(cudaGetLastError());
+            }
+
+            if (as->type == GGML_TYPE_F32 && use_fp32) {
+                CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                    static_cast<int>(input_dim), static_cast<int>(route_count), static_cast<int>(output_dim),
+                    &alpha, weights_ptr, static_cast<int>(input_dim),
+                    gathered.ptr, static_cast<int>(output_dim),
+                    &beta_zero, input_gradient.ptr, static_cast<int>(input_dim)));
+            } else {
+                for (int64_t output_offset = 0; output_offset < output_dim; output_offset += weight_chunk_capacity) {
+                    const int64_t chunk_dim = std::min(weight_chunk_capacity, output_dim - output_offset);
+                    const char * weight_chunk = expert_weights + output_offset * as->nb[1];
+                    const float * beta = output_offset == 0 ? &beta_zero : &beta_one;
+
+                    if (use_fp16) {
+                        // Gather and convert directly from the F32 gradient into the F16 GEMM input.
+                        // This avoids keeping a full F32 gathered copy alongside the F16 tile.
+                        mul_mat_id_back_gather_lowp(
+                            grad_ptr, route_pairs, gathered_f16.ptr,
+                            output_offset, chunk_dim, route_count, n_used,
+                            grad_nb0, grad_nb1, grad_nb2, stream);
+
+                        const half * weights_f16_ptr;
+                        if (as->type == GGML_TYPE_F16) {
+                            weights_f16_ptr = (const half *) weight_chunk;
+                        } else if (cached_weights_f16 != nullptr) {
+                            weights_f16_ptr = cached_weights_f16 + output_offset * input_dim;
+                        } else {
+                            const int64_t n_weights = input_dim * chunk_dim;
+                            if (to_fp16 != nullptr) {
+                                to_fp16(weight_chunk, weights_f16.ptr, n_weights, stream);
+                            } else {
+                                GGML_ASSERT(to_fp32 != nullptr);
+                                to_fp32(weight_chunk, weights_f32.ptr, n_weights, stream);
+                                const int threads = 256;
+                                mul_mat_id_back_convert_weights_f32_kernel<half><<<(n_weights + threads - 1) / threads, threads, 0, stream>>>(
+                                    weights_f32.ptr, weights_f16.ptr, n_weights);
+                                CUDA_CHECK(cudaGetLastError());
+                            }
+                            weights_f16_ptr = weights_f16.ptr;
+                        }
+
+                        CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                            static_cast<int>(input_dim), static_cast<int>(route_count), static_cast<int>(chunk_dim),
+                            &alpha, weights_f16_ptr, CUDA_R_16F, static_cast<int>(input_dim),
+                            gathered_f16.ptr, CUDA_R_16F, static_cast<int>(chunk_dim),
+                            beta, input_gradient.ptr, CUDA_R_32F, static_cast<int>(input_dim),
+                            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                    } else if (use_bf16) {
+                        // Same fused gather/conversion for the BF16 path.
+                        mul_mat_id_back_gather_lowp(
+                            grad_ptr, route_pairs, gathered_bf16.ptr,
+                            output_offset, chunk_dim, route_count, n_used,
+                            grad_nb0, grad_nb1, grad_nb2, stream);
+
+                        const nv_bfloat16 * weights_bf16_ptr;
+                        if (as->type == GGML_TYPE_BF16) {
+                            weights_bf16_ptr = (const nv_bfloat16 *) weight_chunk;
+                        } else if (cached_weights_bf16 != nullptr) {
+                            weights_bf16_ptr = cached_weights_bf16 + output_offset * input_dim;
+                        } else {
+                            const int64_t n_weights = input_dim * chunk_dim;
+                            if (to_bf16 != nullptr) {
+                                to_bf16(weight_chunk, weights_bf16.ptr, n_weights, stream);
+                            } else {
+                                GGML_ASSERT(to_fp32 != nullptr);
+                                to_fp32(weight_chunk, weights_f32.ptr, n_weights, stream);
+                                const int threads = 256;
+                                mul_mat_id_back_convert_weights_f32_kernel<nv_bfloat16><<<(n_weights + threads - 1) / threads, threads, 0, stream>>>(
+                                    weights_f32.ptr, weights_bf16.ptr, n_weights);
+                                CUDA_CHECK(cudaGetLastError());
+                            }
+                            weights_bf16_ptr = weights_bf16.ptr;
+                        }
+
+                        CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                            static_cast<int>(input_dim), static_cast<int>(route_count), static_cast<int>(chunk_dim),
+                            &alpha, weights_bf16_ptr, CUDA_R_16BF, static_cast<int>(input_dim),
+                            gathered_bf16.ptr, CUDA_R_16BF, static_cast<int>(chunk_dim),
+                            beta, input_gradient.ptr, CUDA_R_32F, static_cast<int>(input_dim),
+                            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                    } else {
+                        const float * weights_f32_ptr;
+                        if (as->type == GGML_TYPE_F32) {
+                            weights_f32_ptr = (const float *) weight_chunk;
+                        } else if (cached_weights_f32 != nullptr) {
+                            weights_f32_ptr = cached_weights_f32 + output_offset * input_dim;
+                        } else {
+                            to_fp32(weight_chunk, weights_f32.ptr, input_dim * chunk_dim, stream);
+                            weights_f32_ptr = weights_f32.ptr;
+                        }
+
+                        CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                            static_cast<int>(input_dim), static_cast<int>(route_count), static_cast<int>(chunk_dim),
+                            &alpha, weights_f32_ptr, static_cast<int>(input_dim),
+                            gathered.ptr + output_offset, static_cast<int>(output_dim),
+                            beta, input_gradient.ptr, static_cast<int>(input_dim)));
+                    }
+                }
+            }
+
+            const dim3 scatter_grid((input_dim + 255) / 256, route_count, 1);
+            mul_mat_id_back_scatter_kernel<<<scatter_grid, 256, 0, stream>>>(
+                input_gradient.ptr, route_pairs, dst_ptr, input_dim, n_used, n_slots,
+                dst_nb1, dst_nb2);
+            CUDA_CHECK(cudaGetLastError());
+        }
     }
 }
