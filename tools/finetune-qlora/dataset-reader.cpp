@@ -1,0 +1,42 @@
+#include "dataset-reader.h"
+
+#include <string>
+#include <utility>
+
+namespace {
+
+void append_stats(dataset_stats & target, const dataset_stats & source) {
+    target.records_read += source.records_read;
+    target.records_accepted += source.records_accepted;
+    target.invalid_records += source.invalid_records;
+    target.rendered_samples += source.rendered_samples;
+    target.training_windows += source.training_windows;
+}
+
+
+}
+
+dataset_read_summary read_dataset_records_batched(const dataset_options & options,
+                                                   const dataset_batch_callback & consume_batch,
+                                                   dataset_thread_pool * pool) {
+    dataset_read_summary summary;
+    summary.success = !options.input_paths.empty();
+    if (options.input_paths.empty()) {
+        dataset_read_result batch;
+        batch.diagnostics.push_back({{}, 0, "no dataset input files were specified"});
+        consume_batch(std::move(batch));
+        summary.success = false;
+        return summary;
+    }
+
+    for (const std::string & path : options.input_paths) {
+
+        dataset_read_summary current = read_jsonl_dataset_batched(path, options, consume_batch, pool);
+        append_stats(summary.stats, current.stats);
+        if (!current.success) {
+            summary.success = false;
+            break;
+        }
+    }
+    return summary;
+}
