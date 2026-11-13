@@ -67,6 +67,34 @@ std::string unique_init_adapter_path(const std::string & output_path) {
     }
 }
 
+class qlora_diagnostic_log_scope {
+    ggml_log_callback previous_callback = nullptr;
+    void * previous_user_data = nullptr;
+
+    static void callback(ggml_log_level level, const char * text, void * user_data) {
+        auto * self = static_cast<qlora_diagnostic_log_scope *>(user_data);
+        if (text && std::strstr(text, "F16 backward cache diagnostic:") != nullptr) {
+            // Route only the explicitly tagged diagnostic records through the
+            // common logger, bypassing the usual -v/TRACE verbosity filter.
+            common_log_add(common_log_main(), GGML_LOG_LEVEL_INFO, "%s", text);
+            return;
+        }
+        if (self->previous_callback) {
+            self->previous_callback(level, text, self->previous_user_data);
+        }
+    }
+
+public:
+    qlora_diagnostic_log_scope() {
+        llama_log_get(&previous_callback, &previous_user_data);
+        llama_log_set(callback, this);
+    }
+
+    ~qlora_diagnostic_log_scope() {
+        llama_log_set(previous_callback, previous_user_data);
+    }
+};
+
 struct llama_backend_scope {
     ~llama_backend_scope() {
         llama_backend_free();
@@ -118,6 +146,10 @@ int main(int argc, char ** argv) {
             return 1;
         }
     }
+
+    // Keep F16-cache diagnostics visible at the normal log level without enabling
+    // the unrelated verbose library messages controlled by -v.
+    qlora_diagnostic_log_scope diagnostic_log_scope;
 
     qparams.dataset.threads = params.cpuparams.n_threads > 0
         ? static_cast<size_t>(params.cpuparams.n_threads)

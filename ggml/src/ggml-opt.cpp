@@ -78,6 +78,8 @@ struct ggml_opt_context {
     int32_t opt_period         = 1;
     int32_t opt_i              = 0;
     int32_t grad_stats_interval = 0;
+    uint64_t f16_cache_diag_launch_events = 0;
+    int64_t f16_cache_diag_last_launch_step = -1;
     float   loss_normalizer    = 0.0f;
     bool    loss_per_datapoint = false;
 
@@ -122,17 +124,90 @@ namespace {
         std::vector<ggml_opt_f16_cache_user> backward_users;
     };
 
-    static bool ggml_opt_f16_cache_debug_enabled() {
-        const char * value = std::getenv("GGML_OPT_F16_CACHE_DEBUG");
+    static bool ggml_opt_f16_cache_diagnostics_enabled() {
+        const char * value = std::getenv("GGML_OPT_F16_CACHE_DIAGNOSTICS");
         return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
     }
 
-    static size_t ggml_opt_f16_cache_nbytes(const ggml_tensor * tensor) {
-        size_t size = ggml_row_size(GGML_TYPE_F16, tensor->ne[0]);
-        for (int i = 1; i < GGML_MAX_DIMS; ++i) {
-            size *= static_cast<size_t>(tensor->ne[i]);
+    struct ggml_opt_f16_cache_device_memory {
+        ggml_backend_dev_t device;
+        const char * backend_name;
+        size_t free_bytes;
+        size_t total_bytes;
+    };
+
+    static std::vector<ggml_opt_f16_cache_device_memory> ggml_opt_f16_cache_get_device_memory(
+            ggml_opt_context_t opt_ctx) {
+        std::vector<ggml_opt_f16_cache_device_memory> result;
+        if (!opt_ctx || !opt_ctx->backend_sched) {
+            return result;
         }
-        return size;
+
+        std::unordered_set<ggml_backend_dev_t> seen;
+        const int n_backends = ggml_backend_sched_get_n_backends(opt_ctx->backend_sched);
+        for (int i = 0; i < n_backends; ++i) {
+            ggml_backend_t backend = ggml_backend_sched_get_backend(opt_ctx->backend_sched, i);
+            const char * backend_name = ggml_backend_name(backend);
+            if (!backend_name || std::strncmp(backend_name, "CUDA", 4) != 0) {
+                continue;
+            }
+
+            ggml_backend_dev_t device = ggml_backend_get_device(backend);
+            if (!device || !seen.insert(device).second) {
+                continue;
+            }
+
+            ggml_opt_f16_cache_device_memory memory = {};
+            memory.device = device;
+            memory.backend_name = backend_name;
+            ggml_backend_dev_memory(device, &memory.free_bytes, &memory.total_bytes);
+            result.push_back(memory);
+        }
+        return result;
+    }
+
+    static const char * ggml_opt_f16_cache_build_type_name(enum ggml_opt_build_type build_type) {
+        switch (build_type) {
+            case GGML_OPT_BUILD_TYPE_FORWARD: return "forward";
+            case GGML_OPT_BUILD_TYPE_GRAD:    return "gradient";
+            case GGML_OPT_BUILD_TYPE_OPT:     return "optimizer";
+            default:                          return "unknown";
+        }
+    }
+
+    // Keep diagnostics useful without producing one line for every training batch:
+    // report the first eight events, then one event every 512 optimizer steps.
+    static bool ggml_opt_f16_cache_should_report(
+            uint64_t & event_count,
+            int64_t step,
+            int64_t & last_periodic_step) {
+        const uint64_t event = event_count++;
+        if (event < 8) {
+            return true;
+        }
+        if (step > 0 && step % 512 == 0 && last_periodic_step != step) {
+            last_periodic_step = step;
+            return true;
+        }
+        return false;
+    }
+
+    static void ggml_opt_f16_cache_log_launch_memory(ggml_opt_context_t opt_ctx) {
+        const std::vector<ggml_opt_f16_cache_device_memory> current_memory =
+            ggml_opt_f16_cache_get_device_memory(opt_ctx);
+        constexpr double mib = 1024.0 * 1024.0;
+
+        for (const ggml_opt_f16_cache_device_memory & current : current_memory) {
+            const double free = current.free_bytes / mib;
+            const double used = current.total_bytes >= current.free_bytes
+                ? (current.total_bytes - current.free_bytes) / mib : 0.0;
+            GGML_LOG_INFO("F16 backward cache diagnostic: event=before_graph_launch step=%" PRId64
+                          " phase=%s accumulation=%d/%d device=%s free=%.1fMiB"
+                          " used=%.1fMiB total=%.1fMiB\n",
+                          opt_ctx->iter, ggml_opt_f16_cache_build_type_name(opt_ctx->build_type),
+                          opt_ctx->opt_i + 1, opt_ctx->opt_period, current.backend_name,
+                          free, used, current.total_bytes / mib);
+        }
     }
 
     static bool ggml_opt_is_view_of(const ggml_tensor * tensor, const ggml_tensor * base) {
@@ -169,10 +244,13 @@ namespace {
 
     static void ggml_opt_cache_f16_backward_activations(ggml_opt_context_t opt_ctx) {
         const int n_nodes_f = opt_ctx->gf->n_nodes;
+        const bool diagnostics_enabled = ggml_opt_f16_cache_diagnostics_enabled();
         size_t n_marked = 0;
-        for (int i = 0; i < n_nodes_f; ++i) {
-            if (opt_ctx->gf->nodes[i]->flags & GGML_TENSOR_FLAG_F16_BACKWARD_CACHE) {
-                ++n_marked;
+        if (diagnostics_enabled) {
+            for (int i = 0; i < n_nodes_f; ++i) {
+                if (opt_ctx->gf->nodes[i]->flags & GGML_TENSOR_FLAG_F16_BACKWARD_CACHE) {
+                    ++n_marked;
+                }
             }
         }
         opt_ctx->n_forward_nodes = n_nodes_f;
@@ -291,8 +369,12 @@ namespace {
 
         const size_t n_candidates_before_backend = candidates.size();
         if (candidates.empty() || !opt_ctx->backend_sched) {
-            GGML_LOG_INFO("F16 backward cache: marked=%zu candidates=%zu backend_supported=0 inserted=0\n",
-                          n_marked, n_candidates_before_backend);
+            if (diagnostics_enabled) {
+                GGML_LOG_INFO("F16 backward cache diagnostic: event=cache marked=%zu candidates=%zu"
+                              " supported=0 inserted=0 reason=%s\n",
+                              n_marked, n_candidates_before_backend,
+                              candidates.empty() ? "no_candidates" : "no_backend_scheduler");
+            }
             return;
         }
 
@@ -340,13 +422,6 @@ namespace {
         }), candidates.end());
         ggml_backend_sched_reset(opt_ctx->backend_sched);
 
-        size_t supported_f32_bytes = 0;
-        size_t supported_f16_bytes = 0;
-        for (const ggml_opt_f16_cache_candidate & candidate : candidates) {
-            supported_f32_bytes += ggml_nbytes(candidate.activation);
-            supported_f16_bytes += ggml_opt_f16_cache_nbytes(candidate.activation);
-        }
-
         std::sort(candidates.begin(), candidates.end(), [](const auto & lhs, const auto & rhs) {
             return lhs.last_forward_use > rhs.last_forward_use;
         });
@@ -355,7 +430,6 @@ namespace {
         size_t inserted_f32_bytes = 0;
         size_t inserted_f16_bytes = 0;
         size_t n_inserted = 0;
-        const bool debug_cache = ggml_opt_f16_cache_debug_enabled();
 
         for (const ggml_opt_f16_cache_candidate & candidate : candidates) {
             if (opt_ctx->gb_grad->n_nodes >= ggml_graph_size(opt_ctx->gb_grad)) {
@@ -403,24 +477,18 @@ namespace {
             ++n_inserted;
             inserted_f32_bytes += ggml_nbytes(candidate.activation);
             inserted_f16_bytes += ggml_nbytes(cache);
-            if (debug_cache) {
-                GGML_LOG_INFO("F16 backward cache: tensor='%s' shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] F32=%zu KiB F16=%zu KiB backward_users=%zu\n",
-                              candidate.activation->name,
-                              candidate.activation->ne[0], candidate.activation->ne[1],
-                              candidate.activation->ne[2], candidate.activation->ne[3],
-                              ggml_nbytes(candidate.activation) / 1024, ggml_nbytes(cache) / 1024,
-                              candidate.backward_users.size());
-            }
+
         }
 
-        const double mib = 1024.0 * 1024.0;
-        GGML_LOG_INFO("F16 backward cache: marked=%zu candidates=%zu backend_supported=%zu inserted=%zu, "
-                      "supported F32=%.1f MiB F16=%.1f MiB, inserted F32=%.1f MiB F16=%.1f MiB, "
-                      "graph_nodes=%d->%d\n",
-                      n_marked, n_candidates_before_backend, candidates.size(), n_inserted,
-                      supported_f32_bytes / mib, supported_f16_bytes / mib,
-                      inserted_f32_bytes / mib, inserted_f16_bytes / mib,
-                      n_nodes_before_cache, opt_ctx->gb_grad->n_nodes);
+        if (diagnostics_enabled) {
+            constexpr double mib = 1024.0 * 1024.0;
+            GGML_LOG_INFO("F16 backward cache diagnostic: event=cache marked=%zu candidates=%zu"
+                          " supported=%zu inserted=%zu inserted_f32=%.1fMiB cache_f16=%.1fMiB"
+                          " graph_nodes=%d->%d\n",
+                          n_marked, n_candidates_before_backend, candidates.size(), n_inserted,
+                          inserted_f32_bytes / mib, inserted_f16_bytes / mib,
+                          n_nodes_before_cache, opt_ctx->gb_grad->n_nodes);
+        }
     }
 
     void ggml_opt_collect_grad_stats(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
@@ -1873,6 +1941,13 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
         }
     }
 
+    const bool log_launch_memory = ggml_opt_f16_cache_diagnostics_enabled() &&
+        ggml_opt_f16_cache_should_report(opt_ctx->f16_cache_diag_launch_events,
+                                         opt_ctx->iter,
+                                         opt_ctx->f16_cache_diag_last_launch_step);
+    if (log_launch_memory) {
+        ggml_opt_f16_cache_log_launch_memory(opt_ctx);
+    }
     ggml_backend_sched_graph_compute(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
     if (result && opt_ctx->allocated_graph == opt_ctx->gb_opt && opt_ctx->grad_stats_interval > 0 &&
         opt_ctx->iter % opt_ctx->grad_stats_interval == 0) {
