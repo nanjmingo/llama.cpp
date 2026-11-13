@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cinttypes>
+#include <cstdlib>
 #include <locale>
 #include <map>
 #include <random>
@@ -121,6 +122,19 @@ namespace {
         std::vector<ggml_opt_f16_cache_user> backward_users;
     };
 
+    static bool ggml_opt_f16_cache_debug_enabled() {
+        const char * value = std::getenv("GGML_OPT_F16_CACHE_DEBUG");
+        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    }
+
+    static size_t ggml_opt_f16_cache_nbytes(const ggml_tensor * tensor) {
+        size_t size = ggml_row_size(GGML_TYPE_F16, tensor->ne[0]);
+        for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+            size *= static_cast<size_t>(tensor->ne[i]);
+        }
+        return size;
+    }
+
     static bool ggml_opt_is_view_of(const ggml_tensor * tensor, const ggml_tensor * base) {
         for (const ggml_tensor * view = tensor ? tensor->view_src : nullptr; view; view = view->view_src) {
             if (view == base) {
@@ -155,6 +169,12 @@ namespace {
 
     static void ggml_opt_cache_f16_backward_activations(ggml_opt_context_t opt_ctx) {
         const int n_nodes_f = opt_ctx->gf->n_nodes;
+        size_t n_marked = 0;
+        for (int i = 0; i < n_nodes_f; ++i) {
+            if (opt_ctx->gf->nodes[i]->flags & GGML_TENSOR_FLAG_F16_BACKWARD_CACHE) {
+                ++n_marked;
+            }
+        }
         opt_ctx->n_forward_nodes = n_nodes_f;
         opt_ctx->forward_node_indices.resize(n_nodes_f);
         for (int i = 0; i < n_nodes_f; ++i) {
@@ -269,7 +289,10 @@ namespace {
             candidates.push_back(std::move(candidate));
         }
 
+        const size_t n_candidates_before_backend = candidates.size();
         if (candidates.empty() || !opt_ctx->backend_sched) {
+            GGML_LOG_INFO("F16 backward cache: marked=%zu candidates=%zu backend_supported=0 inserted=0\n",
+                          n_marked, n_candidates_before_backend);
             return;
         }
 
@@ -317,9 +340,22 @@ namespace {
         }), candidates.end());
         ggml_backend_sched_reset(opt_ctx->backend_sched);
 
+        size_t supported_f32_bytes = 0;
+        size_t supported_f16_bytes = 0;
+        for (const ggml_opt_f16_cache_candidate & candidate : candidates) {
+            supported_f32_bytes += ggml_nbytes(candidate.activation);
+            supported_f16_bytes += ggml_opt_f16_cache_nbytes(candidate.activation);
+        }
+
         std::sort(candidates.begin(), candidates.end(), [](const auto & lhs, const auto & rhs) {
             return lhs.last_forward_use > rhs.last_forward_use;
         });
+
+        const int n_nodes_before_cache = opt_ctx->gb_grad->n_nodes;
+        size_t inserted_f32_bytes = 0;
+        size_t inserted_f16_bytes = 0;
+        size_t n_inserted = 0;
+        const bool debug_cache = ggml_opt_f16_cache_debug_enabled();
 
         for (const ggml_opt_f16_cache_candidate & candidate : candidates) {
             if (opt_ctx->gb_grad->n_nodes >= ggml_graph_size(opt_ctx->gb_grad)) {
@@ -363,7 +399,28 @@ namespace {
 
             opt_ctx->forward_node_indices.insert(opt_ctx->forward_node_indices.begin() + insert_at, -1);
             ++opt_ctx->n_forward_nodes;
+
+            ++n_inserted;
+            inserted_f32_bytes += ggml_nbytes(candidate.activation);
+            inserted_f16_bytes += ggml_nbytes(cache);
+            if (debug_cache) {
+                GGML_LOG_INFO("F16 backward cache: tensor='%s' shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] F32=%zu KiB F16=%zu KiB backward_users=%zu\n",
+                              candidate.activation->name,
+                              candidate.activation->ne[0], candidate.activation->ne[1],
+                              candidate.activation->ne[2], candidate.activation->ne[3],
+                              ggml_nbytes(candidate.activation) / 1024, ggml_nbytes(cache) / 1024,
+                              candidate.backward_users.size());
+            }
         }
+
+        const double mib = 1024.0 * 1024.0;
+        GGML_LOG_INFO("F16 backward cache: marked=%zu candidates=%zu backend_supported=%zu inserted=%zu, "
+                      "supported F32=%.1f MiB F16=%.1f MiB, inserted F32=%.1f MiB F16=%.1f MiB, "
+                      "graph_nodes=%d->%d\n",
+                      n_marked, n_candidates_before_backend, candidates.size(), n_inserted,
+                      supported_f32_bytes / mib, supported_f16_bytes / mib,
+                      inserted_f32_bytes / mib, inserted_f16_bytes / mib,
+                      n_nodes_before_cache, opt_ctx->gb_grad->n_nodes);
     }
 
     void ggml_opt_collect_grad_stats(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
