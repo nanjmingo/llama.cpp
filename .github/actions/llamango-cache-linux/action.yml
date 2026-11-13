@@ -9,7 +9,7 @@ inputs:
   max-size:
     description: Maximum ccache size.
     required: false
-    default: 2G
+    default: 1G
 
 runs:
   using: composite
