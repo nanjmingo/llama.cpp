@@ -446,43 +446,47 @@ namespace {
     }
 }
 
-static bool ggml_opt_recompute_reads_mutable_state(
+static bool ggml_opt_tensor_depends_on(
         ggml_tensor * tensor,
-        const std::unordered_set<ggml_tensor *> & forward_nodes) {
-    const auto is_mutable_external = [&](ggml_tensor * source) {
-        if (!source) {
-            return false;
-        }
-        while (source->view_src) {
-            source = source->view_src;
-        }
-        if (forward_nodes.count(source) ||
-                (source->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_PARAM)) ||
-                !source->buffer) {
-            return false;
-        }
-        return ggml_backend_buffer_get_usage(source->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
-    };
+        ggml_tensor * input,
+        std::unordered_map<ggml_tensor *, bool> & memo) {
+    if (!tensor) {
+        return false;
+    }
+    if (tensor == input) {
+        return true;
+    }
 
-    if (is_mutable_external(tensor->view_src)) {
+    const auto found = memo.find(tensor);
+    if (found != memo.end()) {
+        return found->second;
+    }
+
+    memo.emplace(tensor, false);
+    if (ggml_opt_tensor_depends_on(tensor->view_src, input, memo)) {
+        memo[tensor] = true;
         return true;
     }
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
-        if (is_mutable_external(tensor->src[i])) {
+        if (ggml_opt_tensor_depends_on(tensor->src[i], input, memo)) {
+            memo[tensor] = true;
             return true;
         }
     }
     return false;
 }
 
-static ggml_tensor * ggml_opt_recompute_clone(
+static ggml_tensor * ggml_opt_clone_recompute_tensor(
         ggml_context * ctx,
         ggml_tensor * tensor,
-        const std::unordered_set<ggml_tensor *> & forward_nodes,
-        const std::unordered_set<ggml_tensor *> & keep,
+        ggml_tensor * input,
+        std::unordered_map<ggml_tensor *, bool> & dependency_memo,
         std::unordered_map<ggml_tensor *, ggml_tensor *> & clones) {
-    if (!tensor || !forward_nodes.count(tensor) || keep.count(tensor) || tensor->op == GGML_OP_NONE ||
-            tensor->type == GGML_TYPE_I32 || tensor->type == GGML_TYPE_I64) {
+    if (!tensor || tensor == input || tensor->type == GGML_TYPE_I32 || tensor->type == GGML_TYPE_I64 ||
+            (tensor->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT |
+                              GGML_TENSOR_FLAG_PARAM | GGML_TENSOR_FLAG_LOSS |
+                              GGML_TENSOR_FLAG_F16_BACKWARD_CACHE)) ||
+            !ggml_opt_tensor_depends_on(tensor, input, dependency_memo)) {
         return tensor;
     }
 
@@ -491,28 +495,21 @@ static ggml_tensor * ggml_opt_recompute_clone(
         return found->second;
     }
 
-    ggml_tensor * view_src = ggml_opt_recompute_clone(ctx, tensor->view_src, forward_nodes, keep, clones);
-    size_t view_offs = tensor->view_offs;
-    if (view_src && view_src->view_src) {
-        view_offs += view_src->view_offs;
-        view_src = view_src->view_src;
-    }
     ggml_tensor * clone = ggml_dup_tensor(ctx, tensor);
-    clone->view_src = view_src;
-    clone->view_offs = view_offs;
-    clone->data = view_src && view_src->data ? (char *) view_src->data + view_offs : nullptr;
     clones.emplace(tensor, clone);
-
-    memcpy(clone->nb, tensor->nb, sizeof(tensor->nb));
-    memcpy(clone->op_params, tensor->op_params, sizeof(tensor->op_params));
     clone->op = tensor->op;
-    clone->flags = tensor->flags & ~(GGML_TENSOR_FLAG_PARAM | GGML_TENSOR_FLAG_LOSS |
-                                     GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_INPUT |
-                                     GGML_TENSOR_FLAG_CHECKPOINT);
-    ggml_format_name(clone, "%.56s (recompute)", tensor->name);
-
+    memcpy(clone->nb, tensor->nb, sizeof(tensor->nb));
+    clone->flags = tensor->flags & ~(GGML_TENSOR_FLAG_RECOMPUTE | GGML_TENSOR_FLAG_RECOMPUTE_INPUT |
+                                     GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT |
+                                     GGML_TENSOR_FLAG_PARAM | GGML_TENSOR_FLAG_LOSS);
+    memcpy(clone->op_params, tensor->op_params, sizeof(tensor->op_params));
+    ggml_format_name(clone, "recompute_%s", tensor->name);
+    clone->view_offs = tensor->view_offs;
+    clone->view_src = ggml_opt_clone_recompute_tensor(
+            ctx, tensor->view_src, input, dependency_memo, clones);
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
-        clone->src[i] = ggml_opt_recompute_clone(ctx, tensor->src[i], forward_nodes, keep, clones);
+        clone->src[i] = ggml_opt_clone_recompute_tensor(
+                ctx, tensor->src[i], input, dependency_memo, clones);
     }
     return clone;
 }
@@ -524,53 +521,67 @@ static void ggml_opt_recompute_checkpoints(ggml_opt_context_t opt_ctx) {
         return;
     }
 
-    const int n_forward = opt_ctx->n_forward_nodes;
-    std::unordered_set<ggml_tensor *> forward_nodes;
-    forward_nodes.reserve(static_cast<size_t>(n_forward));
-    std::unordered_set<ggml_tensor *> keep;
-    keep.reserve(static_cast<size_t>(n_forward));
+    struct recompute_region {
+        ggml_tensor * input;
+        ggml_tensor * output;
+    };
+    std::vector<recompute_region> regions;
+    ggml_tensor * input = nullptr;
 
-    for (int i = 0; i < n_forward; ++i) {
+    for (int i = 0; i < opt_ctx->n_forward_nodes; ++i) {
         ggml_tensor * node = opt_ctx->gb_grad->nodes[i];
-        forward_nodes.insert(node);
-    }
-
-    for (int i = 0; i < n_forward; ++i) {
-        ggml_tensor * node = opt_ctx->gb_grad->nodes[i];
-        const uint32_t keep_flags = GGML_TENSOR_FLAG_PARAM | GGML_TENSOR_FLAG_INPUT |
-                                    GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_LOSS |
-                                    GGML_TENSOR_FLAG_CHECKPOINT | GGML_TENSOR_FLAG_F16_BACKWARD_CACHE;
-        if (node->op == GGML_OP_NONE || (node->flags & keep_flags) != 0 ||
-                ggml_opt_recompute_reads_mutable_state(node, forward_nodes)) {
-            keep.insert(node);
+        if (node->flags & GGML_TENSOR_FLAG_RECOMPUTE_INPUT) {
+            GGML_ASSERT(input == nullptr && "nested activation recompute regions are not supported");
+            input = node;
         }
-        if (node->flags & GGML_TENSOR_FLAG_CHECKPOINT) {
-            ++opt_ctx->checkpoint_count;
+        if (node->flags & GGML_TENSOR_FLAG_RECOMPUTE) {
+            GGML_ASSERT(input != nullptr && "activation recompute output has no input boundary");
+            regions.push_back({ input, node });
+            input = nullptr;
         }
     }
+    GGML_ASSERT(input == nullptr && "activation recompute input has no output boundary");
 
-    if (opt_ctx->checkpoint_count == 0) {
+    if (regions.empty()) {
         return;
     }
 
+    std::unordered_map<ggml_tensor *, ggml_tensor *> replacements;
+    for (const auto & region : regions) {
+        std::unordered_map<ggml_tensor *, bool> dependency_memo;
+        std::unordered_map<ggml_tensor *, ggml_tensor *> clones;
+        ggml_tensor * replay = ggml_opt_clone_recompute_tensor(
+                opt_ctx->ctx_compute, region.output, region.input, dependency_memo, clones);
+        GGML_ASSERT(replay != region.output && "activation recompute output does not depend on its input");
+        for (const auto & entry : clones) {
+            replacements.emplace(entry.first, entry.second);
+        }
+        opt_ctx->recompute_nodes += static_cast<int32_t>(clones.size());
+    }
+    opt_ctx->checkpoint_count = static_cast<int32_t>(regions.size());
+
     ggml_cgraph * graph = opt_ctx->gb_grad;
-    std::unordered_map<ggml_tensor *, ggml_tensor *> clones;
-    for (int i = n_forward; i < graph->n_nodes; ++i) {
+    for (int i = opt_ctx->n_forward_nodes; i < graph->n_nodes; ++i) {
         ggml_tensor * node = graph->nodes[i];
-        node->view_src = ggml_opt_recompute_clone(
-                opt_ctx->ctx_compute, node->view_src, forward_nodes, keep, clones);
+        const auto view_it = replacements.find(node->view_src);
+        if (view_it != replacements.end()) {
+            node->view_src = view_it->second;
+        }
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
-            node->src[j] = ggml_opt_recompute_clone(
-                    opt_ctx->ctx_compute, node->src[j], forward_nodes, keep, clones);
+            const auto src_it = replacements.find(node->src[j]);
+            if (src_it != replacements.end()) {
+                node->src[j] = src_it->second;
+            }
         }
     }
 
     ggml_cgraph * reordered = ggml_new_graph_custom(opt_ctx->ctx_compute, graph->size, /*grads =*/ true);
-    for (int i = 0; i < n_forward; ++i) {
-        ggml_build_forward_expand(reordered, graph->nodes[i]);
-    }
-    for (int i = n_forward; i < graph->n_nodes; ++i) {
-        ggml_build_forward_expand(reordered, graph->nodes[i]);
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        if (graph->nodes[i]->flags & GGML_TENSOR_FLAG_COMPUTE) {
+            ggml_build_forward_expand(reordered, graph->nodes[i]);
+        } else {
+            ggml_build_forward_order(reordered, graph->nodes[i]);
+        }
     }
 
     for (size_t i = 0; i < graph->visited_hash_set.size; ++i) {
@@ -588,8 +599,7 @@ static void ggml_opt_recompute_checkpoints(ggml_opt_context_t opt_ctx) {
     }
 
     opt_ctx->gb_grad = reordered;
-    opt_ctx->recompute_nodes = static_cast<int32_t>(clones.size());
-    GGML_LOG_INFO("%s: retained %d activation checkpoints and replayed %d forward nodes\n",
+    GGML_LOG_INFO("%s: activation recompute: %d regions, %d replay nodes\n",
             __func__, opt_ctx->checkpoint_count, opt_ctx->recompute_nodes);
 }
 

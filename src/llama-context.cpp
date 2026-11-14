@@ -3111,6 +3111,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.activation_recompute =*/ training_graph && opt_grad_checkpoint,
     };
 }
 
@@ -3254,10 +3255,6 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
             ggml_set_name(cur, name);
-        }
-
-        if (opt_grad_checkpoint && cparams.training && strcmp(name, "l_out") == 0) {
-            cur->flags |= GGML_TENSOR_FLAG_CHECKPOINT;
         }
 
         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
@@ -4523,13 +4520,13 @@ bool llama_context::opt_epoch_iter(
             if (train && opt_grad_checkpoint) {
                 const int32_t checkpoints = ggml_opt_checkpoint_count(opt_ctx);
                 if (checkpoints == 0) {
-                    LLAMA_LOG_ERROR("%s: gradient checkpointing is enabled, but the training graph has no checkpoint tensors\n",
+                    LLAMA_LOG_ERROR("%s: gradient checkpointing is not supported by this model graph; no safe activation recompute regions were defined\n",
                             __func__);
                     execution_failed = true;
                     break;
                 }
                 if (n_train_graphs == 0) {
-                    LLAMA_LOG_INFO("%s: gradient checkpointing retained %d layer outputs and replayed %d forward nodes\n",
+                    LLAMA_LOG_INFO("%s: gradient checkpointing enabled %d recompute regions and replayed %d forward nodes\n",
                             __func__, checkpoints, ggml_opt_recompute_nodes(opt_ctx));
                 }
             }

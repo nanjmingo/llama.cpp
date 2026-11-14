@@ -874,11 +874,20 @@ static bool run_gradient_checkpoint_case(
     ggml_tensor * hidden_input = ggml_add(ctx_graph, inputs, weights);
     ggml_tensor * hidden = ggml_sqr(ctx_graph, hidden_input);
     ggml_tensor * hidden_view = ggml_view_1d(ctx_graph, hidden, 1, 0);
-    ggml_tensor * checkpoint_tensor = ggml_sqr(ctx_graph, hidden_view);
+    ggml_tensor * index_input = ggml_reshape_2d(ctx_graph, hidden_input, 1, 1);
+    ggml_tensor * indices = ggml_argmax(ctx_graph, index_input);
+    ggml_tensor * selected = ggml_get_rows(ctx_graph, index_input, indices);
+    ggml_tensor * selected_zero = ggml_scale(ctx_graph, ggml_sum(ctx_graph, selected), 0.0f);
+    ggml_tensor * checkpoint_tensor = ggml_add(ctx_graph, ggml_sqr(ctx_graph, hidden_view), selected_zero);
+    ggml_tensor * second_input = ggml_scale(ctx_graph, checkpoint_tensor, 1.0f);
+    ggml_tensor * second_output = ggml_sqr(ctx_graph, second_input);
+    ggml_tensor * outputs = ggml_add(ctx_graph, second_output, selected_zero);
     if (checkpoint) {
-        checkpoint_tensor->flags |= GGML_TENSOR_FLAG_CHECKPOINT;
+        hidden_input->flags |= GGML_TENSOR_FLAG_RECOMPUTE_INPUT;
+        checkpoint_tensor->flags |= GGML_TENSOR_FLAG_RECOMPUTE;
+        second_input->flags |= GGML_TENSOR_FLAG_RECOMPUTE_INPUT;
+        second_output->flags |= GGML_TENSOR_FLAG_RECOMPUTE;
     }
-    ggml_tensor * outputs = ggml_sqr(ctx_graph, checkpoint_tensor);
     ggml_cgraph * gf = ggml_new_graph_custom(ctx_graph, 128, true);
     ggml_build_forward_expand(gf, outputs);
 
@@ -938,7 +947,7 @@ static std::pair<int, int> test_gradient_checkpointing(
             checkpoints, nodes);
     const float expected_weight = optim == GGML_OPT_OPTIMIZER_TYPE_ADAMW ? 1.0f : -17494.0f;
     const bool subtest_ok = plain_ok && checkpoint_ok &&
-        unused_checkpoints == 0 && unused_nodes == 0 && checkpoints == 1 && nodes == 3 &&
+        unused_checkpoints == 0 && unused_nodes == 0 && checkpoints == 2 && nodes >= 8 &&
         almost_equal(loss_plain, 6561.0, 1e-5) &&
         almost_equal(loss_plain, loss_checkpoint, 1e-5) &&
         almost_equal(weight_plain, expected_weight, 1e-4) &&

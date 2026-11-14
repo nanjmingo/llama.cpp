@@ -162,7 +162,7 @@ extern "C" {
 
         enum ggml_type optimizer_state_type;
 
-        bool checkpoint; // recompute forward activations between tensors marked with GGML_TENSOR_FLAG_CHECKPOINT
+        bool checkpoint; // recompute forward activations between GGML_TENSOR_FLAG_RECOMPUTE_INPUT and GGML_TENSOR_FLAG_RECOMPUTE
     };
 
     // get parameters for an optimization context with defaults set where possible

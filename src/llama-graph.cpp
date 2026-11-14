@@ -1651,6 +1651,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     hparams          (params.hparams),
     cparams          (params.cparams),
     training_graph   (params.training_graph),
+    activation_recompute(params.activation_recompute),
     ubatch           (params.ubatch),
     n_embd           (hparams.n_embd),
     n_layer          (hparams.n_layer()),
@@ -2120,7 +2121,8 @@ ggml_tensor * llm_graph_context::build_ffn(
          ggml_tensor * act_scales,
      llm_ffn_op_type   type_op,
    llm_ffn_gate_type   type_gate,
-                 int   il) const {
+                 int   il,
+         ggml_tensor ** down_input) const {
     const llm_arch arch = model.arch;
 
     // NVFP4 support is currently restricted to
@@ -2305,6 +2307,10 @@ ggml_tensor * llm_graph_context::build_ffn(
     if (gate && type_gate == LLM_FFN_PAR) {
         cur = ggml_mul(ctx0, cur, tmp);
         cb(cur, "ffn_gate_par", il);
+    }
+
+    if (down_input) {
+        *down_input = cur;
     }
 
     if (down) {

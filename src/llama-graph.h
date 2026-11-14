@@ -837,6 +837,7 @@ struct llm_graph_params {
     llm_graph_cb cb;
 
     llm_graph_result * res;
+    bool activation_recompute = false;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -914,6 +915,7 @@ struct llm_graph_params {
             model == other.model &&
             gtype == other.gtype &&
             training_graph == other.training_graph &&
+            activation_recompute == other.activation_recompute &&
             cvec  == other.cvec  &&
             loras == other.loras &&
             cross == other.cross;
@@ -1039,6 +1041,7 @@ struct llm_graph_context {
     const llama_hparams & hparams;
     const llama_cparams & cparams;
     const bool training_graph;
+    const bool activation_recompute;
     const llama_ubatch  & ubatch;
 
     const int64_t n_embd;
@@ -1193,7 +1196,8 @@ struct llm_graph_context {
              ggml_tensor * act_scales,
          llm_ffn_op_type   type_op,
        llm_ffn_gate_type   type_gate,
-                     int   il) const;
+                     int   il,
+             ggml_tensor ** down_input = nullptr) const;
 
     // build MoE FFN without bias tensors
     ggml_tensor * build_moe_ffn(

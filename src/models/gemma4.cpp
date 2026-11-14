@@ -318,6 +318,9 @@ llama_model_gemma4::graph::graph(const llm_graph_params & params) :
 
         ggml_tensor * attn_out = ggml_add(ctx0, cur, inpL);
         cb(attn_out, "attn_out", il);
+        if (activation_recompute) {
+            attn_out->flags |= GGML_TENSOR_FLAG_RECOMPUTE_INPUT;
+        }
 
         // feed-forward network
         const bool is_moe_layer = model.layers[il].ffn_gate_inp != nullptr;
@@ -373,6 +376,9 @@ llama_model_gemma4::graph::graph(const llm_graph_params & params) :
             cb(cur_moe, "ffn_moe", il);
 
             cur = ggml_add(ctx0, cur_mlp, cur_moe);
+            if (activation_recompute) {
+                cur->flags |= GGML_TENSOR_FLAG_RECOMPUTE;
+            }
             cb(cur, "ffn_moe_combined", il);
         } else {
             cur = build_norm(attn_out,
@@ -380,12 +386,17 @@ llama_model_gemma4::graph::graph(const llm_graph_params & params) :
                     LLM_NORM_RMS, il);
             cb(cur, "ffn_norm", il);
 
+            ggml_tensor * ffn_down_input = nullptr;
             cur = build_ffn(cur,
                     model.layers[il].ffn_up,   nullptr, model.layers[il].ffn_up_s,
                     model.layers[il].ffn_gate, nullptr, model.layers[il].ffn_gate_s,
                     model.layers[il].ffn_down, nullptr, model.layers[il].ffn_down_s,
                     nullptr,
-                    LLM_FFN_GELU, LLM_FFN_PAR, il);
+                    LLM_FFN_GELU, LLM_FFN_PAR, il, &ffn_down_input);
+            GGML_ASSERT(ffn_down_input);
+            if (activation_recompute) {
+                ffn_down_input->flags |= GGML_TENSOR_FLAG_RECOMPUTE;
+            }
             cb(cur, "ffn_out", il);
         }
         cur = build_norm(cur,
