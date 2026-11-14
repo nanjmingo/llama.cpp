@@ -201,13 +201,26 @@ namespace {
             }
         }
 
+        std::vector<ggml_tensor *> forward_nodes(opt_ctx->gf->n_nodes, nullptr);
+        for (int i = 0; i < n_forward; ++i) {
+            const int original_index = opt_ctx->forward_node_indices[i];
+            if (original_index < 0) {
+                // Preserve explicitly inserted activation caches.
+                state.keep.insert(graph->nodes[i]);
+                continue;
+            }
+            GGML_ASSERT(original_index < opt_ctx->gf->n_nodes);
+            forward_nodes[original_index] = graph->nodes[i];
+        }
+
         std::vector<ggml_tensor *> checkpoints;
         for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
             ggml_tensor * node = opt_ctx->gf->nodes[i];
             if (std::strncmp(node->name, "l_out-", 6) != 0) {
                 continue;
             }
-            checkpoints.push_back(node);
+            GGML_ASSERT(forward_nodes[i] != nullptr);
+            checkpoints.push_back(forward_nodes[i]);
         }
 
         if (checkpoints.empty()) {
