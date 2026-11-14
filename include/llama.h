@@ -1720,7 +1720,11 @@ extern "C" {
         enum ggml_opt_optimizer_type optimizer_type;
         enum ggml_type optimizer_state_type;
 
-        bool grad_checkpoint; // recompute layer activations during the backward pass
+#ifdef __cplusplus
+        bool grad_checkpoint = false; // recompute layer activations during the backward pass
+#else
+        bool grad_checkpoint;
+#endif
     };
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
