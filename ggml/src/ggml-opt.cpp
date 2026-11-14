@@ -180,8 +180,9 @@ namespace {
 
         for (int i = 0; i < n_forward; ++i) {
             ggml_tensor * node = graph->nodes[i];
-            bool keep = (node->flags & (GGML_TENSOR_FLAG_PARAM | GGML_TENSOR_FLAG_INPUT |
-                                        GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_LOSS)) != 0;
+            bool keep = node->op == GGML_OP_GET_ROWS ||
+                (node->flags & (GGML_TENSOR_FLAG_PARAM | GGML_TENSOR_FLAG_INPUT |
+                                GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_LOSS)) != 0;
 
             for (int j = 0; j < GGML_MAX_SRC && !keep && node->view_src == nullptr; ++j) {
                 ggml_tensor * src = node->src[j];
