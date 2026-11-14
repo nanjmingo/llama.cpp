@@ -220,7 +220,7 @@ jobs:
           Add-Content -Path $env:GITHUB_PATH -Value $llvmBin
           $clangVersion
 
-      - name: Select MSVC 14.44 for Windows ARM64
+      - name: Select a Clang-compatible MSVC toolset for Windows ARM64
         if: inputs.architecture == 'arm64'
         shell: pwsh
         run: |
@@ -231,23 +231,113 @@ jobs:
             $vswherePath = $vswhere.Source
           }
 
-          $component = 'Microsoft.VisualStudio.Component.VC.14.44.17.14.ARM64'
-          $vsInstallPath = & $vswherePath -latest -products '*' -requires $component -property installationPath |
-            Select-Object -First 1
-          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($vsInstallPath)) {
-            throw "Visual Studio with the ARM64 MSVC 14.44 component was not found"
+          function Get-CompatibleToolsets {
+            param([string[]]$InstallationPaths)
+
+            foreach ($installationPath in $InstallationPaths) {
+              $toolsetRoot = Join-Path $installationPath 'VC\Tools\MSVC'
+              if (-not (Test-Path -LiteralPath $toolsetRoot -PathType Container)) {
+                continue
+              }
+
+              $toolsetDirectories = Get-ChildItem -LiteralPath $toolsetRoot -Directory |
+                Where-Object { $_.Name -match '^14\.(44|51)\.\d+$' }
+
+              foreach ($toolsetDirectory in $toolsetDirectories) {
+                $includePath = Join-Path $toolsetDirectory.FullName 'include\yvals_core.h'
+                $arm64LibraryPath = Join-Path $toolsetDirectory.FullName 'lib\arm64'
+                $vcvarsall = Join-Path $installationPath 'VC\Auxiliary\Build\vcvarsall.bat'
+                if ((Test-Path -LiteralPath $includePath -PathType Leaf) -and
+                    (Test-Path -LiteralPath $arm64LibraryPath -PathType Container) -and
+                    (Test-Path -LiteralPath $vcvarsall -PathType Leaf)) {
+                  [PSCustomObject]@{
+                    InstallationPath = $installationPath
+                    Version = $toolsetDirectory.Name
+                  }
+                }
+              }
+            }
           }
 
-          $vcvarsall = Join-Path $vsInstallPath 'VC\Auxiliary\Build\vcvarsall.bat'
+          $vsInstallPaths = @(
+            & $vswherePath -all -products '*' -property installationPath |
+              Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+              ForEach-Object { $_.Trim() } |
+              Select-Object -Unique
+          )
+          if ($LASTEXITCODE -ne 0 -or $vsInstallPaths.Count -eq 0) {
+            throw 'No Visual Studio installation was found'
+          }
+
+          $compatibleToolsets = @(Get-CompatibleToolsets -InstallationPaths $vsInstallPaths)
+          if ($compatibleToolsets.Count -eq 0) {
+            $vs2026InstallPath = & $vswherePath -all -products '*' -version '[18.0,19.0)' -property installationPath |
+              Select-Object -First 1
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($vs2026InstallPath)) {
+              throw 'No Clang-compatible MSVC toolset was found and Visual Studio 2026 is unavailable for installing MSVC 14.51'
+            }
+
+            $channelId = & $vswherePath -all -products '*' -version '[18.0,19.0)' -property channelId |
+              Select-Object -First 1
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($channelId)) {
+              throw 'Visual Studio 2026 channel ID was not found'
+            }
+
+            $component = 'Microsoft.VisualStudio.Component.VC.14.51.ARM64'
+            $componentInstances = @(
+              & $vswherePath -all -products '*' -requires $component -property installationPath |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                ForEach-Object { $_.Trim() }
+            )
+            if ($LASTEXITCODE -ne 0) {
+              throw 'Failed to query installed Visual Studio components'
+            }
+
+            if (-not ($componentInstances | Where-Object { $_ -ieq $vs2026InstallPath.Trim() })) {
+              $setupPath = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\setup.exe'
+              if (-not (Test-Path -LiteralPath $setupPath -PathType Leaf)) {
+                throw "Visual Studio Installer was not found: $setupPath"
+              }
+
+              Write-Host 'Installing the MSVC 14.51 ARM64 toolset'
+              $arguments = 'modify --installPath "{0}" --channelId "{1}" --add "{2}" --quiet --norestart' -f `
+                $vs2026InstallPath, $channelId, $component
+              $installerProcess = Start-Process -FilePath $setupPath -ArgumentList $arguments -Wait -PassThru
+              if ($installerProcess.ExitCode -notin @(0, 3010)) {
+                throw "MSVC 14.51 installation failed with exit code $($installerProcess.ExitCode)"
+              }
+            }
+
+            $vsInstallPaths = @(
+              & $vswherePath -all -products '*' -property installationPath |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                ForEach-Object { $_.Trim() } |
+                Select-Object -Unique
+            )
+            if ($LASTEXITCODE -ne 0) {
+              throw 'Failed to enumerate Visual Studio installations after installing MSVC 14.51'
+            }
+
+            $compatibleToolsets = @(Get-CompatibleToolsets -InstallationPaths $vsInstallPaths)
+          }
+
+          $selectedToolset = $compatibleToolsets |
+            Sort-Object -Property @{ Expression = { [version]$_.Version }; Descending = $true } |
+            Select-Object -First 1
+          if ($null -eq $selectedToolset) {
+            throw 'No ARM64 MSVC 14.44 or 14.51 toolset was found after toolset selection'
+          }
+
+          $vcvarsall = Join-Path $selectedToolset.InstallationPath 'VC\Auxiliary\Build\vcvarsall.bat'
           if (-not (Test-Path -LiteralPath $vcvarsall -PathType Leaf)) {
             throw "vcvarsall.bat was not found: $vcvarsall"
           }
 
-          $command = 'call "{0}" amd64_arm64 -vcvars_ver=14.44 && set' -f $vcvarsall
+          $command = 'call "{0}" amd64_arm64 -vcvars_ver={1} && set' -f $vcvarsall, $selectedToolset.Version
           $environmentOutput = & $env:ComSpec /d /s /c $command 2>&1
           if ($LASTEXITCODE -ne 0) {
             $environmentOutput | Write-Host
-            throw "Failed to initialize the MSVC 14.44 ARM64 toolchain"
+            throw "Failed to initialize MSVC $($selectedToolset.Version) for ARM64"
           }
 
           $environmentNames = @(
@@ -278,8 +368,8 @@ jobs:
             }
           }
 
-          if ($environment['VCToolsVersion'] -notmatch '^14\.44\.') {
-            throw "Expected MSVC 14.44, got: $($environment['VCToolsVersion'])"
+          if ($environment['VCToolsVersion'] -notmatch '^14\.(44|51)\.') {
+            throw "Expected MSVC 14.44 or 14.51, got: $($environment['VCToolsVersion'])"
           }
           if ([string]::IsNullOrWhiteSpace($environment['VCToolsInstallDir'])) {
             throw 'VCToolsInstallDir was not set by vcvarsall.bat'
@@ -315,7 +405,7 @@ jobs:
           $probeStatus = $LASTEXITCODE
           $probeOutput | Write-Host
           if ($probeStatus -ne 0) {
-            throw "Clang could not compile the MSVC STL probe with MSVC 14.44 (exit code $probeStatus)"
+            throw "Clang 20.1.8 could not compile the MSVC STL probe with MSVC $($environment['VCToolsVersion']) (exit code $probeStatus)"
           }
 
       - name: Ensure Ninja is available
