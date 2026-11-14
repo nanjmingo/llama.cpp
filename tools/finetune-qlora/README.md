@@ -99,7 +99,7 @@ Train a LoRA adapter with context size 512:
 | `-epochs`, `--epochs` | `2` | Number of training epochs (ignored when `--max-steps` is set). |
 | `--max-steps` | disabled | Stop after N optimizer updates. Loops the dataset if needed. |
 | `--gradient-accumulation-steps` | `1` | Accumulate gradients across N windows before each optimizer update. |
-| `--grad-checkpoint` | off | Recompute model-defined feed-forward regions during backpropagation. Currently supported by Gemma 4; attention and mutable cache state are not recomputed. |
+| `--grad-checkpoint` | off | Recompute activations inside common Dense FFN and MoE FFN graph regions during backpropagation to reduce memory use. |
 | `--optimizer-state-type` | `f32` | AdamW moment storage type: `f32`, `f16`, or `bf16`. (SGD is F32 only). |
 | `--lr-scheduler` | `constant` | Schedule: `constant` or `cosine`. |
 | `--warmup-steps` | `0` | Linear warmup duration in optimizer updates. |
@@ -300,4 +300,4 @@ The output file shows token counts, target token counts, and target ranges (e.g.
 | **SSM / Mamba** | `SSM_CONV` and `SSM_SCAN` do not have backward implementations. | Gradients stop at SSM layers. Upstream `ssm_in` cannot receive gradients; downstream `ssm_out` works. |
 | **GLU Variants** | Backward supports `SWIGLU` and `GEGLU` splits. Other GLU variants are not supported. | Standard models (Llama, Mistral, Qwen) use supported SwiGLU. |
 | **MTP / NextN** | Multi-Token Prediction heads are not optimized. | MTP prediction layers are skipped during training and kept frozen in output adapters. |
-| **Activation Memory** | Each training window is processed as a complete graph. | On supported models, `--grad-checkpoint` recomputes feed-forward regions during backpropagation. Attention and mutable cache state remain outside the recompute regions. Windows still cannot be split into smaller microbatches; reduce context size `-c` if memory is still insufficient. |
+| **Activation Memory** | Each training window is processed as a complete graph. | `--grad-checkpoint` recomputes activations inside common FFN graph regions. It does not checkpoint attention or KV-cache operations, and models that bypass the common FFN builders do not register regions. Windows still cannot be split into smaller microbatches; reduce context size `-c` if memory is still insufficient. |

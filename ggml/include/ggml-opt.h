@@ -23,6 +23,11 @@ extern "C" {
     typedef struct ggml_opt_context * ggml_opt_context_t;
     typedef struct ggml_opt_result  * ggml_opt_result_t;
 
+    struct ggml_opt_recompute_region {
+        struct ggml_tensor * input;
+        struct ggml_tensor * output;
+    };
+
     struct ggml_opt_grad_stats {
         int64_t n_tensors;
         int64_t n_elements;
@@ -162,7 +167,7 @@ extern "C" {
 
         enum ggml_type optimizer_state_type;
 
-        bool checkpoint; // recompute forward activations between GGML_TENSOR_FLAG_RECOMPUTE_INPUT and GGML_TENSOR_FLAG_RECOMPUTE
+        bool checkpoint; // recompute forward activations within registered regions
     };
 
     // get parameters for an optimization context with defaults set where possible
@@ -204,6 +209,11 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_opt_grad_acc(ggml_opt_context_t opt_ctx, struct ggml_tensor * node);
 
     GGML_API bool ggml_opt_has_grad(ggml_opt_context_t opt_ctx, const struct ggml_tensor * node);
+
+    GGML_API void ggml_opt_set_recompute_regions(
+            ggml_opt_context_t opt_ctx,
+            const struct ggml_opt_recompute_region * regions,
+            int32_t n_regions);
 
     GGML_API int32_t ggml_opt_checkpoint_count(ggml_opt_context_t opt_ctx);
     GGML_API int32_t ggml_opt_recompute_nodes(ggml_opt_context_t opt_ctx);

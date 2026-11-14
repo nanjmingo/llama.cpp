@@ -12,6 +12,7 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <utility>
 
 struct ggml_cgraph;
 struct ggml_context;
@@ -837,7 +838,6 @@ struct llm_graph_params {
     llm_graph_cb cb;
 
     llm_graph_result * res;
-    bool activation_recompute = false;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -915,7 +915,6 @@ struct llm_graph_params {
             model == other.model &&
             gtype == other.gtype &&
             training_graph == other.training_graph &&
-            activation_recompute == other.activation_recompute &&
             cvec  == other.cvec  &&
             loras == other.loras &&
             cross == other.cross;
@@ -965,6 +964,9 @@ public:
 
     void add_fused_node(llm_graph_fused_node result);
 
+    void add_recompute_region(ggml_tensor * input, ggml_tensor * output);
+    const std::vector<std::pair<ggml_tensor *, ggml_tensor *>> & get_recompute_regions() const { return recompute_regions; }
+
     // Hadamard-transformed activations, keyed by (input, rotation): folded weights that read the same activation share one transform
     ggml_tensor * get_hdmd_input(const ggml_tensor * cur, const ggml_tensor * rot) const;
     void          set_hdmd_input(const ggml_tensor * cur, const ggml_tensor * rot, ggml_tensor * res);
@@ -992,6 +994,7 @@ public:
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
+    std::vector<std::pair<ggml_tensor *, ggml_tensor *>> recompute_regions;
 
     std::map<std::pair<const ggml_tensor *, const ggml_tensor *>, ggml_tensor *> hdmd_inputs;
 
@@ -1041,7 +1044,6 @@ struct llm_graph_context {
     const llama_hparams & hparams;
     const llama_cparams & cparams;
     const bool training_graph;
-    const bool activation_recompute;
     const llama_ubatch  & ubatch;
 
     const int64_t n_embd;
@@ -1196,8 +1198,7 @@ struct llm_graph_context {
              ggml_tensor * act_scales,
          llm_ffn_op_type   type_op,
        llm_ffn_gate_type   type_gate,
-                     int   il,
-             ggml_tensor ** down_input = nullptr) const;
+                     int   il) const;
 
     // build MoE FFN without bias tensors
     ggml_tensor * build_moe_ffn(

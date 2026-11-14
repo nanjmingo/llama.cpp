@@ -245,7 +245,7 @@ bool train_adapter(const qlora_params & qparams,
                 __func__, qparams.grad_stats_interval);
     }
     if (qparams.grad_checkpoint) {
-        LOG_INF("%s: gradient checkpointing enabled; model-defined FFN regions are recomputed during backpropagation\n",
+        LOG_INF("%s: gradient checkpointing enabled; common FFN graph regions are recomputed during backpropagation\n",
                 __func__);
     }
     LOG_INF("%s: lr scheduler=%s warmup_steps=%d warmup_init_ratio=%.3g total_steps=%ld lr=%.3g lr_min=%.3g\n",

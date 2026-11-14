@@ -92,7 +92,7 @@ const std::vector<qlora_arg> & get_qlora_arg_defs() {
         ));
         add_opt(qlora_arg(
             {"--grad-checkpoint", "--gradient-checkpointing"},
-            "Recompute model-defined FFN regions during backpropagation (currently Gemma 4)",
+            "Recompute FFN activations during backpropagation to reduce training memory",
             [](qlora_params & params) {
                 params.grad_checkpoint = true;
             }

@@ -3111,7 +3111,6 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
-        /*.activation_recompute =*/ training_graph && opt_grad_checkpoint,
     };
 }
 
@@ -3256,6 +3255,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
         } else {
             ggml_set_name(cur, name);
         }
+
 
         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
@@ -4491,8 +4491,8 @@ bool llama_context::opt_epoch_iter(
 
             if (!ctx_compute_opt) {
                 const size_t size_gf = ggml_graph_size(gf);
-                const size_t graph_factor = opt_grad_checkpoint ? 2 : 1;
-                const size_t tensor_factor = opt_grad_checkpoint ? 6 : 4;
+                const size_t graph_factor = opt_grad_checkpoint ? 3 : 1;
+                const size_t tensor_factor = opt_grad_checkpoint ? 8 : 4;
                 GGML_ASSERT(size_gf <= SIZE_MAX / graph_factor);
                 GGML_ASSERT(size_gf <= SIZE_MAX / tensor_factor);
                 const size_t graph_size = graph_factor * size_gf;
@@ -4515,19 +4515,28 @@ bool llama_context::opt_epoch_iter(
                 ggml_reset(ctx_compute_opt);
             }
 
+            if (opt_grad_checkpoint) {
+                std::vector<ggml_opt_recompute_region> regions;
+                regions.reserve(res->get_recompute_regions().size());
+                for (const auto & region : res->get_recompute_regions()) {
+                    regions.push_back({ region.first, region.second });
+                }
+                ggml_opt_set_recompute_regions(opt_ctx, regions.data(), static_cast<int32_t>(regions.size()));
+            }
+
             ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
             ggml_opt_alloc(opt_ctx, train);
             if (train && opt_grad_checkpoint) {
-                const int32_t checkpoints = ggml_opt_checkpoint_count(opt_ctx);
-                if (checkpoints == 0) {
-                    LLAMA_LOG_ERROR("%s: gradient checkpointing is not supported by this model graph; no safe activation recompute regions were defined\n",
+                const int32_t recompute_regions = ggml_opt_checkpoint_count(opt_ctx);
+                if (recompute_regions == 0) {
+                    LLAMA_LOG_ERROR("%s: gradient checkpointing is enabled, but the training graph has no recompute regions\n",
                             __func__);
                     execution_failed = true;
                     break;
                 }
                 if (n_train_graphs == 0) {
-                    LLAMA_LOG_INFO("%s: gradient checkpointing enabled %d recompute regions and replayed %d forward nodes\n",
-                            __func__, checkpoints, ggml_opt_recompute_nodes(opt_ctx));
+                    LLAMA_LOG_INFO("%s: gradient checkpointing registered %d recompute regions and replayed %d forward nodes\n",
+                            __func__, recompute_regions, ggml_opt_recompute_nodes(opt_ctx));
                 }
             }
             if (train) {

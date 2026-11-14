@@ -1532,6 +1532,7 @@ void llm_graph_result::reset() {
 
     inputs.clear();
     fused_nodes.clear();
+    recompute_regions.clear();
     hdmd_inputs.clear();
 
     const size_t meta_size = ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false);
@@ -1638,6 +1639,11 @@ void llm_graph_result::set_hdmd_input(const ggml_tensor * cur, const ggml_tensor
     hdmd_inputs[{ cur, rot }] = res;
 }
 
+void llm_graph_result::add_recompute_region(ggml_tensor * input, ggml_tensor * output) {
+    GGML_ASSERT(input && output && input != output);
+    recompute_regions.emplace_back(input, output);
+}
+
 void llm_graph_result::set_params(const llm_graph_params & params) {
     this->params = params;
 }
@@ -1651,7 +1657,6 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     hparams          (params.hparams),
     cparams          (params.cparams),
     training_graph   (params.training_graph),
-    activation_recompute(params.activation_recompute),
     ubatch           (params.ubatch),
     n_embd           (hparams.n_embd),
     n_layer          (hparams.n_layer()),
@@ -2121,9 +2126,9 @@ ggml_tensor * llm_graph_context::build_ffn(
          ggml_tensor * act_scales,
      llm_ffn_op_type   type_op,
    llm_ffn_gate_type   type_gate,
-                 int   il,
-         ggml_tensor ** down_input) const {
+                 int   il) const {
     const llm_arch arch = model.arch;
+    ggml_tensor * const recompute_input = cur;
 
     // NVFP4 support is currently restricted to
     // 1) LORA absence (*_s would be applied after LORA residual, which is incorrect)
@@ -2309,8 +2314,8 @@ ggml_tensor * llm_graph_context::build_ffn(
         cb(cur, "ffn_gate_par", il);
     }
 
-    if (down_input) {
-        *down_input = cur;
+    if (training_graph && down && cur != recompute_input) {
+        res->add_recompute_region(recompute_input, cur);
     }
 
     if (down) {
@@ -2413,6 +2418,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * post_exp_norm,
                float   post_exp_norm_eps) const {
     const llm_arch arch = model.arch;
+    ggml_tensor * const recompute_input = cur;
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -2796,6 +2802,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     cb(moe_out, "ffn_moe_out", il);
+
+    if (training_graph && down_exps && moe_out != recompute_input) {
+        res->add_recompute_region(recompute_input, moe_out);
+    }
 
     return moe_out;
 }
