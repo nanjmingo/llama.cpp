@@ -178,7 +178,7 @@ bool qlora_prepare_save_job(qlora_training_state & state,
                 metadata["lora_targets"] = state.qparams->lora_targets;
                 metadata["freeze_layers"] = state.qparams->freeze_layers;
                 metadata["gradient_accumulation_steps"] = state.qparams->gradient_accumulation_steps;
-                metadata["grad_checkpoint_interval"] = state.qparams->grad_checkpoint_interval;
+                metadata["gradient_checkpointing"] = state.qparams->gradient_checkpointing;
                 metadata["max_steps"] = state.qparams->max_steps;
                 metadata["val_windows"] = state.qparams->val_windows;
                 metadata["context_length"] = llama_n_ctx(state.ctx);

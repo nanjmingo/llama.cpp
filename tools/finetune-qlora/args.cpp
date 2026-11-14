@@ -225,10 +225,16 @@ const std::vector<qlora_arg> & get_qlora_arg_defs() {
             }
         ));
         add_opt(qlora_arg(
-            {"--grad-checkpoint-interval"}, "N",
-            "Recompute layer activations between every N layer outputs; 0 disables (default: 0)",
+            {"--gradient-checkpointing"}, "on/off",
+            "Enable activation recomputation during backward (default: off)",
             [](qlora_params & params, const std::string & value) {
-                params.grad_checkpoint_interval = parse_non_negative_int(value, "--grad-checkpoint-interval");
+                if (value == "on") {
+                    params.gradient_checkpointing = true;
+                } else if (value == "off") {
+                    params.gradient_checkpointing = false;
+                } else {
+                    throw std::invalid_argument("--gradient-checkpointing must be on or off");
+                }
             }
         ));
         add_opt(qlora_arg(

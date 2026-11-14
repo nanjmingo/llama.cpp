@@ -86,7 +86,7 @@ struct ggml_opt_context {
 
     enum ggml_opt_optimizer_type optimizer = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
     enum ggml_type optimizer_state_type = GGML_TYPE_F32;
-    int32_t grad_checkpoint_interval = 0;
+    bool gradient_checkpointing = false;
     bool optimizer_state_ready = false;
     std::vector<uint8_t> pending_optimizer_state;
 };
@@ -160,8 +160,7 @@ namespace {
     }
 
     static void ggml_opt_recompute_checkpoints(ggml_opt_context_t opt_ctx) {
-        const int32_t interval = opt_ctx->grad_checkpoint_interval;
-        if (interval <= 0 || opt_ctx->static_graphs ||
+        if (!opt_ctx->gradient_checkpointing || opt_ctx->static_graphs ||
                 opt_ctx->build_type == GGML_OPT_BUILD_TYPE_FORWARD || opt_ctx->n_forward_nodes == 0) {
             return;
         }
@@ -206,7 +205,6 @@ namespace {
         for (int i = 0; i < n_forward; ++i) {
             const int original_index = opt_ctx->forward_node_indices[i];
             if (original_index < 0) {
-                // Preserve explicitly inserted activation caches.
                 state.keep.insert(graph->nodes[i]);
                 continue;
             }
@@ -214,25 +212,12 @@ namespace {
             forward_nodes[original_index] = graph->nodes[i];
         }
 
-        std::vector<ggml_tensor *> checkpoints;
+        int n_checkpoints = 0;
         for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
             ggml_tensor * node = opt_ctx->gf->nodes[i];
-            if (std::strncmp(node->name, "l_out-", 6) != 0) {
-                continue;
-            }
-            GGML_ASSERT(forward_nodes[i] != nullptr);
-            checkpoints.push_back(forward_nodes[i]);
-        }
-
-        if (checkpoints.empty()) {
-            GGML_LOG_WARN("%s: no l_out checkpoints found; gradient checkpointing is disabled for this graph\n", __func__);
-            return;
-        }
-
-        size_t n_checkpoints = 0;
-        for (size_t i = 0; i < checkpoints.size(); ++i) {
-            if ((i + 1) % static_cast<size_t>(interval) == 0 || i + 1 == checkpoints.size()) {
-                state.keep.insert(checkpoints[i]);
+            if (std::strncmp(node->name, "l_out-", 6) == 0) {
+                GGML_ASSERT(forward_nodes[i] != nullptr);
+                state.keep.insert(forward_nodes[i]);
                 ++n_checkpoints;
             }
         }
@@ -278,8 +263,8 @@ namespace {
 
         ggml_graph_clear(graph);
         ggml_graph_cpy(reordered, graph);
-        GGML_LOG_INFO("%s: interval=%d, checkpoints=%zu, recomputed nodes=%zu\n",
-                __func__, interval, n_checkpoints, state.clones.size());
+        GGML_LOG_INFO("%s: checkpoints=%d, recomputed nodes=%zu\n",
+                __func__, n_checkpoints, state.clones.size());
     }
 
     static bool ggml_opt_is_view_of(const ggml_tensor * tensor, const ggml_tensor * base) {
@@ -889,7 +874,6 @@ struct ggml_opt_params ggml_opt_default_params(
         /*get_opt_pars_ud =*/ nullptr,
         /*optimizer       =*/ GGML_OPT_OPTIMIZER_TYPE_ADAMW,
          GGML_TYPE_F32,
-        /*grad_checkpoint_interval =*/ 0,
     };
 }
 
@@ -1236,8 +1220,6 @@ ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
     result->get_opt_pars_ud  = params.get_opt_pars_ud;
     result->optimizer        = params.optimizer;
     result->optimizer_state_type = params.optimizer_state_type;
-    result->grad_checkpoint_interval = params.grad_checkpoint_interval;
-    GGML_ASSERT(result->grad_checkpoint_interval >= 0);
     GGML_ASSERT(result->optimizer_state_type == GGML_TYPE_F32 ||
                 result->optimizer_state_type == GGML_TYPE_F16 ||
                 result->optimizer_state_type == GGML_TYPE_BF16);
@@ -1677,6 +1659,14 @@ void ggml_opt_set_grad_stats_interval(ggml_opt_context_t opt_ctx, int32_t interv
     GGML_ASSERT(!opt_ctx->eval_ready);
     GGML_ASSERT(opt_ctx->opt_i == 0);
     opt_ctx->grad_stats_interval = interval;
+}
+
+void ggml_opt_set_gradient_checkpointing(ggml_opt_context_t opt_ctx, bool enabled) {
+    GGML_ASSERT(opt_ctx != nullptr);
+    GGML_ASSERT(!opt_ctx->static_graphs && "gradient checkpointing requires dynamic graphs");
+    GGML_ASSERT(!opt_ctx->eval_ready);
+    GGML_ASSERT(opt_ctx->opt_i == 0);
+    opt_ctx->gradient_checkpointing = enabled;
 }
 
 void ggml_opt_set_seed(ggml_opt_context_t opt_ctx, uint32_t seed) {

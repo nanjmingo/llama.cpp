@@ -4328,7 +4328,6 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     opt_params.get_opt_pars_ud = lopt_params.get_opt_pars_ud;
     opt_params.optimizer       = lopt_params.optimizer_type;
     opt_params.optimizer_state_type = lopt_params.optimizer_state_type;
-    opt_params.grad_checkpoint_interval = lopt_params.grad_checkpoint_interval;
     opt_ctx = ggml_opt_init(opt_params);
     if (opt_accumulation_period > 0) {
         ggml_opt_set_opt_period(opt_ctx, opt_accumulation_period);
@@ -4392,6 +4391,11 @@ void llama_context::opt_set_opt_period(int32_t opt_period) {
 void llama_context::opt_set_grad_stats_interval(int32_t interval) {
     GGML_ASSERT(opt_ctx);
     ggml_opt_set_grad_stats_interval(opt_ctx, interval);
+}
+
+void llama_context::opt_set_gradient_checkpointing(bool enabled) {
+    GGML_ASSERT(opt_ctx);
+    ggml_opt_set_gradient_checkpointing(opt_ctx, enabled);
 }
 
 void llama_context::opt_dataset_shuffle(ggml_opt_dataset_t dataset, int64_t idata) {
@@ -5471,6 +5475,10 @@ void llama_opt_set_opt_period(struct llama_context * ctx, int32_t opt_period) {
 
 void llama_opt_set_grad_stats_interval(struct llama_context * ctx, int32_t interval) {
     ctx->opt_set_grad_stats_interval(interval);
+}
+
+void llama_opt_set_gradient_checkpointing(struct llama_context * ctx, bool enabled) {
+    ctx->opt_set_gradient_checkpointing(enabled);
 }
 
 size_t llama_opt_state_size(const struct llama_context * ctx) {

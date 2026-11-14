@@ -116,7 +116,6 @@ bool train_adapter(const qlora_params & qparams,
         &schedule,
         params.optimizer,
         qlora_type_from_name(qparams.optimizer_state_type),
-        qparams.grad_checkpoint_interval,
     };
     const int64_t dataset_windows = ggml_opt_dataset_ndata(dataset.get());
     if (dataset_windows <= 0) {
@@ -171,11 +170,11 @@ bool train_adapter(const qlora_params & qparams,
         schedule.step = resume->scheduler_step;
     }
     llama_opt_init(ctx, model, opt_params);
+    llama_opt_set_gradient_checkpointing(ctx, qparams.gradient_checkpointing);
     llama_opt_set_opt_period(ctx, qparams.gradient_accumulation_steps);
     llama_opt_set_grad_stats_interval(ctx, qparams.grad_stats_interval);
-    if (qparams.grad_checkpoint_interval > 0) {
-        LOG_INF("%s: gradient checkpointing enabled (layer interval=%d)\n",
-                __func__, qparams.grad_checkpoint_interval);
+    if (qparams.gradient_checkpointing) {
+        LOG_INF("%s: gradient checkpointing enabled\n", __func__);
     }
     if (qparams.shuffle_dataset && !resume) {
         uint32_t seed = params.sampling.seed;

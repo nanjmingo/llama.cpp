@@ -161,9 +161,6 @@ extern "C" {
         enum ggml_opt_optimizer_type optimizer;
 
         enum ggml_type optimizer_state_type;
-
-        // Recompute layer activations between every N l_out checkpoints (dynamic graphs only); 0 disables checkpointing.
-        int32_t grad_checkpoint_interval;
     };
 
     // get parameters for an optimization context with defaults set where possible
@@ -179,6 +176,7 @@ extern "C" {
 
     GGML_API void ggml_opt_set_opt_period(ggml_opt_context_t opt_ctx, int32_t opt_period);
     GGML_API void ggml_opt_set_grad_stats_interval(ggml_opt_context_t opt_ctx, int32_t interval);
+    GGML_API void ggml_opt_set_gradient_checkpointing(ggml_opt_context_t opt_ctx, bool enabled);
 
     GGML_API void ggml_opt_set_loss_normalizer(ggml_opt_context_t opt_ctx, float loss_normalizer);
 

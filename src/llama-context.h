@@ -222,6 +222,7 @@ struct llama_context {
     void opt_set_seed(uint32_t seed);
     void opt_set_opt_period(int32_t opt_period);
     void opt_set_grad_stats_interval(int32_t interval);
+    void opt_set_gradient_checkpointing(bool enabled);
     size_t opt_state_size() const;
     bool opt_state_export(void * data, size_t size) const;
     bool opt_state_import(const void * data, size_t size);

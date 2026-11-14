@@ -109,9 +109,9 @@ Train a LoRA adapter with context size 512:
 | `--backward-precision` | `f32` | Requested input precision for backward GEMM: `f32`, `f16`, `bf16`. |
 | `--val-windows` | all remaining | Max windows evaluated after training range (`0` disables validation). |
 | `--grad-stats-interval` | `0` | Log gradient norm/stats every N updates (`0` disables logging). |
-| `--grad-checkpoint-interval` | `0` | Recompute layer activations between every N `l_out` boundaries to reduce activation memory (`0` disables; `1` checkpoints every layer output). |
+| `--gradient-checkpointing` | `off` | Recompute intermediate layer activations during backward to reduce activation memory (`on` or `off`). |
 
-Gradient checkpointing operates on dynamic training graphs. It retains every Nth `l_out` boundary and the final layer output, then recomputes intermediate activations during the backward pass. MoE I32 expert-selection indices and operations that read mutable external caches are reused from the original forward pass.
+When enabled, gradient checkpointing retains every `l_out` layer boundary and recomputes intermediate activations during backward. MoE I32 expert-selection indices and `GET_ROWS` outputs are reused from the original forward pass.
 
 #### Precision Selection
 

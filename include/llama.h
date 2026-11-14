@@ -1719,14 +1719,13 @@ extern "C" {
 
         enum ggml_opt_optimizer_type optimizer_type;
         enum ggml_type optimizer_state_type;
-
-        int32_t grad_checkpoint_interval; // recompute layer activations between every N l_out checkpoints; 0 disables
     };
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
     LLAMA_API void llama_opt_set_seed(struct llama_context * lctx, uint32_t seed);
     LLAMA_API void llama_opt_set_opt_period(struct llama_context * lctx, int32_t opt_period);
     LLAMA_API void llama_opt_set_grad_stats_interval(struct llama_context * lctx, int32_t interval);
+    LLAMA_API void llama_opt_set_gradient_checkpointing(struct llama_context * lctx, bool enabled);
     LLAMA_API size_t llama_opt_state_size(const struct llama_context * lctx);
     LLAMA_API bool llama_opt_state_export(const struct llama_context * lctx, void * data, size_t size);
     LLAMA_API bool llama_opt_state_import(struct llama_context * lctx, const void * data, size_t size);
