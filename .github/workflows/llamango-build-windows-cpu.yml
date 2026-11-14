@@ -220,6 +220,104 @@ jobs:
           Add-Content -Path $env:GITHUB_PATH -Value $llvmBin
           $clangVersion
 
+      - name: Select MSVC 14.44 for Windows ARM64
+        if: inputs.architecture == 'arm64'
+        shell: pwsh
+        run: |
+          $vswherePath = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path -LiteralPath $vswherePath -PathType Leaf)) {
+            $vswhere = Get-Command vswhere.exe -CommandType Application -ErrorAction Stop |
+              Select-Object -First 1
+            $vswherePath = $vswhere.Source
+          }
+
+          $component = 'Microsoft.VisualStudio.Component.VC.14.44.17.14.ARM64'
+          $vsInstallPath = & $vswherePath -latest -products '*' -requires $component -property installationPath |
+            Select-Object -First 1
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($vsInstallPath)) {
+            throw "Visual Studio with the ARM64 MSVC 14.44 component was not found"
+          }
+
+          $vcvarsall = Join-Path $vsInstallPath 'VC\Auxiliary\Build\vcvarsall.bat'
+          if (-not (Test-Path -LiteralPath $vcvarsall -PathType Leaf)) {
+            throw "vcvarsall.bat was not found: $vcvarsall"
+          }
+
+          $command = 'call "{0}" amd64_arm64 -vcvars_ver=14.44 && set' -f $vcvarsall
+          $environmentOutput = & $env:ComSpec /d /s /c $command 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            $environmentOutput | Write-Host
+            throw "Failed to initialize the MSVC 14.44 ARM64 toolchain"
+          }
+
+          $environmentNames = @(
+            'PATH'
+            'INCLUDE'
+            'LIB'
+            'LIBPATH'
+            'VCINSTALLDIR'
+            'VCToolsInstallDir'
+            'VCToolsVersion'
+            'VSINSTALLDIR'
+            'WindowsSdkDir'
+            'WindowsSDKVersion'
+            'UniversalCRTSdkDir'
+            'UCRTVersion'
+            'ExtensionSdkDir'
+          )
+          $environment = @{}
+          foreach ($line in $environmentOutput) {
+            $separator = $line.IndexOf('=')
+            if ($separator -le 0) {
+              continue
+            }
+
+            $name = $line.Substring(0, $separator)
+            if ($name -in $environmentNames) {
+              $environment[$name] = $line.Substring($separator + 1)
+            }
+          }
+
+          if ($environment['VCToolsVersion'] -notmatch '^14\.44\.') {
+            throw "Expected MSVC 14.44, got: $($environment['VCToolsVersion'])"
+          }
+          if ([string]::IsNullOrWhiteSpace($environment['VCToolsInstallDir'])) {
+            throw 'VCToolsInstallDir was not set by vcvarsall.bat'
+          }
+
+          $llvmBin = Join-Path $env:RUNNER_TEMP 'llvm-20.1.8\bin'
+          $clang = Join-Path $llvmBin 'clang++.exe'
+          if (-not (Test-Path -LiteralPath $clang -PathType Leaf)) {
+            throw "Clang was not found: $clang"
+          }
+          $environment['PATH'] = "$llvmBin;$($environment['PATH'])"
+
+          foreach ($name in $environmentNames) {
+            if (-not $environment.ContainsKey($name)) {
+              continue
+            }
+
+            Set-Item -Path "Env:$name" -Value $environment[$name]
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value "$name=$($environment[$name])" -Encoding utf8NoBOM
+          }
+
+          Write-Host "Using MSVC toolset $($environment['VCToolsVersion'])"
+          Write-Host "Using MSVC headers from $($environment['VCToolsInstallDir'])"
+
+          $probe = @'
+          #include <vector>
+          int main() {
+              std::vector<int> values;
+              return static_cast<int>(values.size());
+          }
+          '@
+          $probeOutput = $probe | & $clang --target=arm64-pc-windows-msvc -fsyntax-only -x c++ - 2>&1
+          $probeStatus = $LASTEXITCODE
+          $probeOutput | Write-Host
+          if ($probeStatus -ne 0) {
+            throw "Clang could not compile the MSVC STL probe with MSVC 14.44 (exit code $probeStatus)"
+          }
+
       - name: Ensure Ninja is available
         shell: pwsh
         run: |
