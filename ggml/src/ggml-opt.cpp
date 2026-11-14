@@ -212,13 +212,11 @@ namespace {
             forward_nodes[original_index] = graph->nodes[i];
         }
 
-        int n_checkpoints = 0;
         for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
             ggml_tensor * node = opt_ctx->gf->nodes[i];
             if (std::strncmp(node->name, "l_out-", 6) == 0) {
                 GGML_ASSERT(forward_nodes[i] != nullptr);
                 state.keep.insert(forward_nodes[i]);
-                ++n_checkpoints;
             }
         }
 
@@ -263,8 +261,6 @@ namespace {
 
         ggml_graph_clear(graph);
         ggml_graph_cpy(reordered, graph);
-        GGML_LOG_INFO("%s: checkpoints=%d, recomputed nodes=%zu\n",
-                __func__, n_checkpoints, state.clones.size());
     }
 
     static bool ggml_opt_is_view_of(const ggml_tensor * tensor, const ggml_tensor * base) {
