@@ -225,6 +225,13 @@ const std::vector<qlora_arg> & get_qlora_arg_defs() {
             }
         ));
         add_opt(qlora_arg(
+            {"--grad-checkpoint-interval"}, "N",
+            "Recompute layer activations between every N layer outputs; 0 disables (default: 0)",
+            [](qlora_params & params, const std::string & value) {
+                params.grad_checkpoint_interval = parse_non_negative_int(value, "--grad-checkpoint-interval");
+            }
+        ));
+        add_opt(qlora_arg(
             {"--max-steps"}, "N",
             "Stop after N optimizer updates and repeat the dataset as needed; overrides --epochs (default: disabled)",
             [](qlora_params & params, const std::string & value) {

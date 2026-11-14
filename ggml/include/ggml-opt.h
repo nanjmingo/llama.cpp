@@ -161,6 +161,9 @@ extern "C" {
         enum ggml_opt_optimizer_type optimizer;
 
         enum ggml_type optimizer_state_type;
+
+        // Recompute layer activations between every N l_out checkpoints (dynamic graphs only); 0 disables checkpointing.
+        int32_t grad_checkpoint_interval;
     };
 
     // get parameters for an optimization context with defaults set where possible

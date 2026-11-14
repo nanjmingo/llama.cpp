@@ -74,6 +74,7 @@ int main(int argc, char ** argv) {
         /*get_opt_pars_ud =*/&params.lr,
         /*optimizer_type  =*/params.optimizer,
         GGML_TYPE_F32,
+        /*grad_checkpoint_interval =*/0,
     };
     llama_opt_init(ctx, model, lopt_params);
 

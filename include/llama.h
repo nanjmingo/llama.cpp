@@ -1719,6 +1719,8 @@ extern "C" {
 
         enum ggml_opt_optimizer_type optimizer_type;
         enum ggml_type optimizer_state_type;
+
+        int32_t grad_checkpoint_interval; // recompute layer activations between every N l_out checkpoints; 0 disables
     };
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);

@@ -6,7 +6,7 @@ Base model weights stay **frozen**. Training updates only the LoRA adapter weigh
 
 - **Supported precision**: Trainable LoRA weights support F32, F16, and BF16 storage (gradients accumulate in F32).
 - **Optimizers**: AdamW (F32, F16, or BF16 moment states) and SGD (F32 only).
-- **Features**: Full-context causal training, gradient accumulation, Flash Attention (CPU and CUDA), MoE expert training, and crash-safe checkpoint/resume.
+- **Features**: Full-context causal training, gradient accumulation, activation checkpointing, Flash Attention (CPU and CUDA), MoE expert training, and crash-safe checkpoint/resume.
 
 ---
 
@@ -109,6 +109,9 @@ Train a LoRA adapter with context size 512:
 | `--backward-precision` | `f32` | Requested input precision for backward GEMM: `f32`, `f16`, `bf16`. |
 | `--val-windows` | all remaining | Max windows evaluated after training range (`0` disables validation). |
 | `--grad-stats-interval` | `0` | Log gradient norm/stats every N updates (`0` disables logging). |
+| `--grad-checkpoint-interval` | `0` | Recompute layer activations between every N `l_out` boundaries to reduce activation memory (`0` disables; `1` checkpoints every layer output). |
+
+Gradient checkpointing operates on dynamic training graphs. It retains every Nth `l_out` boundary and the final layer output, then recomputes intermediate activations during the backward pass. MoE I32 expert-selection indices and operations that read mutable external caches are reused from the original forward pass.
 
 #### Precision Selection
 
