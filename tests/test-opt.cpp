@@ -880,7 +880,9 @@ static bool run_gradient_checkpoint_case(
     ggml_tensor * selected = ggml_get_rows(ctx_graph, hidden, indices);
     ggml_tensor * hidden_view = ggml_view_1d(ctx_graph, selected, 1, 0);
     ggml_tensor * checkpoint_tensor = ggml_sqr(ctx_graph, hidden_view);
+    checkpoint_tensor->flags |= GGML_TENSOR_FLAG_F16_BACKWARD_CACHE;
     ggml_tensor * checkpoint_output = ggml_scale(ctx_graph, checkpoint_tensor, 2.0f);
+    checkpoint_output->flags |= GGML_TENSOR_FLAG_F16_BACKWARD_CACHE;
     ggml_tensor * outputs = ggml_sqr(ctx_graph, checkpoint_output);
     ggml_cgraph * gf = ggml_new_graph_custom(ctx_graph, 128, true);
     ggml_build_forward_expand(gf, outputs);

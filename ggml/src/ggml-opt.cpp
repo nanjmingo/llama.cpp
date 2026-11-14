@@ -541,7 +541,8 @@ static ggml_tensor * ggml_opt_recompute_clone(
     memcpy(clone->op_params, tensor->op_params, sizeof(tensor->op_params));
     clone->op = tensor->op;
     clone->flags = tensor->flags & ~(GGML_TENSOR_FLAG_PARAM | GGML_TENSOR_FLAG_LOSS |
-                                     GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_INPUT);
+                                     GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_INPUT |
+                                     GGML_TENSOR_FLAG_F16_BACKWARD_CACHE);
     ggml_format_name(clone, "%.56s (recompute)", tensor->name);
 
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
@@ -572,8 +573,7 @@ static void ggml_opt_recompute_regions(ggml_opt_context_t opt_ctx) {
     for (int i = 0; i < n_forward; ++i) {
         ggml_tensor * node = graph->nodes[i];
         const uint32_t keep_flags = GGML_TENSOR_FLAG_PARAM | GGML_TENSOR_FLAG_INPUT |
-                                    GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_LOSS |
-                                    GGML_TENSOR_FLAG_F16_BACKWARD_CACHE;
+                                    GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_LOSS;
         if (node->op == GGML_OP_NONE || (node->flags & keep_flags) != 0 ||
                 ggml_opt_recompute_reads_mutable_state(node, forward_nodes)) {
             keep.insert(node);
