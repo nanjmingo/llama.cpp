@@ -113,13 +113,11 @@ Train a LoRA adapter with context size 512:
 
 When enabled, gradient checkpointing retains every `l_out` layer boundary and recomputes intermediate activations during backward. MoE I32 expert-selection indices and `GET_ROWS` outputs are reused from the original forward pass.
 
-When `--backward-precision f16` is selected, F16 backward activation caching is enabled by default. Set `GGML_OPT_DISABLE_F16_BACKWARD_CACHE=1` to disable this cache independently of gradient checkpointing, for example when comparing VRAM usage and training speed. Unset the variable to keep the default behavior.
-
 #### Precision Selection
 
 On CUDA, `f32`, `f16`, and `bf16` requests are independent of the weight tensor storage type. The existing cuBLAS and backward matrix-multiplication paths convert supported inputs and weights to the requested compute type. If the GPU does not support the requested low-precision type efficiently, CUDA falls back to F32.
 
-`q8` is a separate quantized-activation mode. It remains available for quantized-weight kernels; with floating-point weights it uses the weight's native floating-point precision.
+`q8` requests Q8 activations for quantized-weight kernels. For floating-point weights, where Q8 activations are not applicable, the request resolves to F16. On CUDA, if F16 computation is not supported by the device, the cuBLAS path falls back to F32. Quantized-weight operations that cannot use a Q8 kernel also use the existing CUDA cuBLAS fallback, which selects F16 when supported and F32 otherwise.
 
 CPU support for applying F16/BF16 precision to F32 weights is not included in this change.
 

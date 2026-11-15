@@ -1393,14 +1393,10 @@ static ggml_prec llama_prec_policy_resolve(ggml_prec requested, ggml_type weight
         return requested;
     }
 
-    switch (weight_type) {
-        case GGML_TYPE_F16:
-            return GGML_PREC_F16;
-        case GGML_TYPE_BF16:
-            return GGML_PREC_BF16;
-        default:
-            return GGML_PREC_F32;
-    }
+    // Q8 activations are supported by quantized-weight kernels. For floating-point
+    // weights, use F16 instead; the CUDA cuBLAS path falls back to F32 when F16
+    // computation is not supported by the device.
+    return GGML_PREC_F16;
 }
 
 bool llama_prec_policy::apply(ggml_tensor * res) const {

@@ -8,7 +8,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <cinttypes>
 #include <locale>
@@ -306,8 +305,7 @@ namespace {
             opt_ctx->forward_node_indices[i] = i;
         }
 
-        const char * disable_f16_cache = std::getenv("GGML_OPT_DISABLE_F16_BACKWARD_CACHE");
-        if (disable_f16_cache && std::strcmp(disable_f16_cache, "1") == 0) {
+        if (opt_ctx->gradient_checkpointing) {
             return;
         }
 
