@@ -1,0 +1,317 @@
+name: Llamango CI & Prerelease
+
+run-name: CI | ${{ github.event.head_commit.timestamp }} | ${{ github.ref_name }}
+
+on:
+  push:
+    branches:
+      - '**'
+
+permissions:
+  contents: read
+
+jobs:
+  prepare-prerelease:
+    name: Prepare prerelease
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    outputs:
+      release_tag: ${{ steps.metadata.outputs.release_tag }}
+      ubuntu_x64_cpu_asset_name: ${{ steps.metadata.outputs.ubuntu_x64_cpu_asset_name }}
+      ubuntu_arm64_cpu_asset_name: ${{ steps.metadata.outputs.ubuntu_arm64_cpu_asset_name }}
+      windows_x64_cpu_asset_name: ${{ steps.metadata.outputs.windows_x64_cpu_asset_name }}
+      windows_arm64_cpu_asset_name: ${{ steps.metadata.outputs.windows_arm64_cpu_asset_name }}
+      ubuntu_x64_cuda_13_0_asset_name: ${{ steps.metadata.outputs.ubuntu_x64_cuda_13_0_asset_name }}
+      ubuntu_x64_cuda_12_8_asset_name: ${{ steps.metadata.outputs.ubuntu_x64_cuda_12_8_asset_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Prepare release metadata and create draft release
+        id: metadata
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          BRANCH_SLUG="$(printf '%s' "$GITHUB_REF_NAME" | sed -E 's/[^A-Za-z0-9._-]+/-/g; s/^-+//; s/-+$//' | cut -c1-80)"
+          if [[ -z "$BRANCH_SLUG" ]]; then
+            BRANCH_SLUG="branch"
+          fi
+
+          COMMIT_DATE="$(git show -s --format=%cI "$GITHUB_SHA")"
+          COMMIT_TIMESTAMP="$(date -u --date="$COMMIT_DATE" '+%Y-%m-%d-%H%M')"
+          COMMIT_DATE_UTC="$(date -u --date="$COMMIT_DATE" '+%Y-%m-%dT%H:%M:%SZ')"
+          RELEASE_BASE="${COMMIT_TIMESTAMP}-${BRANCH_SLUG}"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          RELEASE_TAG="$RELEASE_BASE"
+
+          UBUNTU_X64_CPU_ASSET_NAME="${RELEASE_BASE}-ubuntu-x64-cpu.tar.gz"
+          UBUNTU_ARM64_CPU_ASSET_NAME="${RELEASE_BASE}-ubuntu-arm64-cpu.tar.gz"
+          WINDOWS_X64_CPU_ASSET_NAME="${RELEASE_BASE}-windows-x64-cpu.zip"
+          WINDOWS_ARM64_CPU_ASSET_NAME="${RELEASE_BASE}-windows-arm64-cpu.zip"
+          UBUNTU_X64_CUDA_13_0_ASSET_NAME="${RELEASE_BASE}-ubuntu-x64-cuda-13.0.tar.gz"
+          UBUNTU_X64_CUDA_12_8_ASSET_NAME="${RELEASE_BASE}-ubuntu-x64-cuda-12.8.tar.gz"
+
+          tag_or_release_exists() {
+            gh release view "$1" >/dev/null 2>&1 || \
+              git ls-remote --exit-code --tags origin "refs/tags/$1" >/dev/null 2>&1
+          }
+
+          if tag_or_release_exists "$RELEASE_TAG"; then
+            RELEASE_TAG="${RELEASE_BASE}-${SHORT_SHA}"
+          fi
+
+          RELEASE_TITLE="$RELEASE_TAG"
+
+          cat > release-notes.md <<EOF_NOTES
+          Commit: ${GITHUB_SHA}
+          Commit date: ${COMMIT_DATE_UTC}
+
+          Ubuntu x64 CPU: Pending
+          Ubuntu ARM64 CPU: Pending
+          Windows x64 CPU: Pending
+          Windows ARM64 CPU: Pending
+
+          EOF_NOTES
+
+          create_or_update_release() {
+            if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+              gh release edit "$RELEASE_TAG" \
+                --title "$RELEASE_TITLE" \
+                --notes-file release-notes.md \
+                --prerelease
+            else
+              gh release create "$RELEASE_TAG" \
+                --target "$GITHUB_SHA" \
+                --title "$RELEASE_TITLE" \
+                --notes-file release-notes.md \
+                --draft \
+                --prerelease \
+                --latest=false
+            fi
+          }
+
+          if ! create_or_update_release; then
+            if [[ "$RELEASE_TAG" == "$RELEASE_BASE" ]] && tag_or_release_exists "$RELEASE_BASE"; then
+              RELEASE_TAG="${RELEASE_BASE}-${SHORT_SHA}"
+              RELEASE_TITLE="$RELEASE_TAG"
+              create_or_update_release
+            else
+              exit 1
+            fi
+          fi
+
+          {
+            echo "release_tag=${RELEASE_TAG}"
+            echo "ubuntu_x64_cpu_asset_name=${UBUNTU_X64_CPU_ASSET_NAME}"
+            echo "ubuntu_arm64_cpu_asset_name=${UBUNTU_ARM64_CPU_ASSET_NAME}"
+            echo "windows_x64_cpu_asset_name=${WINDOWS_X64_CPU_ASSET_NAME}"
+            echo "windows_arm64_cpu_asset_name=${WINDOWS_ARM64_CPU_ASSET_NAME}"
+            echo "ubuntu_x64_cuda_13_0_asset_name=${UBUNTU_X64_CUDA_13_0_ASSET_NAME}"
+            echo "ubuntu_x64_cuda_12_8_asset_name=${UBUNTU_X64_CUDA_12_8_ASSET_NAME}"
+          } >> "$GITHUB_OUTPUT"
+
+  build-ubuntu-x64-cpu:
+    permissions:
+      contents: write
+    name: Ubuntu / x64
+    needs: prepare-prerelease
+    uses: ./.github/workflows/llamango-build-ubuntu-cpu.yml
+    with:
+      runner: ubuntu-22.04
+      ubuntu_version: '22.04'
+      architecture: x64
+      cache_key_prefix: llamango-cache-ubuntu-cpu-22.04-x64
+      release_tag: ${{ needs.prepare-prerelease.outputs.release_tag }}
+      asset_name: ${{ needs.prepare-prerelease.outputs.ubuntu_x64_cpu_asset_name }}
+
+  build-ubuntu-arm64-cpu:
+    permissions:
+      contents: write
+    name: Ubuntu / ARM64
+    needs: prepare-prerelease
+    uses: ./.github/workflows/llamango-build-ubuntu-cpu.yml
+    with:
+      runner: ubuntu-24.04-arm
+      ubuntu_version: '24.04'
+      architecture: arm64
+      cache_key_prefix: llamango-cache-ubuntu-cpu-24.04-arm64
+      release_tag: ${{ needs.prepare-prerelease.outputs.release_tag }}
+      asset_name: ${{ needs.prepare-prerelease.outputs.ubuntu_arm64_cpu_asset_name }}
+
+  build-windows-x64-cpu:
+    permissions:
+      contents: write
+    name: Windows / x64
+    needs: prepare-prerelease
+    uses: ./.github/workflows/llamango-build-windows-cpu.yml
+    with:
+      architecture: x64
+      runner: windows-2025
+      toolchain_file: cmake/x64-windows-llvm.cmake
+      ccache_arch: x86_64
+      ccache_sha256: 6993ce645e53192cec592ee23186200b574ac4c59097ecde8d9cfd681b47ae84
+      openmp_args: -DGGML_OPENMP_FETCH=ON
+      release_tag: ${{ needs.prepare-prerelease.outputs.release_tag }}
+      asset_name: ${{ needs.prepare-prerelease.outputs.windows_x64_cpu_asset_name }}
+
+  build-windows-arm64-cpu:
+    permissions:
+      contents: write
+    name: Windows / ARM64
+    needs: prepare-prerelease
+    uses: ./.github/workflows/llamango-build-windows-cpu.yml
+    with:
+      architecture: arm64
+      runner: windows-11-arm
+      toolchain_file: cmake/arm64-windows-llvm.cmake
+      ccache_arch: aarch64
+      ccache_sha256: 47ea5a0ed661bea53962d8fb8ee9a1769092d979a6f7c73d3081499b3305b2ab
+      openmp_args: -DGGML_OPENMP_FETCH=ON
+      release_tag: ${{ needs.prepare-prerelease.outputs.release_tag }}
+      asset_name: ${{ needs.prepare-prerelease.outputs.windows_arm64_cpu_asset_name }}
+
+  build-ubuntu-x64-cuda-13-0:
+    permissions:
+      contents: write
+    name: Ubuntu / x64
+    needs: prepare-prerelease
+    uses: ./.github/workflows/llamango-build-ubuntu-cuda.yml
+    with:
+      cuda_version: '13.0.3'
+      cuda_display_version: '13.0'
+      container_image: nvidia/cuda:13.0.3-devel-ubuntu22.04
+      cache_key_prefix: llamango-cache-ubuntu-cuda-13.0.3-22.04
+      asset_name: ${{ needs.prepare-prerelease.outputs.ubuntu_x64_cuda_13_0_asset_name }}
+      release_tag: ${{ needs.prepare-prerelease.outputs.release_tag }}
+      cccl_version: v3.4.3
+
+  build-ubuntu-x64-cuda-12-8:
+    permissions:
+      contents: write
+    name: Ubuntu / x64
+    needs: prepare-prerelease
+    uses: ./.github/workflows/llamango-build-ubuntu-cuda.yml
+    with:
+      cuda_version: '12.8.2'
+      cuda_display_version: '12.8'
+      container_image: nvidia/cuda:12.8.2-devel-ubuntu22.04
+      cache_key_prefix: llamango-cache-ubuntu-cuda-12.8.2-22.04
+      asset_name: ${{ needs.prepare-prerelease.outputs.ubuntu_x64_cuda_12_8_asset_name }}
+      release_tag: ${{ needs.prepare-prerelease.outputs.release_tag }}
+
+  cleanup-caches:
+    name: Cleanup build caches
+    needs:
+      - build-ubuntu-x64-cpu
+      - build-ubuntu-arm64-cpu
+      - build-windows-x64-cpu
+      - build-windows-arm64-cpu
+      - build-ubuntu-x64-cuda-13-0
+      - build-ubuntu-x64-cuda-12-8
+    if: ${{ always() && !cancelled() }}
+    runs-on: ubuntu-22.04
+    permissions:
+      actions: write
+    concurrency:
+      group: llamango-cache-cleanup-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Retain the latest three caches per build target
+        uses: actions/github-script@v9
+        continue-on-error: true
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const prefixes = [
+              "llamango-cache-ubuntu-cpu-22.04-x64",
+              "llamango-cache-ubuntu-cpu-24.04-arm64",
+              "llamango-cache-windows-cpu-x64-4.14.2",
+              "llamango-cache-windows-cpu-arm64-4.14.2",
+              "llamango-cache-ubuntu-cuda-13.0.3-22.04",
+              "llamango-cache-ubuntu-cuda-12.8.2-22.04",
+            ];
+            const keepCount = 1;
+            const { owner, repo } = context.repo;
+            const ref = context.ref;
+
+            for (const prefix of prefixes) {
+              const caches = [];
+
+              for (let page = 1; ; page += 1) {
+                const { data } = await github.request(
+                  "GET /repos/{owner}/{repo}/actions/caches",
+                  {
+                    owner,
+                    repo,
+                    ref,
+                    key: prefix,
+                    sort: "created_at",
+                    direction: "desc",
+                    per_page: 100,
+                    page,
+                  },
+                );
+                const pageCaches = data.actions_caches ?? [];
+                caches.push(
+                  ...pageCaches.filter(
+                    (cache) =>
+                      cache.ref === ref && cache.key.startsWith(`${prefix}-`),
+                  ),
+                );
+
+                if (pageCaches.length < 100) {
+                  break;
+                }
+              }
+
+              caches.sort(
+                (left, right) =>
+                  Date.parse(right.created_at) - Date.parse(left.created_at) ||
+                  right.id - left.id,
+              );
+
+              const staleCaches = caches.slice(keepCount);
+              core.info(
+                `${prefix} (${ref}): found ${caches.length}, keeping ${Math.min(caches.length, keepCount)}, deleting ${staleCaches.length}.`,
+              );
+
+              for (const cache of staleCaches) {
+                try {
+                  await github.request(
+                    "DELETE /repos/{owner}/{repo}/actions/caches/{cache_id}",
+                    { owner, repo, cache_id: cache.id },
+                  );
+                  core.info(`Deleted cache ${cache.id}: ${cache.key}`);
+                } catch (error) {
+                  if (error.status === 404) {
+                    core.info(`Cache ${cache.id} was already removed.`);
+                    continue;
+                  }
+                  throw error;
+                }
+              }
+            }
+
+  test-cpu-results:
+    name: CPU test results
+    needs:
+      - prepare-prerelease
+      - build-ubuntu-x64-cpu
+      - build-ubuntu-arm64-cpu
+      - build-windows-x64-cpu
+      - build-windows-arm64-cpu
+    if: always() && needs.prepare-prerelease.result == 'success'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/llamango-test-cpu-results.yml
+    with:
+      release_tag: ${{ needs.prepare-prerelease.outputs.release_tag }}
+      ubuntu_x64_result: ${{ needs.build-ubuntu-x64-cpu.result }}
+      ubuntu_arm64_result: ${{ needs.build-ubuntu-arm64-cpu.result }}
+      windows_x64_result: ${{ needs.build-windows-x64-cpu.result }}
+      windows_arm64_result: ${{ needs.build-windows-arm64-cpu.result }}
