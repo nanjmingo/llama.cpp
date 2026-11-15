@@ -1,0 +1,40 @@
+name: Setup Llamango Linux ccache
+
+description: Initialize, restore, and reset ccache for a Llamango Linux build.
+
+inputs:
+  cache-key-prefix:
+    description: Stable cache key prefix for this runner and build target.
+    required: true
+  max-size:
+    description: Maximum ccache size.
+    required: false
+    default: 1G
+
+runs:
+  using: composite
+  steps:
+    - name: Initialize ccache
+      shell: bash
+      env:
+        CCACHE_MAX_SIZE: ${{ inputs.max-size }}
+      run: |
+        ccache_dir="${GITHUB_WORKSPACE}/.ccache"
+        mkdir -p "$ccache_dir"
+        {
+          echo "CCACHE_DIR=${ccache_dir}"
+          echo "CCACHE_MAXSIZE=${CCACHE_MAX_SIZE}"
+          echo "CCACHE_BASEDIR=${GITHUB_WORKSPACE}"
+        } >> "$GITHUB_ENV"
+
+    - name: Restore ccache
+      uses: actions/cache/restore@v6
+      with:
+        path: .ccache
+        key: ${{ inputs.cache-key-prefix }}-${{ github.run_id }}
+        restore-keys: |
+          ${{ inputs.cache-key-prefix }}-
+
+    - name: Reset ccache statistics
+      shell: bash
+      run: ccache --zero-stats
