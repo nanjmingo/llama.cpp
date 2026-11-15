@@ -623,13 +623,15 @@ static __global__ void quantize_mmq_few_q8_1(
     float amax = fmaxf(fmaxf(fabsf(xi.x), fabsf(xi.y)), fmaxf(fabsf(xi.z), fabsf(xi.w)));
     amax = warp_reduce_max<8>(amax);
 
-    const float d_inv = 127.0f / amax;
+    // A fully zero 32-value sub-block (including padded columns) must quantize to zero.
+    const bool nonzero = amax != 0.0f;
+    const float d_inv = nonzero ? 127.0f / amax : 0.0f;
     char4 q;
-    q.x = roundf(xi.x*d_inv);
-    q.y = roundf(xi.y*d_inv);
-    q.z = roundf(xi.z*d_inv);
-    q.w = roundf(xi.w*d_inv);
-    const float d = 1.0f / d_inv;
+    q.x = nonzero ? roundf(xi.x*d_inv) : 0;
+    q.y = nonzero ? roundf(xi.y*d_inv) : 0;
+    q.z = nonzero ? roundf(xi.z*d_inv) : 0;
+    q.w = nonzero ? roundf(xi.w*d_inv) : 0;
+    const float d = nonzero ? 1.0f / d_inv : 0.0f;
 
     // as in quantize_mmq_q8_1: the sum of the quantized values; the int warp_reduce_sum reduces the whole warp on Ampere+
     [[maybe_unused]] float sum = 0.0f;
