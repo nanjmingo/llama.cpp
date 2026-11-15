@@ -367,20 +367,60 @@ static bool read_gguf_tensor_bytes(const std::filesystem::path & path,
                             const gguf_context * gguf,
                             const char * name,
                             ggml_type expected_type,
-                            std::vector<uint8_t> & data) {
+                            std::vector<uint8_t> & data,
+                            std::string & error) {
     const int64_t id = gguf_find_tensor(gguf, name);
-    if (id < 0 || gguf_get_tensor_type(gguf, id) != expected_type) return false;
+    if (id < 0) {
+        error = std::string("tensor '") + name + "' is missing";
+        return false;
+    }
+
+    const ggml_type actual_type = gguf_get_tensor_type(gguf, id);
+    if (actual_type != expected_type) {
+        error = std::string("tensor '") + name + "' has type " + ggml_type_name(actual_type) +
+                "; expected " + ggml_type_name(expected_type);
+        return false;
+    }
+
     const size_t size = gguf_get_tensor_size(gguf, id);
     const size_t base = gguf_get_data_offset(gguf);
     const size_t offset = gguf_get_tensor_offset(gguf, id);
-    if (offset > SIZE_MAX - base || size > static_cast<size_t>(std::numeric_limits<std::streamsize>::max())) return false;
+    if (offset > SIZE_MAX - base) {
+        error = std::string("tensor '") + name + "' data offset overflows size_t";
+        return false;
+    }
+    const size_t absolute_offset = base + offset;
+    if (absolute_offset > static_cast<size_t>(std::numeric_limits<std::streamoff>::max())) {
+        error = std::string("tensor '") + name + "' data offset exceeds stream offset range";
+        return false;
+    }
+    if (size > static_cast<size_t>(std::numeric_limits<std::streamsize>::max())) {
+        error = std::string("tensor '") + name + "' size exceeds stream read range";
+        return false;
+    }
+
     std::ifstream stream(path, std::ios::binary);
-    if (!stream) return false;
-    stream.seekg(static_cast<std::streamoff>(base + offset));
-    if (!stream) return false;
+    if (!stream) {
+        error = "cannot open file for reading";
+        return false;
+    }
+    stream.seekg(static_cast<std::streamoff>(absolute_offset));
+    if (!stream) {
+        error = std::string("failed to seek to tensor '") + name + "' data at offset " +
+                std::to_string(absolute_offset);
+        return false;
+    }
+
     data.resize(size);
-    if (size > 0) stream.read(reinterpret_cast<char *>(data.data()), static_cast<std::streamsize>(size));
-    return static_cast<bool>(stream) || (size == 0 && static_cast<bool>(stream));
+    if (size > 0) {
+        stream.read(reinterpret_cast<char *>(data.data()), static_cast<std::streamsize>(size));
+        if (stream.gcount() != static_cast<std::streamsize>(size)) {
+            error = std::string("short read for tensor '") + name + "': read " +
+                    std::to_string(stream.gcount()) + " of " + std::to_string(size) + " bytes";
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool write_optimizer_file(const std::filesystem::path & path,
@@ -480,39 +520,96 @@ bool load_qlora_checkpoint(const std::string & requested_path, qlora_checkpoint 
         return false;
     }
 
+    const std::filesystem::path optimizer_path = result.directory / "optimizer.gguf";
     gguf_init_params init_params = { true, nullptr };
-    gguf_context_ptr optimizer_gguf(gguf_init_from_file((result.directory / "optimizer.gguf").string().c_str(), init_params));
+    gguf_context_ptr optimizer_gguf(gguf_init_from_file(optimizer_path.string().c_str(), init_params));
     if (!optimizer_gguf) {
-        LOG_ERR("%s: failed to open optimizer checkpoint\n", __func__);
+        LOG_ERR("%s: failed to parse or open optimizer checkpoint '%s'\n",
+                __func__, optimizer_path.string().c_str());
         return false;
     }
+
     const int64_t version_id = gguf_find_key(optimizer_gguf.get(), "qlora.checkpoint.version");
+    if (version_id < 0) {
+        LOG_ERR("%s: optimizer checkpoint '%s' is missing metadata key 'qlora.checkpoint.version'\n",
+                __func__, optimizer_path.string().c_str());
+        return false;
+    }
+    const gguf_type version_type = gguf_get_kv_type(optimizer_gguf.get(), version_id);
+    if (version_type != GGUF_TYPE_UINT32) {
+        LOG_ERR("%s: optimizer checkpoint key 'qlora.checkpoint.version' has type %s; expected %s\n",
+                __func__, gguf_type_name(version_type), gguf_type_name(GGUF_TYPE_UINT32));
+        return false;
+    }
+    const uint32_t optimizer_version = gguf_get_val_u32(optimizer_gguf.get(), version_id);
+    if (optimizer_version != 3) {
+        LOG_ERR("%s: unsupported optimizer checkpoint version %u; expected 3\n",
+                __func__, optimizer_version);
+        return false;
+    }
+
     const int64_t optimizer_name_id = gguf_find_key(optimizer_gguf.get(), "qlora.optimizer.name");
+    if (optimizer_name_id < 0) {
+        LOG_ERR("%s: optimizer checkpoint is missing metadata key 'qlora.optimizer.name'\n", __func__);
+        return false;
+    }
+    const gguf_type optimizer_name_type = gguf_get_kv_type(optimizer_gguf.get(), optimizer_name_id);
+    if (optimizer_name_type != GGUF_TYPE_STRING) {
+        LOG_ERR("%s: optimizer checkpoint key 'qlora.optimizer.name' has type %s; expected %s\n",
+                __func__, gguf_type_name(optimizer_name_type), gguf_type_name(GGUF_TYPE_STRING));
+        return false;
+    }
+    const char * stored_name = gguf_get_val_str(optimizer_gguf.get(), optimizer_name_id);
+    std::string metadata_name;
+    try {
+        metadata_name = result.metadata.at("optimizer").get<std::string>();
+    } catch (const std::exception & ex) {
+        LOG_ERR("%s: training-state.json has no valid string value for 'optimizer': %s\n",
+                __func__, ex.what());
+        return false;
+    }
+    if (metadata_name != stored_name) {
+        LOG_ERR("%s: optimizer name mismatch: optimizer.gguf contains '%s', training-state.json contains '%s'\n",
+                __func__, stored_name, metadata_name.c_str());
+        return false;
+    }
+
     const int64_t optimizer_state_type_id = gguf_find_key(optimizer_gguf.get(), "qlora.optimizer.state_type");
-    bool optimizer_matches = false;
-    bool optimizer_state_type_matches = false;
-    if (optimizer_name_id >= 0) {
-        const char * stored_name = gguf_get_val_str(optimizer_gguf.get(), optimizer_name_id);
-        try {
-            optimizer_matches = stored_name && result.metadata.at("optimizer").get<std::string>() == stored_name;
-        } catch (const std::exception &) {
-            optimizer_matches = false;
-        }
+    if (optimizer_state_type_id < 0) {
+        LOG_ERR("%s: optimizer checkpoint is missing metadata key 'qlora.optimizer.state_type'\n", __func__);
+        return false;
     }
-    if (optimizer_state_type_id >= 0) {
-        const char * stored_type = gguf_get_val_str(optimizer_gguf.get(), optimizer_state_type_id);
-        try {
-            optimizer_state_type_matches = stored_type && result.metadata.at("optimizer_state_type").get<std::string>() == stored_type;
-        } catch (const std::exception &) {
-            optimizer_state_type_matches = false;
-        }
+    const gguf_type optimizer_state_type = gguf_get_kv_type(optimizer_gguf.get(), optimizer_state_type_id);
+    if (optimizer_state_type != GGUF_TYPE_STRING) {
+        LOG_ERR("%s: optimizer checkpoint key 'qlora.optimizer.state_type' has type %s; expected %s\n",
+                __func__, gguf_type_name(optimizer_state_type), gguf_type_name(GGUF_TYPE_STRING));
+        return false;
     }
-    if (version_id < 0 || optimizer_name_id < 0 || optimizer_state_type_id < 0 ||
-        gguf_get_val_u32(optimizer_gguf.get(), version_id) != 3 ||
-        !optimizer_matches || !optimizer_state_type_matches ||
-        !read_gguf_tensor_bytes(result.directory / "optimizer.gguf", optimizer_gguf.get(),
-                                "optimizer.state", GGML_TYPE_I8, result.optimizer_state)) {
-        LOG_ERR("%s: invalid optimizer checkpoint contents\n", __func__);
+    const char * stored_state_type = gguf_get_val_str(optimizer_gguf.get(), optimizer_state_type_id);
+    std::string metadata_state_type;
+    try {
+        metadata_state_type = result.metadata.at("optimizer_state_type").get<std::string>();
+    } catch (const std::exception & ex) {
+        LOG_ERR("%s: training-state.json has no valid string value for 'optimizer_state_type': %s\n",
+                __func__, ex.what());
+        return false;
+    }
+    if (metadata_state_type != stored_state_type) {
+        LOG_ERR("%s: optimizer state type mismatch: optimizer.gguf contains '%s', training-state.json contains '%s'\n",
+                __func__, stored_state_type, metadata_state_type.c_str());
+        return false;
+    }
+
+    std::string tensor_error;
+    if (!read_gguf_tensor_bytes(optimizer_path, optimizer_gguf.get(), "optimizer.state",
+                                GGML_TYPE_I8, result.optimizer_state, tensor_error)) {
+        LOG_ERR("%s: cannot load optimizer state tensor from '%s': %s\n",
+                __func__, optimizer_path.string().c_str(), tensor_error.c_str());
+        return false;
+    }
+    if (result.optimizer_state.empty()) {
+        LOG_ERR("%s: optimizer state tensor in '%s' is empty\n",
+                __func__, optimizer_path.string().c_str());
         return false;
     }
     if (!ggml_opt_state_data_is_finite(result.optimizer_state.data(), result.optimizer_state.size())) {

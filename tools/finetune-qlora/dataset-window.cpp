@@ -44,7 +44,7 @@ void fill_window(const training_sample & sample,
 
         const size_t target_index = sample_index + 1;
         const bool initial_text_context = sample.text_continuation && offset == 0 &&
-            target_index < static_cast<size_t>(context_length / 2);
+            target_index <= static_cast<size_t>(context_length / 2);
         const float weight = initial_text_context ? 0.0f : sample.weights[target_index];
         if (weights) {
             weights[i] = weight;

@@ -1800,10 +1800,8 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur_mm);
 
-    const bool has_src1_prec_policy = prec_policy && prec_policy->apply(res);
-
-    if (training_graph && ggml_is_quantized(w->type) && !has_src1_prec_policy) {
-        ggml_prec_set_src(res, GGML_PREC_F32, 1);
+    if (prec_policy) {
+        prec_policy->apply(res);
     }
 
     if (w->type == GGML_TYPE_NVFP4) {
