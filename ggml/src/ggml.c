@@ -3359,7 +3359,6 @@ enum ggml_prec ggml_prec_get_src(
     };
 }
 
-
 // ggml_mul_mat
 
 static inline bool ggml_can_mul_mat(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {

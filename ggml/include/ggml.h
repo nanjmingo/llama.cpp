@@ -1093,6 +1093,7 @@ extern "C" {
             struct ggml_tensor  * a);
 
 
+
     // xIELU activation function
     // x = x * (c_a(alpha_n) + c_b(alpha_p, beta) * sigmoid(beta * x)) + eps * (x > 0)
     // where c_a = softplus and c_b(a, b) = softplus(a) + b are constraining functions
@@ -1285,7 +1286,6 @@ extern "C" {
     //     - cannot quantize it down to GGML_TYPE_Q4_0 or GGML_TYPE_NVFP4
     //   - ggml_prec_set_src(a, GGML_PREC_Q4, 1):
     //     - allows the implementation to quantize F32, BF16, F16 data of src[1] down to 4-bit datatypes such as GGML_TYPE_Q4_K, GGML_TYPE_NVFP4 etc.
-    // For MUL_MAT/MUL_MAT_ID ops, this compute type is also propagated to their backward ops; Q8/Q4 use F16 there.
     //
     // return false on faliure
     GGML_API bool ggml_prec_set_src(

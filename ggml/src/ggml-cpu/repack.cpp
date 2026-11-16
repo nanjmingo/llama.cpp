@@ -2459,6 +2459,7 @@ void ggml_gemm_q8_0_4x4_q8_0_generic(int                        n,
 }
 
 
+
 void ggml_gemm_q8_0_4x8_q8_0_generic(int                        n,
                                      float * GGML_RESTRICT      s,
                                      size_t                     bs,

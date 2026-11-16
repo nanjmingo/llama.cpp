@@ -702,7 +702,7 @@ struct llama_prec_policy {
     // TODO: migrate ad-hoc ggml_prec_set_acc() calls to this container + update apply() to use it
     std::unordered_map<const ggml_tensor *, ggml_prec> prec_acc;
 
-    // the key is the weight tensor `res->src[0]`, stores the recommended activation precision
+    // the key is the weight tensor `res->src[0]`, stores the recommended activation precision type
     std::unordered_map<const ggml_tensor *, ggml_prec> prec_src1;
 
     ggml_prec compute_type = GGML_PREC_UNDEFINED;

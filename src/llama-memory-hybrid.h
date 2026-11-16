@@ -40,7 +40,7 @@ public:
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
     const layer_filter_cb & filter_recr = nullptr,
-                 bool no_alloc_kv_cache = false);
+                     bool   no_alloc_kv_cache = false);
 
     ~llama_memory_hybrid() = default;
 

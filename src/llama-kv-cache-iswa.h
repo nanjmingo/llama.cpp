@@ -29,7 +29,7 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
-                     bool no_alloc_kv_cache = false);
+                         bool   no_alloc_kv_cache = false);
 
     llama_kv_cache_iswa(
             const llama_model & model,
@@ -48,7 +48,7 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
-                     bool no_alloc_kv_cache = false);
+                         bool   no_alloc_kv_cache = false);
 
     ~llama_kv_cache_iswa() = default;
 
