@@ -83,7 +83,7 @@ struct ggml_opt_context {
 
     enum ggml_opt_optimizer_type optimizer = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
     enum ggml_type optimizer_state_type = GGML_TYPE_F32;
-    bool gradient_checkpointing = false;
+    bool activation_checkpointing = false;
     bool optimizer_state_ready = false;
     std::vector<uint8_t> pending_optimizer_state;
 };
@@ -142,7 +142,7 @@ namespace {
     }
 
     static void ggml_opt_recompute_checkpoints(ggml_opt_context_t opt_ctx) {
-        if (!opt_ctx->gradient_checkpointing || opt_ctx->static_graphs ||
+        if (!opt_ctx->activation_checkpointing || opt_ctx->static_graphs ||
                 opt_ctx->build_type == GGML_OPT_BUILD_TYPE_FORWARD || opt_ctx->gf->n_nodes == 0) {
             return;
         }
@@ -205,7 +205,7 @@ namespace {
         }
 
         ggml_cgraph * reordered = ggml_new_graph_custom(opt_ctx->ctx_compute, graph->size, graph->grads != nullptr);
-        GGML_ASSERT(reordered && "failed to allocate gradient checkpoint graph");
+        GGML_ASSERT(reordered && "failed to allocate activation checkpoint graph");
         for (int i = 0; i < n_forward; ++i) {
             ggml_build_forward_expand(reordered, graph->nodes[i]);
         }
@@ -1296,12 +1296,12 @@ void ggml_opt_set_opt_period(ggml_opt_context_t opt_ctx, int32_t opt_period) {
     opt_ctx->opt_period = opt_period;
 }
 
-void ggml_opt_set_gradient_checkpointing(ggml_opt_context_t opt_ctx, bool enabled) {
+void ggml_opt_set_activation_checkpointing(ggml_opt_context_t opt_ctx, bool enabled) {
     GGML_ASSERT(opt_ctx != nullptr);
-    GGML_ASSERT(!opt_ctx->static_graphs && "gradient checkpointing requires dynamic graphs");
+    GGML_ASSERT(!opt_ctx->static_graphs && "activation checkpointing requires dynamic graphs");
     GGML_ASSERT(!opt_ctx->eval_ready);
     GGML_ASSERT(opt_ctx->opt_i == 0);
-    opt_ctx->gradient_checkpointing = enabled;
+    opt_ctx->activation_checkpointing = enabled;
 }
 
 void ggml_opt_set_seed(ggml_opt_context_t opt_ctx, uint32_t seed) {

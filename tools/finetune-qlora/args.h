@@ -23,7 +23,7 @@ struct qlora_params {
     int32_t     save_snapshot_steps = 0;
     int32_t     save_snapshot_limit = 0;
     int32_t     gradient_accumulation_steps = 8;
-    bool        gradient_checkpointing = true;
+    bool        activation_checkpointing = true;
     int32_t     max_steps          = 0;
     int32_t     val_windows        = -1;
     int32_t     freeze_layers      = 0;

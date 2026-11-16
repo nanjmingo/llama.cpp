@@ -169,10 +169,10 @@ bool train_adapter(const qlora_params & qparams,
         schedule.step = resume->scheduler_step;
     }
     llama_opt_init(ctx, model, opt_params);
-    llama_opt_set_gradient_checkpointing(ctx, qparams.gradient_checkpointing);
+    llama_opt_set_activation_checkpointing(ctx, qparams.activation_checkpointing);
     llama_opt_set_opt_period(ctx, qparams.gradient_accumulation_steps);
-    if (qparams.gradient_checkpointing) {
-        LOG_INF("%s: gradient checkpointing enabled\n", __func__);
+    if (qparams.activation_checkpointing) {
+        LOG_INF("%s: activation checkpointing enabled\n", __func__);
     }
     if (qparams.shuffle_dataset && !resume) {
         uint32_t seed = params.sampling.seed;

@@ -164,7 +164,7 @@ extern "C" {
     GGML_API void ggml_opt_set_seed(ggml_opt_context_t opt_ctx, uint32_t seed);
 
     GGML_API void ggml_opt_set_opt_period(ggml_opt_context_t opt_ctx, int32_t opt_period);
-    GGML_API void ggml_opt_set_gradient_checkpointing(ggml_opt_context_t opt_ctx, bool enabled);
+    GGML_API void ggml_opt_set_activation_checkpointing(ggml_opt_context_t opt_ctx, bool enabled);
 
     GGML_API void ggml_opt_set_loss_normalizer(ggml_opt_context_t opt_ctx, float loss_normalizer);
 

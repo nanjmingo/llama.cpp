@@ -108,9 +108,9 @@ Train a LoRA adapter with context size 512:
 | `-decay-epochs` | `-1` | Epochs to decay constant LR toward `--learning-rate-min`. |
 | `--compute-type` | `f16` | GEMM compute type: `f32`, `f16`, `bf16`, or `q8`. `q8` requests Q8 for forward GEMM and F16 for backward GEMM. |
 | `--val-windows` | all remaining | Max windows evaluated after training range (`0` disables validation). |
-| `--gradient-checkpointing` | `on` | Recompute intermediate layer activations during backward to reduce activation memory (`on` or `off`). |
+| `--activation-checkpointing` | `on` | Recompute intermediate layer activations during backward to reduce activation memory (`on` or `off`). |
 
-When enabled, gradient checkpointing retains every `l_out` layer boundary and recomputes intermediate activations during backward. MoE I32 expert-selection indices and `GET_ROWS` outputs are reused from the original forward pass.
+When enabled, activation checkpointing retains every `l_out` layer boundary and recomputes intermediate activations during backward. MoE I32 expert-selection indices and `GET_ROWS` outputs are reused from the original forward pass.
 
 #### Precision Selection
 

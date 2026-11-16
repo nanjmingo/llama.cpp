@@ -4393,9 +4393,9 @@ void llama_context::opt_set_opt_period(int32_t opt_period) {
     opt_accumulation_period = opt_period;
 }
 
-void llama_context::opt_set_gradient_checkpointing(bool enabled) {
+void llama_context::opt_set_activation_checkpointing(bool enabled) {
     GGML_ASSERT(opt_ctx);
-    ggml_opt_set_gradient_checkpointing(opt_ctx, enabled);
+    ggml_opt_set_activation_checkpointing(opt_ctx, enabled);
 }
 
 void llama_context::opt_dataset_shuffle(ggml_opt_dataset_t dataset, int64_t idata) {
@@ -5473,8 +5473,8 @@ void llama_opt_set_opt_period(struct llama_context * ctx, int32_t opt_period) {
     ctx->opt_set_opt_period(opt_period);
 }
 
-void llama_opt_set_gradient_checkpointing(struct llama_context * ctx, bool enabled) {
-    ctx->opt_set_gradient_checkpointing(enabled);
+void llama_opt_set_activation_checkpointing(struct llama_context * ctx, bool enabled) {
+    ctx->opt_set_activation_checkpointing(enabled);
 }
 
 size_t llama_opt_state_size(const struct llama_context * ctx) {

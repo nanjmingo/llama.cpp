@@ -226,7 +226,6 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=ccache ^
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache ^
             -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded ^
-            -DBUILD_SHARED_LIBS=OFF ^
             -DLLAMA_BUILD_COMMON=ON ^
             -DLLAMA_BUILD_TOOLS=ON ^
             -DLLAMA_BUILD_TESTS=ON ^
