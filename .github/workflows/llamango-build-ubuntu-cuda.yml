@@ -36,6 +36,9 @@ on:
 jobs:
   build:
     if: ${{ !inputs.skip_build }}
+    concurrency:
+      group: ${{ inputs.cache_key_prefix }}-${{ github.ref }}
+      queue: max
     name: CUDA ${{ inputs.cuda_display_version }}
     runs-on: ubuntu-22.04
     container: ${{ inputs.container_image }}

@@ -11,6 +11,10 @@ on:
         description: GitHub-hosted Windows runner with Visual Studio 2026.
         required: true
         type: string
+      cache_key_prefix:
+        description: Stable prefix for the ccache key and concurrency group.
+        required: true
+        type: string
       release_tag:
         description: Prerelease tag created by the orchestrator.
         required: true
@@ -28,6 +32,9 @@ on:
 jobs:
   build:
     if: ${{ !inputs.skip_build }}
+    concurrency:
+      group: ${{ inputs.cache_key_prefix }}-${{ github.ref }}
+      queue: max
     name: CPU
     runs-on: ${{ inputs.runner }}
     permissions:
@@ -184,9 +191,9 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: .ccache
-          key: llamango-cache-windows-msvc-${{ inputs.architecture }}-4.14.2-${{ github.run_id }}
+          key: ${{ inputs.cache_key_prefix }}-${{ github.run_id }}
           restore-keys: |
-            llamango-cache-windows-msvc-${{ inputs.architecture }}-4.14.2-
+            ${{ inputs.cache_key_prefix }}-
 
       - name: Configure and build full CPU build
         id: build
@@ -304,7 +311,7 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: .ccache
-          key: llamango-cache-windows-msvc-${{ inputs.architecture }}-4.14.2-${{ github.run_id }}
+          key: ${{ inputs.cache_key_prefix }}-${{ github.run_id }}
 
       - name: Run all CPU tests
         id: test

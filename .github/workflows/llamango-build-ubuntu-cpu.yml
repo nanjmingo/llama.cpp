@@ -32,6 +32,9 @@ on:
 jobs:
   build:
     if: ${{ !inputs.skip_build }}
+    concurrency:
+      group: ${{ inputs.cache_key_prefix }}-${{ github.ref }}
+      queue: max
     name: CPU
     runs-on: ${{ inputs.runner }}
     permissions:

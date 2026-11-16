@@ -7,10 +7,6 @@ on:
     branches:
       - '**'
 
-concurrency:
-  group: llamango-ci
-  queue: max
-
 permissions:
   contents: read
 
@@ -169,6 +165,7 @@ jobs:
     with:
       architecture: x64
       runner: windows-2025-vs2026
+      cache_key_prefix: llamango-cache-windows-cpu-x64-4.14.2
       release_tag: ${{ needs.prepare-prerelease.outputs.release_tag }}
       asset_name: ${{ needs.prepare-prerelease.outputs.windows_x64_cpu_asset_name }}
       skip_build: ${{ needs.prepare-prerelease.outputs.skip_windows_x64_cpu_build == 'true' }}
@@ -182,6 +179,7 @@ jobs:
     with:
       architecture: arm64
       runner: windows-11-vs2026-arm
+      cache_key_prefix: llamango-cache-windows-cpu-arm64-4.14.2
       release_tag: ${{ needs.prepare-prerelease.outputs.release_tag }}
       asset_name: ${{ needs.prepare-prerelease.outputs.windows_arm64_cpu_asset_name }}
       skip_build: ${{ needs.prepare-prerelease.outputs.skip_windows_arm64_cpu_build == 'true' }}
@@ -217,7 +215,7 @@ jobs:
       release_tag: ${{ needs.prepare-prerelease.outputs.release_tag }}
 
   cleanup-caches:
-    name: Cleanup build caches
+    name: Cleanup ${{ matrix.target }} cache
     needs:
       - build-ubuntu-x64-cpu
       - build-ubuntu-arm64-cpu
@@ -226,86 +224,94 @@ jobs:
       - build-ubuntu-x64-cuda-13-0
       - build-ubuntu-x64-cuda-12-8
     if: ${{ always() && !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: Ubuntu CPU x64
+            cache_key_prefix: llamango-cache-ubuntu-cpu-22.04-x64
+          - target: Ubuntu CPU ARM64
+            cache_key_prefix: llamango-cache-ubuntu-cpu-22.04-arm64
+          - target: Windows CPU x64
+            cache_key_prefix: llamango-cache-windows-cpu-x64-4.14.2
+          - target: Windows CPU ARM64
+            cache_key_prefix: llamango-cache-windows-cpu-arm64-4.14.2
+          - target: Ubuntu CUDA 13.0
+            cache_key_prefix: llamango-cache-ubuntu-cuda-13.0.3-22.04
+          - target: Ubuntu CUDA 12.8
+            cache_key_prefix: llamango-cache-ubuntu-cuda-12.8.2-22.04
     runs-on: ubuntu-22.04
     permissions:
       actions: write
     concurrency:
-      group: llamango-cache-cleanup-${{ github.ref }}
-      cancel-in-progress: false
+      group: ${{ matrix.cache_key_prefix }}-${{ github.ref }}
+      queue: max
     steps:
-      - name: Retain the latest cache per build target
+      - name: Retain the latest cache for this build target
         uses: actions/github-script@v9
         continue-on-error: true
+        env:
+          CACHE_KEY_PREFIX: ${{ matrix.cache_key_prefix }}
         with:
           github-token: ${{ github.token }}
           script: |
-            const prefixes = [
-              "llamango-cache-ubuntu-cpu-22.04-x64",
-              "llamango-cache-ubuntu-cpu-22.04-arm64",
-              "llamango-cache-windows-msvc-x64-4.14.2",
-              "llamango-cache-windows-msvc-arm64-4.14.2",
-              "llamango-cache-ubuntu-cuda-13.0.3-22.04",
-              "llamango-cache-ubuntu-cuda-12.8.2-22.04",
-            ];
+            const prefix = process.env.CACHE_KEY_PREFIX;
             const keepCount = 1;
             const { owner, repo } = context.repo;
             const ref = context.ref;
+            const caches = [];
 
-            for (const prefix of prefixes) {
-              const caches = [];
+            for (let page = 1; ; page += 1) {
+              const { data } = await github.request(
+                "GET /repos/{owner}/{repo}/actions/caches",
+                {
+                  owner,
+                  repo,
+                  ref,
+                  key: prefix,
+                  sort: "created_at",
+                  direction: "desc",
+                  per_page: 100,
+                  page,
+                },
+              );
+              const pageCaches = data.actions_caches ?? [];
+              caches.push(
+                ...pageCaches.filter(
+                  (cache) =>
+                    cache.ref === ref && cache.key.startsWith(`${prefix}-`),
+                ),
+              );
 
-              for (let page = 1; ; page += 1) {
-                const { data } = await github.request(
-                  "GET /repos/{owner}/{repo}/actions/caches",
-                  {
-                    owner,
-                    repo,
-                    ref,
-                    key: prefix,
-                    sort: "created_at",
-                    direction: "desc",
-                    per_page: 100,
-                    page,
-                  },
-                );
-                const pageCaches = data.actions_caches ?? [];
-                caches.push(
-                  ...pageCaches.filter(
-                    (cache) =>
-                      cache.ref === ref && cache.key.startsWith(`${prefix}-`),
-                  ),
-                );
-
-                if (pageCaches.length < 100) {
-                  break;
-                }
+              if (pageCaches.length < 100) {
+                break;
               }
+            }
 
-              caches.sort(
-                (left, right) =>
-                  Date.parse(right.created_at) - Date.parse(left.created_at) ||
-                  right.id - left.id,
-              );
+            caches.sort(
+              (left, right) =>
+                Date.parse(right.created_at) - Date.parse(left.created_at) ||
+                right.id - left.id,
+            );
 
-              const staleCaches = caches.slice(keepCount);
-              core.info(
-                `${prefix} (${ref}): found ${caches.length}, keeping ${Math.min(caches.length, keepCount)}, deleting ${staleCaches.length}.`,
-              );
+            const staleCaches = caches.slice(keepCount);
+            core.info(
+              `${prefix} (${ref}): found ${caches.length}, keeping ${Math.min(caches.length, keepCount)}, deleting ${staleCaches.length}.`,
+            );
 
-              for (const cache of staleCaches) {
-                try {
-                  await github.request(
-                    "DELETE /repos/{owner}/{repo}/actions/caches/{cache_id}",
-                    { owner, repo, cache_id: cache.id },
-                  );
-                  core.info(`Deleted cache ${cache.id}: ${cache.key}`);
-                } catch (error) {
-                  if (error.status === 404) {
-                    core.info(`Cache ${cache.id} was already removed.`);
-                    continue;
-                  }
-                  throw error;
+            for (const cache of staleCaches) {
+              try {
+                await github.request(
+                  "DELETE /repos/{owner}/{repo}/actions/caches/{cache_id}",
+                  { owner, repo, cache_id: cache.id },
+                );
+                core.info(`Deleted cache ${cache.id}: ${cache.key}`);
+              } catch (error) {
+                if (error.status === 404) {
+                  core.info(`Cache ${cache.id} was already removed.`);
+                  continue;
                 }
+                throw error;
               }
             }
 
