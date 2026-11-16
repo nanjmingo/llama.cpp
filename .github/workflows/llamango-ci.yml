@@ -140,7 +140,6 @@ jobs:
     uses: ./.github/workflows/llamango-build-ubuntu-cpu.yml
     with:
       runner: ubuntu-22.04
-      ubuntu_version: '22.04'
       architecture: x64
       cache_key_prefix: llamango-cache-ubuntu-cpu-22.04-x64
       release_tag: ${{ needs.prepare-prerelease.outputs.release_tag }}
@@ -154,10 +153,9 @@ jobs:
     needs: prepare-prerelease
     uses: ./.github/workflows/llamango-build-ubuntu-cpu.yml
     with:
-      runner: ubuntu-24.04-arm
-      ubuntu_version: '24.04'
+      runner: ubuntu-22.04-arm
       architecture: arm64
-      cache_key_prefix: llamango-cache-ubuntu-cpu-24.04-arm64
+      cache_key_prefix: llamango-cache-ubuntu-cpu-22.04-arm64
       release_tag: ${{ needs.prepare-prerelease.outputs.release_tag }}
       asset_name: ${{ needs.prepare-prerelease.outputs.ubuntu_arm64_cpu_asset_name }}
       skip_build: ${{ needs.prepare-prerelease.outputs.skip_ubuntu_arm64_cpu_build == 'true' }}
@@ -170,11 +168,7 @@ jobs:
     uses: ./.github/workflows/llamango-build-windows-cpu.yml
     with:
       architecture: x64
-      runner: windows-2025
-      toolchain_file: cmake/x64-windows-llvm.cmake
-      ccache_arch: x86_64
-      ccache_sha256: 6993ce645e53192cec592ee23186200b574ac4c59097ecde8d9cfd681b47ae84
-      openmp_args: -DGGML_OPENMP_FETCH=ON
+      runner: windows-2025-vs2026
       release_tag: ${{ needs.prepare-prerelease.outputs.release_tag }}
       asset_name: ${{ needs.prepare-prerelease.outputs.windows_x64_cpu_asset_name }}
       skip_build: ${{ needs.prepare-prerelease.outputs.skip_windows_x64_cpu_build == 'true' }}
@@ -187,11 +181,7 @@ jobs:
     uses: ./.github/workflows/llamango-build-windows-cpu.yml
     with:
       architecture: arm64
-      runner: windows-11-arm
-      toolchain_file: cmake/arm64-windows-llvm.cmake
-      ccache_arch: aarch64
-      ccache_sha256: 47ea5a0ed661bea53962d8fb8ee9a1769092d979a6f7c73d3081499b3305b2ab
-      openmp_args: -DGGML_OPENMP_FETCH=ON
+      runner: windows-11-vs2026-arm
       release_tag: ${{ needs.prepare-prerelease.outputs.release_tag }}
       asset_name: ${{ needs.prepare-prerelease.outputs.windows_arm64_cpu_asset_name }}
       skip_build: ${{ needs.prepare-prerelease.outputs.skip_windows_arm64_cpu_build == 'true' }}
@@ -199,7 +189,7 @@ jobs:
   build-ubuntu-x64-cuda-13-0:
     permissions:
       contents: write
-    name: Ubuntu / x64
+    name: Ubuntu / x64 / CUDA 13.0
     needs: prepare-prerelease
     uses: ./.github/workflows/llamango-build-ubuntu-cuda.yml
     with:
@@ -210,12 +200,11 @@ jobs:
       asset_name: ${{ needs.prepare-prerelease.outputs.ubuntu_x64_cuda_13_0_asset_name }}
       skip_build: ${{ needs.prepare-prerelease.outputs.skip_ubuntu_x64_cuda_13_0_build == 'true' }}
       release_tag: ${{ needs.prepare-prerelease.outputs.release_tag }}
-      cccl_version: v3.4.3
 
   build-ubuntu-x64-cuda-12-8:
     permissions:
       contents: write
-    name: Ubuntu / x64
+    name: Ubuntu / x64 / CUDA 12.8
     needs: prepare-prerelease
     uses: ./.github/workflows/llamango-build-ubuntu-cuda.yml
     with:
@@ -244,7 +233,7 @@ jobs:
       group: llamango-cache-cleanup-${{ github.ref }}
       cancel-in-progress: false
     steps:
-      - name: Retain the latest three caches per build target
+      - name: Retain the latest cache per build target
         uses: actions/github-script@v9
         continue-on-error: true
         with:
@@ -252,9 +241,9 @@ jobs:
           script: |
             const prefixes = [
               "llamango-cache-ubuntu-cpu-22.04-x64",
-              "llamango-cache-ubuntu-cpu-24.04-arm64",
-              "llamango-cache-windows-cpu-x64-4.14.2",
-              "llamango-cache-windows-cpu-arm64-4.14.2",
+              "llamango-cache-ubuntu-cpu-22.04-arm64",
+              "llamango-cache-windows-msvc-x64-4.14.2",
+              "llamango-cache-windows-msvc-arm64-4.14.2",
               "llamango-cache-ubuntu-cuda-13.0.3-22.04",
               "llamango-cache-ubuntu-cuda-12.8.2-22.04",
             ];

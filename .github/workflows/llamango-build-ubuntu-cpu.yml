@@ -7,10 +7,6 @@ on:
         description: GitHub-hosted runner label.
         required: true
         type: string
-      ubuntu_version:
-        description: Ubuntu version written to BUILD_INFO.txt.
-        required: true
-        type: string
       architecture:
         description: Target architecture (x64 or arm64).
         required: true
@@ -79,23 +75,21 @@ jobs:
 
           echo "$GITHUB_WORKSPACE/.venv-ci/bin" >> "$GITHUB_PATH"
 
-      - name: Toolchain workaround (GCC 14)
-        if: inputs.architecture == 'arm64'
-        run: |
-          sudo apt-get install -y gcc-14 g++-14
-          echo "CC=gcc-14" >> "$GITHUB_ENV"
-          echo "CXX=g++-14" >> "$GITHUB_ENV"
-
       - name: Setup ccache
         uses: ./.github/actions/llamango-cache-linux
         with:
           cache-key-prefix: ${{ inputs.cache_key_prefix }}
 
       - name: Configure full CPU build
+        env:
+          CC: gcc-12
+          CXX: g++-12
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_BUILD_RPATH_USE_ORIGIN=ON \
+            -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++" \
+            -DBUILD_SHARED_LIBS=OFF \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DLLAMA_BUILD_COMMON=ON \
@@ -120,18 +114,18 @@ jobs:
         if: always() && steps.build.outcome == 'success'
         env:
           ASSET_NAME: ${{ inputs.asset_name }}
-          UBUNTU_VERSION: ${{ inputs.ubuntu_version }}
           ARCHITECTURE: ${{ inputs.architecture }}
         run: |
           set -euo pipefail
           cat > build/bin/BUILD_INFO.txt <<EOF_INFO
           Repository: ${GITHUB_REPOSITORY}
           Commit: ${GITHUB_SHA}
-          OS: Ubuntu ${UBUNTU_VERSION}
+          OS: Ubuntu 22.04
           Architecture: ${ARCHITECTURE}
           Backend: CPU
           Build scope: all default CMake targets
           Build type: Release
+          C/C++ runtime: static libgcc/libstdc++
           EOF_INFO
           tar -czf "$ASSET_NAME" -C build/bin .
 
@@ -143,10 +137,6 @@ jobs:
           asset-path: ${{ inputs.asset_name }}
           token: ${{ github.token }}
           repository: ${{ github.repository }}
-
-      - name: Show ccache statistics
-        if: always()
-        run: ccache --show-stats
 
       - name: Save ccache
         if: always() && steps.build.outcome == 'success'
