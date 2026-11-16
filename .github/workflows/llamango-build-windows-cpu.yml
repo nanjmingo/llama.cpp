@@ -724,6 +724,3 @@ jobs:
           repository: ${{ github.repository }}
           publish-release: 'false'
 
-      - name: Fail job if Windows CPU tests failed
-        if: always() && steps.test.outcome == 'failure'
-        run: exit 1

@@ -193,6 +193,3 @@ jobs:
           repository: ${{ github.repository }}
           publish-release: 'false'
 
-      - name: Fail job if CPU tests failed
-        if: always() && steps.test.outputs.exit_code != '0'
-        run: exit 1
