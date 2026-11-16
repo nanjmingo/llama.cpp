@@ -200,18 +200,8 @@ jobs:
             default { throw "Unsupported Windows architecture: $env:TARGET_ARCHITECTURE" }
           }
 
-          $vswherePath = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
-          if (-not (Test-Path -LiteralPath $vswherePath -PathType Leaf)) {
-            $vswhere = Get-Command vswhere.exe -CommandType Application -ErrorAction Stop |
-              Select-Object -First 1
-            $vswherePath = $vswhere.Source
-          }
-          $vsInstallPath = & $vswherePath -latest -products '*' -property installationPath |
-            Select-Object -First 1
-          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($vsInstallPath)) {
-            throw 'Visual Studio 2026 installation could not be located with vswhere'
-          }
-
+          # The selected GitHub-hosted VS2026 images install Enterprise at this path.
+          $vsInstallPath = Join-Path $env:ProgramFiles 'Microsoft Visual Studio/18/Enterprise'
           $vsDevCmd = Join-Path $vsInstallPath 'Common7/Tools/VsDevCmd.bat'
           if (-not (Test-Path -LiteralPath $vsDevCmd -PathType Leaf)) {
             throw "VsDevCmd.bat was not found: $vsDevCmd"
