@@ -78,9 +78,11 @@ static __dpct_inline__ void cross_entropy_loss_back_f32_kernel(
     max_logit = warp_reduce_max<WARP_SIZE>(max_logit);
 
     float sum_exp = 0.0f;
+    float label_sum = 0.0f;
     for (int i = tid; i < nclasses; i += WARP_SIZE) {
         const float v = sycl::exp((has_shared ? smem[i] : logits[i]) - max_logit);
         sum_exp += v;
+        label_sum += labels[i];
         if (has_shared) {
             smem[i] = v;
         } else {
@@ -88,12 +90,13 @@ static __dpct_inline__ void cross_entropy_loss_back_f32_kernel(
         }
     }
     sum_exp = warp_reduce_sum<WARP_SIZE>(sum_exp);
-    const float inv_sum = 1.0f / sum_exp;
+    label_sum = warp_reduce_sum<WARP_SIZE>(label_sum);
+    const float sm_scale = label_sum / sum_exp;
 
     const float d_by_nrows = grad[0] / (float) nrows;
     for (int i = tid; i < nclasses; i += WARP_SIZE) {
         const float sm_num = has_shared ? smem[i] : dst[i];
-        dst[i] = (sm_num * inv_sum - labels[i]) * d_by_nrows;
+        dst[i] = (sm_num * sm_scale - labels[i]) * d_by_nrows;
     }
 }
 

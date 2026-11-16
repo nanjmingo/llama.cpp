@@ -1,0 +1,46 @@
+name: Llamango CPU Test Results
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: Release tag whose JUnit assets should be summarized.
+        required: true
+        type: string
+      ubuntu_x64_result:
+        description: Result of the Ubuntu x64 CPU build and test job.
+        required: true
+        type: string
+      ubuntu_arm64_result:
+        description: Result of the Ubuntu ARM64 CPU build and test job.
+        required: true
+        type: string
+      windows_x64_result:
+        description: Result of the Windows x64 CPU build and test job.
+        required: true
+        type: string
+      windows_arm64_result:
+        description: Result of the Windows ARM64 CPU build and test job.
+        required: true
+        type: string
+
+jobs:
+  update:
+    name: Update Release Notes
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Aggregate CPU JUnit results and update prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          UBUNTU_X64_JOB_RESULT: ${{ inputs.ubuntu_x64_result }}
+          UBUNTU_ARM64_JOB_RESULT: ${{ inputs.ubuntu_arm64_result }}
+          WINDOWS_X64_JOB_RESULT: ${{ inputs.windows_x64_result }}
+          WINDOWS_ARM64_JOB_RESULT: ${{ inputs.windows_arm64_result }}
+        run: bash .github/scripts/llamango/test/update-test-cpu-results.sh
