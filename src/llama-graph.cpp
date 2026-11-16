@@ -1785,13 +1785,6 @@ static void llama_prec_policy_apply_matmul(const llama_prec_policy * prec_policy
     }
 }
 
-static void llama_prec_policy_mark_f16_backward_cache(
-        bool training_graph, ggml_tensor * activation, const ggml_tensor * matmul) {
-    if (training_graph && ggml_prec_get_bwd(matmul) == GGML_PREC_F16) {
-        activation->flags |= GGML_TENSOR_FLAG_F16_BACKWARD_CACHE;
-    }
-}
-
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
@@ -1823,19 +1816,8 @@ ggml_tensor * llm_graph_context::build_lora_mm(
 
         ggml_tensor * lora_a_cur = ggml_mul_mat(ctx0, lw->a, cur);
         llama_prec_policy_apply_matmul(prec_policy, lora_a_cur);
-        // The backward activation cache is architecture-independent. The optimizer
-        // validates the activation's type, aliases, backward users, and backend support
-        // before replacing any F32 activation with its F16 cache.
-        if (training_graph && ggml_prec_get_bwd(lora_a_cur) == GGML_PREC_F16) {
-            cur->flags |= GGML_TENSOR_FLAG_F16_BACKWARD_CACHE;
-        }
-
         ggml_tensor * ab_cur = ggml_mul_mat(ctx0, lw->b, lora_a_cur);
         llama_prec_policy_apply_matmul(prec_policy, ab_cur);
-        if (training_graph && ggml_prec_get_bwd(ab_cur) == GGML_PREC_F16) {
-            lora_a_cur->flags |= GGML_TENSOR_FLAG_F16_BACKWARD_CACHE;
-        }
-
         ab_cur = ggml_scale(ctx0, ab_cur, scale);
         res = ggml_add(ctx0, res, ab_cur);
     }
@@ -1922,16 +1904,8 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
 
         ggml_tensor * lora_a_cur = ggml_mul_mat_id(ctx0, lw->a, cur, ids);
         llama_prec_policy_apply_matmul(prec_policy, lora_a_cur);
-        if (training_graph && ggml_prec_get_bwd(lora_a_cur) == GGML_PREC_F16) {
-            cur->flags |= GGML_TENSOR_FLAG_F16_BACKWARD_CACHE;
-        }
-
         ggml_tensor * ab_cur = ggml_mul_mat_id(ctx0, lw->b, lora_a_cur, ids);
         llama_prec_policy_apply_matmul(prec_policy, ab_cur);
-        if (training_graph && ggml_prec_get_bwd(ab_cur) == GGML_PREC_F16) {
-            lora_a_cur->flags |= GGML_TENSOR_FLAG_F16_BACKWARD_CACHE;
-        }
-
         ab_cur = ggml_scale(ctx0, ab_cur, scale);
         res = ggml_add(ctx0, res, ab_cur);
     }
@@ -3215,8 +3189,6 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
         ggml_prec_set_acc(kq, GGML_PREC_BF16);
         llama_prec_policy_apply_matmul(prec_policy, kq);
-        llama_prec_policy_mark_f16_backward_cache(training_graph, q, kq);
-        llama_prec_policy_mark_f16_backward_cache(training_graph, k, kq);
         cb(kq, "kq", il);
 
         if (model.arch == LLM_ARCH_GROK) {
@@ -3258,7 +3230,6 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
         llama_prec_policy_apply_matmul(prec_policy, kqv);
-        llama_prec_policy_mark_f16_backward_cache(training_graph, v, kqv);
         cb(kqv, "kqv", il);
 
         // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA

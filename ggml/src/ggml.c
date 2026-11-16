@@ -3307,6 +3307,9 @@ bool ggml_prec_set_src(
     switch (a->op) {
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_OUT_PROD:
+        case GGML_OP_OUT_PROD_ID:
+        case GGML_OP_MUL_MAT_ID_BACK:
             {
                 if (idx != 1) {
                     return false;
@@ -3344,6 +3347,9 @@ enum ggml_prec ggml_prec_get_src(
     switch (a->op) {
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_OUT_PROD:
+        case GGML_OP_OUT_PROD_ID:
+        case GGML_OP_MUL_MAT_ID_BACK:
             if (idx != 1) {
                 return GGML_PREC_UNDEFINED;
             }
@@ -3353,44 +3359,6 @@ enum ggml_prec ggml_prec_get_src(
     };
 }
 
-bool ggml_prec_set_bwd(
-        struct ggml_tensor * a,
-        enum ggml_prec       prec) {
-    switch (prec) {
-        case GGML_PREC_F32:
-        case GGML_PREC_F16:
-        case GGML_PREC_BF16:
-        case GGML_PREC_UNDEFINED:
-            break;
-        default:
-            return false;
-    }
-
-    switch (a->op) {
-        case GGML_OP_MUL_MAT:
-        case GGML_OP_MUL_MAT_ID:
-        case GGML_OP_OUT_PROD:
-        case GGML_OP_OUT_PROD_ID:
-        case GGML_OP_MUL_MAT_ID_BACK:
-            ggml_set_op_params_i32(a, 4, (int32_t) prec);
-            return true;
-        default:
-            return false;
-    }
-}
-
-enum ggml_prec ggml_prec_get_bwd(const struct ggml_tensor * a) {
-    switch (a->op) {
-        case GGML_OP_MUL_MAT:
-        case GGML_OP_MUL_MAT_ID:
-        case GGML_OP_OUT_PROD:
-        case GGML_OP_OUT_PROD_ID:
-        case GGML_OP_MUL_MAT_ID_BACK:
-            return (enum ggml_prec) ggml_get_op_params_i32(a, 4);
-        default:
-            return GGML_PREC_UNDEFINED;
-    }
-}
 
 // ggml_mul_mat
 
@@ -6889,6 +6857,15 @@ static void ggml_sub_or_set(
     ggml_build_forward_expand(cgraph, cgraph->grads[isrc]);
 }
 
+static enum ggml_prec ggml_prec_compute_type_for_grad(const struct ggml_tensor * tensor) {
+    const enum ggml_prec compute_type = ggml_prec_get_src(tensor, 1);
+
+    // Q8/Q4 are forward activation formats; backward kernels use F16 for these compute types.
+    return compute_type == GGML_PREC_Q8 || compute_type == GGML_PREC_Q4
+        ? GGML_PREC_F16
+        : compute_type;
+}
+
 static void ggml_compute_backward(
         struct ggml_context * ctx, struct ggml_cgraph * cgraph, int i, const bool * grads_needed) {
     struct ggml_tensor * tensor = cgraph->nodes[i];
@@ -7067,9 +7044,9 @@ static void ggml_compute_backward(
                     ggml_out_prod(ctx, // [n,m,qq,rr]
                         src1,          // [n,p,qq,rr]
                         grad);         // [m,p,qq,rr]
-                const enum ggml_prec prec_bwd = ggml_prec_get_bwd(tensor);
-                if (prec_bwd != GGML_PREC_UNDEFINED) {
-                    GGML_ASSERT(ggml_prec_set_bwd(tmp, prec_bwd));
+                const enum ggml_prec compute_type = ggml_prec_compute_type_for_grad(tensor);
+                if (compute_type != GGML_PREC_UNDEFINED) {
+                    GGML_ASSERT(ggml_prec_set_src(tmp, compute_type, 1));
                 }
                 if (!ggml_are_same_shape(tmp, src0)) {
                     GGML_ASSERT(tmp->ne[0] == src0->ne[0]);
@@ -7091,9 +7068,9 @@ static void ggml_compute_backward(
                         src0,               // [n,m,q1,r1]
                         ggml_transpose(ctx, // [p,m,qq,rr]
                             grad));         // [m,p,qq,rr]
-                const enum ggml_prec prec_bwd = ggml_prec_get_bwd(tensor);
-                if (prec_bwd != GGML_PREC_UNDEFINED) {
-                    GGML_ASSERT(ggml_prec_set_bwd(grad_src1, prec_bwd));
+                const enum ggml_prec compute_type = ggml_prec_compute_type_for_grad(tensor);
+                if (compute_type != GGML_PREC_UNDEFINED) {
+                    GGML_ASSERT(ggml_prec_set_src(grad_src1, compute_type, 1));
                 }
                 ggml_add_or_set(ctx, cgraph, isrc1, grad_src1);
             }
@@ -7106,25 +7083,25 @@ static void ggml_compute_backward(
                     src1_expanded = ggml_repeat_4d(ctx, src1, src1->ne[0], src2->ne[0], src1->ne[2], 1);
                 }
                 struct ggml_tensor * grad_as = ggml_out_prod_id(ctx, src1_expanded, grad, src2, n_expert);
-                const enum ggml_prec prec_bwd = ggml_prec_get_bwd(tensor);
-                if (prec_bwd != GGML_PREC_UNDEFINED) {
-                    GGML_ASSERT(ggml_prec_set_bwd(grad_as, prec_bwd));
+                const enum ggml_prec compute_type = ggml_prec_compute_type_for_grad(tensor);
+                if (compute_type != GGML_PREC_UNDEFINED) {
+                    GGML_ASSERT(ggml_prec_set_src(grad_as, compute_type, 1));
                 }
                 ggml_add_or_set(ctx, cgraph, isrc0, grad_as);
             }
             if (src1_needs_grads) {
                 struct ggml_tensor * grad_b;
-                const enum ggml_prec prec_bwd = ggml_prec_get_bwd(tensor);
+                const enum ggml_prec compute_type = ggml_prec_compute_type_for_grad(tensor);
                 if (ggml_is_quantized(src0->type)) {
                     grad_b = ggml_mul_mat_id_back(ctx, src0, grad, src2, src1);
-                    if (prec_bwd != GGML_PREC_UNDEFINED) {
-                        GGML_ASSERT(ggml_prec_set_bwd(grad_b, prec_bwd));
+                    if (compute_type != GGML_PREC_UNDEFINED) {
+                        GGML_ASSERT(ggml_prec_set_src(grad_b, compute_type, 1));
                     }
                 } else {
                     struct ggml_tensor * as_T = ggml_cont(ctx, ggml_permute(ctx, src0, 1, 0, 2, 3));
                     grad_b = ggml_mul_mat_id(ctx, as_T, grad, src2);
-                    if (prec_bwd != GGML_PREC_UNDEFINED) {
-                        GGML_ASSERT(ggml_prec_set_src(grad_b, prec_bwd, 1));
+                    if (compute_type != GGML_PREC_UNDEFINED) {
+                        GGML_ASSERT(ggml_prec_set_src(grad_b, compute_type, 1));
                     }
                     if (!ggml_are_same_shape(grad_b, src1)) {
                         grad_b = ggml_repeat_back(ctx, grad_b, src1);

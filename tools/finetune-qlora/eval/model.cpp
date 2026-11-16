@@ -116,10 +116,9 @@ Model::Impl::Impl(ModelOptions opts, ModelPrecisionConfig precision_config)
     model.reset(llama_model_load_from_file(options.model_path.c_str(), model_params));
     detail::require(static_cast<bool>(model), "failed to load the GGUF model");
 
-    active_forward_precision = precision.forward_precision;
+    active_compute_type = precision.compute_precision;
     model->prec_policy.prec_src1.clear();
-    model->prec_policy.prec_src1_default = precision.forward_precision;
-    model->prec_policy.prec_bwd = precision.backward_precision;
+    model->prec_policy.compute_type = precision.compute_precision;
     lora_tensors prepared;
     {
         std::mt19937 rng(42);
@@ -158,16 +157,16 @@ Model::~Model() = default;
 Model::Model(Model &&) noexcept = default;
 Model & Model::operator=(Model &&) noexcept = default;
 
-void Model::Impl::set_forward_precision(ggml_prec forward_precision) {
-    if (active_forward_precision == forward_precision) {
+void Model::Impl::set_compute_type(ggml_prec compute_type) {
+    if (active_compute_type == compute_type) {
         return;
     }
-    model->prec_policy.prec_src1_default = forward_precision;
-    active_forward_precision = forward_precision;
+    model->prec_policy.compute_type = compute_type;
+    active_compute_type = compute_type;
 }
 
-void Model::set_forward_precision(ggml_prec precision) {
-    impl_->set_forward_precision(precision);
+void Model::set_compute_type(ggml_prec compute_type) {
+    impl_->set_compute_type(compute_type);
 }
 
 

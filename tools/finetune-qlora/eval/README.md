@@ -1,14 +1,14 @@
 # QLoRA Precision Evaluation Tool
 
-`eval-qlora-model-precision` evaluates how forward and backward precision affect training loss convergence across different learning rates.
+`eval-qlora-model-precision` evaluates how the selected compute type affects training loss convergence across different learning rates.
 
 ---
 
 ## How It Works
 
-1. Measures initial baseline loss on a fixed evaluation window using F32 forward precision.
+1. Measures initial baseline loss on a fixed evaluation window using F32 compute type.
 2. For each specified learning rate, trains a fresh LoRA adapter for N optimizer updates (`--epoch`).
-3. Evaluates inference loss after each update (always evaluated in F32 forward precision).
+3. Evaluates inference loss after each update (always evaluated with F32 compute type).
 4. Prints per-step loss changes and elapsed time.
 
 ---
@@ -18,8 +18,7 @@
 | Option | Default | Description |
 |---|---|---|
 | `-m`, `--model` | *(required)* | Path to GGUF model file. |
-| `--forward-precision` | `f32` | Forward matrix multiplication precision (`f32`, `f16`, `bf16`, `q8`). |
-| `--backward-precision` | `f32` | Backward matrix multiplication precision (`f32`, `f16`, `bf16`). |
+| `--compute-type` | `f32` | Matrix multiplication compute type (`f32`, `f16`, `bf16`, `q8`). `q8` uses Q8 for forward and F16 for backward. |
 | `--learning-rates` | *(required)* | Comma-separated learning rates (e.g. `1e-2,1e-3,1e-4`). |
 | `--epoch` | `10` | Number of optimizer updates per learning rate. |
 | `--n-gpu-layers` | `0` | GPU offload layers (`0` = CPU only, `-1` = all layers). |
@@ -58,8 +57,7 @@ cmake --build build --target llamango-eval-tools -j
 ```bash
 ./build/bin/eval-qlora-model-precision \
   --model /path/to/SmolLM2-135M-Instruct-Q8_0.gguf \
-  --forward-precision q8 \
-  --backward-precision f32 \
+  --compute-type q8 \
   --n-gpu-layers 99 \
   --flash-attn on \
   --learning-rates 1e-2,1e-3,1e-4,1e-5 \

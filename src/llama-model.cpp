@@ -1404,22 +1404,13 @@ bool llama_prec_policy::apply(ggml_tensor * res) const {
         return false;
     }
 
-    apply_backward(res);
-
     const auto it = prec_src1.find(res->src[0]);
-    const ggml_prec requested = it != prec_src1.end() ? it->second : prec_src1_default;
+    const ggml_prec requested = it != prec_src1.end() ? it->second : compute_type;
     if (requested == GGML_PREC_UNDEFINED) {
         return false;
     }
 
     return ggml_prec_set_src(res, llama_prec_policy_resolve(requested, res->src[0]->type), 1);
-}
-
-void llama_prec_policy::apply_backward(ggml_tensor * res) const {
-    if (res && res->src[0] && prec_bwd != GGML_PREC_UNDEFINED) {
-        const ggml_prec precision = llama_prec_policy_resolve(prec_bwd, res->src[0]->type);
-        GGML_ASSERT(ggml_prec_set_bwd(res, precision));
-    }
 }
 
 void llama_prec_policy::load(llama_model_loader & ml, const llama_model & model) {

@@ -197,8 +197,7 @@ bool qlora_prepare_save_job(qlora_training_state & state,
                 prepared->optimizer_state_type = state.qparams->optimizer_state_type;
                 metadata["lora_type"] = state.qparams->lora_type;
                 metadata["optimizer_state_type"] = state.qparams->optimizer_state_type;
-                metadata["forward_precision"] = state.qparams->forward_precision_name;
-                metadata["backward_precision"] = state.qparams->backward_precision_name;
+                metadata["compute_type"] = state.qparams->compute_type;
                 const ggml_opt_optimizer_params optimizer_defaults = ggml_opt_get_default_optimizer_params(nullptr);
                 metadata["adamw_beta1"] = optimizer_defaults.adamw.beta1;
                 metadata["adamw_beta2"] = optimizer_defaults.adamw.beta2;

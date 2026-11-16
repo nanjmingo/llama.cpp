@@ -12,10 +12,8 @@ struct qlora_params {
     float       lora_alpha         = 0.0f;
     std::string lora_type          = "f32";
     std::string optimizer_state_type = "f32";
-    std::string forward_precision_name = "f32";
-    ggml_prec forward_precision = GGML_PREC_F32;
-    std::string backward_precision_name = "f32";
-    ggml_prec backward_precision = GGML_PREC_F32;
+    std::string compute_type = "f32";
+    ggml_prec compute_precision = GGML_PREC_F32;
     std::string lora_targets       = "attn_q,attn_k,attn_v,attn_output,ffn_gate,ffn_up,ffn_down";
     std::string output_dir;
     std::string resume_from;

@@ -1,4 +1,5 @@
 #include "options.h"
+#include "compute-type.h"
 
 #include <cmath>
 #include <limits>
@@ -121,30 +122,9 @@ Options parse_options(int argc, char ** argv) {
             } else {
                 throw std::runtime_error("--flash-attn must be on or off");
             }
-        } else if (arg == "--forward-precision" && i + 1 < argc) {
-            options.precision.forward_precision_name = argv[++i];
-            if (options.precision.forward_precision_name == "f32") {
-                options.precision.forward_precision = GGML_PREC_F32;
-            } else if (options.precision.forward_precision_name == "f16") {
-                options.precision.forward_precision = GGML_PREC_F16;
-            } else if (options.precision.forward_precision_name == "bf16") {
-                options.precision.forward_precision = GGML_PREC_BF16;
-            } else if (options.precision.forward_precision_name == "q8") {
-                options.precision.forward_precision = GGML_PREC_Q8;
-            } else {
-                throw std::runtime_error("invalid forward precision: " + options.precision.forward_precision_name);
-            }
-        } else if (arg == "--backward-precision" && i + 1 < argc) {
-            options.precision.backward_precision_name = argv[++i];
-            if (options.precision.backward_precision_name == "f32") {
-                options.precision.backward_precision = GGML_PREC_F32;
-            } else if (options.precision.backward_precision_name == "f16") {
-                options.precision.backward_precision = GGML_PREC_F16;
-            } else if (options.precision.backward_precision_name == "bf16") {
-                options.precision.backward_precision = GGML_PREC_BF16;
-            } else {
-                throw std::runtime_error("invalid backward precision: " + options.precision.backward_precision_name);
-            }
+        } else if (arg == "--compute-type" && i + 1 < argc) {
+            options.precision.compute_type = argv[++i];
+            options.precision.compute_precision = qlora_compute_type_from_name(options.precision.compute_type);
         } else if ((arg == "-ctk" || arg == "--cache-type-k") && i + 1 < argc) {
             options.precision.inference_cache_type_k = parse_cache_type(argv[++i]);
         } else if ((arg == "-ctv" || arg == "--cache-type-v") && i + 1 < argc) {
@@ -158,7 +138,7 @@ Options parse_options(int argc, char ** argv) {
         } else {
             throw std::runtime_error(std::string("usage: ") + argv[0] +
                 " --model MODEL.gguf [--lora-targets CSV] [--n-gpu-layers N] [--flash-attn on|off]"
-                " [--forward-precision f32|f16|bf16|q8] [--backward-precision f32|f16|bf16]"
+                " [--compute-type f32|f16|bf16|q8]"
                 " [-ctk|--cache-type-k TYPE] [-ctv|--cache-type-v TYPE]"
                 " [--learning-rates LIST] [--epoch N] [--verbose-logs]");
         }
@@ -166,7 +146,7 @@ Options parse_options(int argc, char ** argv) {
     if (options.model.model_path.empty()) {
         throw std::runtime_error(std::string("usage: ") + argv[0] +
             " --model MODEL.gguf [--lora-targets CSV] [--n-gpu-layers N] [--flash-attn on|off]"
-            " [--forward-precision f32|f16|bf16|q8] [--backward-precision f32|f16|bf16]"
+            " [--compute-type f32|f16|bf16|q8]"
             " [-ctk|--cache-type-k TYPE] [-ctv|--cache-type-v TYPE]"
             " [--learning-rates LIST] [--epoch N] [--verbose-logs]");
     }

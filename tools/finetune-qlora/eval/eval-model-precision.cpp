@@ -19,14 +19,14 @@ std::string format_elapsed_time(std::chrono::steady_clock::duration elapsed) {
     return output.str();
 }
 
-double evaluate_f32_loss(Model & model, EvaluationRun & run, ggml_prec training_precision) {
-    model.set_forward_precision(GGML_PREC_F32);
+double evaluate_f32_loss(Model & model, EvaluationRun & run, ggml_prec training_compute_type) {
+    model.set_compute_type(GGML_PREC_F32);
     try {
         const double loss = run.evaluate_inference_loss();
-        model.set_forward_precision(training_precision);
+        model.set_compute_type(training_compute_type);
         return loss;
     } catch (...) {
-        model.set_forward_precision(training_precision);
+        model.set_compute_type(training_compute_type);
         throw;
     }
 }
@@ -42,7 +42,7 @@ int main(int argc, char ** argv) {
         {
             EvaluationRun baseline_run(model, EvaluationMode::InferenceOnly);
             initial_loss = evaluate_f32_loss(
-                model, baseline_run, options.precision.forward_precision);
+                model, baseline_run, options.precision.compute_precision);
         }
         std::cout << "[initial_loss]=" << format_initial_loss(initial_loss) << '\n';
 
@@ -53,10 +53,10 @@ int main(int argc, char ** argv) {
 
             std::cout << "[lr=" << format_learning_rate(learning_rate) << "]";
             for (size_t epoch = 1; epoch <= static_cast<size_t>(options.epochs); ++epoch) {
-                model.set_forward_precision(options.precision.forward_precision);
+                model.set_compute_type(options.precision.compute_precision);
                 run.train_one_step(learning_rate);
                 const double current_loss = evaluate_f32_loss(
-                    model, run, options.precision.forward_precision);
+                    model, run, options.precision.compute_precision);
                 const double loss_delta = current_loss - previous_loss;
                 std::cout << " [" << epoch << "]=" << format_loss_delta(loss_delta);
                 previous_loss = current_loss;

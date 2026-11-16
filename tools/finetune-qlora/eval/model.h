@@ -19,10 +19,8 @@ struct ModelOptions {
 };
 
 struct ModelPrecisionConfig {
-    std::string forward_precision_name = "f32";
-    ggml_prec forward_precision = GGML_PREC_F32;
-    std::string backward_precision_name = "f32";
-    ggml_prec backward_precision = GGML_PREC_F32;
+    std::string compute_type = "f32";
+    ggml_prec compute_precision = GGML_PREC_F32;
     ggml_type inference_cache_type_k = GGML_TYPE_F32;
     ggml_type inference_cache_type_v = GGML_TYPE_F32;
 };
@@ -44,7 +42,7 @@ public:
     Model(const Model &) = delete;
     Model & operator=(const Model &) = delete;
 
-    void set_forward_precision(ggml_prec precision);
+    void set_compute_type(ggml_prec precision);
 
 private:
     std::unique_ptr<Impl> impl_;

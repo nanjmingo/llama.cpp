@@ -2721,7 +2721,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int64_t ne_get_rows = ne12 * n_expert_used;
     GGML_ASSERT(dst->ne[1] == n_expert_used && dst->ne[2] == ne12);
     const bool scale_src1_f16 = ne_get_rows > 0 && ggml_prec_get_src(dst, 1) == GGML_PREC_F16 &&
-        ggml_prec_get_bwd(dst) == GGML_PREC_UNDEFINED && fast_fp16_hardware_available(cc);
+        fast_fp16_hardware_available(cc);
 
     std::vector<int32_t> ids_to_sorted_host;
     std::vector<int32_t> ids_to_output_host;

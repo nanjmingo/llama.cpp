@@ -216,7 +216,7 @@ static void ggml_cuda_out_prod_lowp(
 
 void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
-    const ggml_prec precision = ggml_prec_get_bwd(dst);
+    const ggml_prec precision = ggml_prec_get_src(dst, 1);
 
     if (precision == GGML_PREC_F32) {
         ggml_cuda_out_prod_lowp<float>(ctx, dst, CUDA_R_32F);
@@ -276,7 +276,7 @@ static __global__ void out_prod_id_gather_kernel(
             dst[i] = __float2bfloat16(value);
         }
     } else {
-        // The activation cache already stores src0 as F16.
+        // Convert directly when the source is already stored in a low-precision type.
         dst[i] = (lowp_t) value;
     }
 }
@@ -436,7 +436,7 @@ void ggml_cuda_out_prod_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     const float alpha_one = 1.0f;
     const float beta_acc  = 1.0f;
-    const ggml_prec precision = ggml_prec_get_bwd(dst);
+    const ggml_prec precision = ggml_prec_get_src(dst, 1);
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     const bool use_fp16 = (src0->type == GGML_TYPE_F16 || precision == GGML_PREC_F16) &&
         fast_fp16_hardware_available(cc);

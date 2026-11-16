@@ -424,14 +424,14 @@ void ggml_cuda_mul_mat_id_back(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const float * grad_ptr = (const float *) grad->data;
     float * dst_ptr = (float *) dst->data;
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    const ggml_prec backward_precision = ggml_prec_get_bwd(dst);
-    const bool use_fp16 = backward_precision == GGML_PREC_F16
+    const ggml_prec compute_type = ggml_prec_get_src(dst, 1);
+    const bool use_fp16 = compute_type == GGML_PREC_F16
         ? fast_fp16_hardware_available(cc)
-        : backward_precision == GGML_PREC_UNDEFINED && as->type != GGML_TYPE_F32 && as->type != GGML_TYPE_BF16 &&
+        : compute_type == GGML_PREC_UNDEFINED && as->type != GGML_TYPE_F32 && as->type != GGML_TYPE_BF16 &&
             fast_fp16_hardware_available(cc);
-    const bool use_bf16 = backward_precision == GGML_PREC_BF16
+    const bool use_bf16 = compute_type == GGML_PREC_BF16
         ? fast_bf16_hardware_available(cc)
-        : backward_precision == GGML_PREC_UNDEFINED && as->type == GGML_TYPE_BF16 &&
+        : compute_type == GGML_PREC_UNDEFINED && as->type == GGML_TYPE_BF16 &&
             fast_bf16_hardware_available(cc);
     const bool use_fp32 = !use_fp16 && !use_bf16;
     const to_fp16_cuda_t to_fp16 = use_fp16 && as->type != GGML_TYPE_F16

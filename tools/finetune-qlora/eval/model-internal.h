@@ -62,7 +62,7 @@ struct AdapterContextDetacher {
 struct Model::Impl {
     ModelOptions options;
     ModelPrecisionConfig precision;
-    ggml_prec active_forward_precision = GGML_PREC_F32;
+    ggml_prec active_compute_type = GGML_PREC_F32;
     detail::QuietLibraryLogs quiet_logs;
     detail::BackendScope backend;
     std::unique_ptr<llama_model, decltype(&llama_model_free)> model{ nullptr, llama_model_free };
@@ -72,7 +72,7 @@ struct Model::Impl {
     int32_t context_length = 0;
 
     explicit Impl(ModelOptions opts, ModelPrecisionConfig precision_config);
-    void set_forward_precision(ggml_prec precision);
+    void set_compute_type(ggml_prec precision);
 };
 
 struct EvaluationRun::Impl {

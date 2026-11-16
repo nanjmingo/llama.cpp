@@ -1,4 +1,5 @@
 #include "args.h"
+#include "compute-type.h"
 #include <algorithm>
 #include <climits>
 #include <cmath>
@@ -118,37 +119,11 @@ const std::vector<qlora_arg> & get_qlora_arg_defs() {
             }
         ));
         add_opt(qlora_arg(
-            {"--forward-precision"}, "TYPE",
-            "Requested CUDA forward matrix-multiplication input precision: f32, f16, bf16, or q8",
+            {"--compute-type"}, "TYPE",
+            "Matrix-multiplication compute type: f32, f16, bf16, or q8 (q8 uses f16 for backward)",
             [](qlora_params & params, const std::string & value) {
-                params.forward_precision_name = value;
-                if (value == "f32") {
-                    params.forward_precision = GGML_PREC_F32;
-                } else if (value == "f16") {
-                    params.forward_precision = GGML_PREC_F16;
-                } else if (value == "bf16") {
-                    params.forward_precision = GGML_PREC_BF16;
-                } else if (value == "q8") {
-                    params.forward_precision = GGML_PREC_Q8;
-                } else {
-                    throw std::invalid_argument("invalid forward precision: " + value);
-                }
-            }
-        ));
-        add_opt(qlora_arg(
-            {"--backward-precision"}, "TYPE",
-            "Requested CUDA backward matrix-multiplication input precision: f32, f16, or bf16 (default: f32)",
-            [](qlora_params & params, const std::string & value) {
-                params.backward_precision_name = value;
-                if (value == "f32") {
-                    params.backward_precision = GGML_PREC_F32;
-                } else if (value == "f16") {
-                    params.backward_precision = GGML_PREC_F16;
-                } else if (value == "bf16") {
-                    params.backward_precision = GGML_PREC_BF16;
-                } else {
-                    throw std::invalid_argument("invalid backward precision: " + value);
-                }
+                params.compute_type = value;
+                params.compute_precision = qlora_compute_type_from_name(value);
             }
         ));
         add_opt(qlora_arg(

@@ -229,8 +229,7 @@ int main(int argc, char ** argv) {
     }
 
     model->prec_policy.prec_src1.clear();
-    model->prec_policy.prec_src1_default = qparams.forward_precision;
-    model->prec_policy.prec_bwd = qparams.backward_precision;
+    model->prec_policy.compute_type = qparams.compute_precision;
     LOG_INF("%s\n", common_params_get_system_info(params).c_str());
     if (arch.empty()) {
         char description[256] = {};

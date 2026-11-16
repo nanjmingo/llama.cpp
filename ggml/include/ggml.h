@@ -497,7 +497,6 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
-        GGML_TENSOR_FLAG_F16_BACKWARD_CACHE = 32,
     };
 
     enum ggml_tri_type {
@@ -1286,6 +1285,7 @@ extern "C" {
     //     - cannot quantize it down to GGML_TYPE_Q4_0 or GGML_TYPE_NVFP4
     //   - ggml_prec_set_src(a, GGML_PREC_Q4, 1):
     //     - allows the implementation to quantize F32, BF16, F16 data of src[1] down to 4-bit datatypes such as GGML_TYPE_Q4_K, GGML_TYPE_NVFP4 etc.
+    // For MUL_MAT/MUL_MAT_ID ops, this compute type is also propagated to their backward ops; Q8/Q4 use F16 there.
     //
     // return false on faliure
     GGML_API bool ggml_prec_set_src(
@@ -1302,13 +1302,6 @@ extern "C" {
     GGML_API enum ggml_prec ggml_prec_get_src(
             const struct ggml_tensor * a,
             int                        idx);
-
-    GGML_API bool ggml_prec_set_bwd(
-            struct ggml_tensor * a,
-            enum ggml_prec       prec);
-
-    GGML_API enum ggml_prec ggml_prec_get_bwd(
-            const struct ggml_tensor * a);
 
     // A: k columns, n rows => [ne03, ne02, n, k]
     // B: k columns, m rows  (i.e. we transpose it internally) => [ne03 * x, ne02 * y, m, k]

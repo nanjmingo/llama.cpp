@@ -105,8 +105,7 @@ Train a LoRA adapter with context size 512:
 | `--warmup-init-ratio` | `0.1` | Starting LR ratio during warmup (`start_lr = peak_lr * ratio`). |
 | `-lr-min`, `--learning-rate-min` | `-1` (0) | Floor LR for cosine schedule or constant decay. |
 | `-decay-epochs` | `-1` | Epochs to decay constant LR toward `--learning-rate-min`. |
-| `--forward-precision` | `f32` | Requested input precision for forward GEMM: `f32`, `f16`, `bf16`, `q8`. |
-| `--backward-precision` | `f32` | Requested input precision for backward GEMM: `f32`, `f16`, `bf16`. |
+| `--compute-type` | `f32` | GEMM compute type: `f32`, `f16`, `bf16`, or `q8`. `q8` requests Q8 for forward GEMM and F16 for backward GEMM. |
 | `--val-windows` | all remaining | Max windows evaluated after training range (`0` disables validation). |
 | `--grad-stats-interval` | `0` | Log gradient norm/stats every N updates (`0` disables logging). |
 | `--gradient-checkpointing` | `off` | Recompute intermediate layer activations during backward to reduce activation memory (`on` or `off`). |
@@ -115,9 +114,9 @@ When enabled, gradient checkpointing retains every `l_out` layer boundary and re
 
 #### Precision Selection
 
-On CUDA, `f32`, `f16`, and `bf16` requests are independent of the weight tensor storage type. The existing cuBLAS and backward matrix-multiplication paths convert supported inputs and weights to the requested compute type. If the GPU does not support the requested low-precision type efficiently, CUDA falls back to F32.
+`--compute-type f32`, `f16`, and `bf16` set one matrix-multiplication compute precision. GGML stores this precision on the forward matmul op and propagates it to the corresponding backward matmul/out-product ops during automatic differentiation. The CUDA kernels convert supported inputs to that compute type; if the GPU does not support the requested low-precision type efficiently, they fall back to F32.
 
-`q8` requests Q8 activations for quantized-weight kernels. For floating-point weights, where Q8 activations are not applicable, the request resolves to F16. On CUDA, if F16 computation is not supported by the device, the cuBLAS path falls back to F32. Quantized-weight operations that cannot use a Q8 kernel also use the existing CUDA cuBLAS fallback, which selects F16 when supported and F32 otherwise.
+`--compute-type q8` requests Q8 activations for forward quantized-weight kernels. The same Q8 compute-type value is propagated through the backward graph, where the CUDA backward kernels use F16 because Q8 backward kernels are not supported. For floating-point weights, where Q8 activations are not applicable, the forward request resolves to F16. If the GPU does not support F16 computation, CUDA falls back to F32.
 
 CPU support for applying F16/BF16 precision to F32 weights is not included in this change.
 

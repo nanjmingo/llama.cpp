@@ -63,8 +63,6 @@ struct ggml_opt_context {
     struct ggml_cgraph * gf      = nullptr;
     struct ggml_cgraph * gb_grad = nullptr;
     struct ggml_cgraph * gb_opt  = nullptr;
-    int n_forward_nodes = 0;
-    std::vector<int> forward_node_indices;
     bool static_graphs           = false;
     bool eval_ready              = false;
     std::vector<struct ggml_tensor *> grad_accs;
@@ -109,19 +107,6 @@ struct ggml_opt_result {
 namespace {
     bool ggml_opt_apply_pending_state(ggml_opt_context_t opt_ctx);
 
-    struct ggml_opt_f16_cache_user {
-        ggml_tensor * owner;
-        int src_index;
-        ggml_tensor * backend_node;
-        bool replace_repeat;
-    };
-
-    struct ggml_opt_f16_cache_candidate {
-        ggml_tensor * activation;
-        int last_forward_use;
-        std::vector<ggml_opt_f16_cache_user> backward_users;
-    };
-
     struct ggml_opt_recompute_state {
         std::unordered_set<ggml_tensor *> forward;
         std::unordered_set<ggml_tensor *> keep;
@@ -161,12 +146,12 @@ namespace {
 
     static void ggml_opt_recompute_checkpoints(ggml_opt_context_t opt_ctx) {
         if (!opt_ctx->gradient_checkpointing || opt_ctx->static_graphs ||
-                opt_ctx->build_type == GGML_OPT_BUILD_TYPE_FORWARD || opt_ctx->n_forward_nodes == 0) {
+                opt_ctx->build_type == GGML_OPT_BUILD_TYPE_FORWARD || opt_ctx->gf->n_nodes == 0) {
             return;
         }
 
         ggml_cgraph * graph = opt_ctx->gb_grad;
-        const int n_forward = opt_ctx->n_forward_nodes;
+        const int n_forward = opt_ctx->gf->n_nodes;
         GGML_ASSERT(graph && n_forward <= graph->n_nodes);
 
         ggml_opt_recompute_state state;
@@ -201,22 +186,10 @@ namespace {
             }
         }
 
-        std::vector<ggml_tensor *> forward_nodes(opt_ctx->gf->n_nodes, nullptr);
         for (int i = 0; i < n_forward; ++i) {
-            const int original_index = opt_ctx->forward_node_indices[i];
-            if (original_index < 0) {
-                state.keep.insert(graph->nodes[i]);
-                continue;
-            }
-            GGML_ASSERT(original_index < opt_ctx->gf->n_nodes);
-            forward_nodes[original_index] = graph->nodes[i];
-        }
-
-        for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
             ggml_tensor * node = opt_ctx->gf->nodes[i];
             if (std::strncmp(node->name, "l_out-", 6) == 0) {
-                GGML_ASSERT(forward_nodes[i] != nullptr);
-                state.keep.insert(forward_nodes[i]);
+                state.keep.insert(graph->nodes[i]);
             }
         }
 
@@ -261,256 +234,6 @@ namespace {
 
         ggml_graph_clear(graph);
         ggml_graph_cpy(reordered, graph);
-    }
-
-    static bool ggml_opt_is_view_of(const ggml_tensor * tensor, const ggml_tensor * base) {
-        for (const ggml_tensor * view = tensor ? tensor->view_src : nullptr; view; view = view->view_src) {
-            if (view == base) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    static bool ggml_opt_backend_supports_f16_out_prod(
-            ggml_backend_t backend,
-            const ggml_tensor * out_prod) {
-        const char * backend_name = ggml_backend_name(backend);
-        if (!backend_name || std::strncmp(backend_name, "CUDA", 4) != 0) {
-            return false;
-        }
-
-        ggml_tensor src0 = *out_prod->src[0];
-        src0.type = GGML_TYPE_F16;
-        src0.data = nullptr;
-        src0.buffer = nullptr;
-        src0.extra = nullptr;
-        src0.view_src = nullptr;
-        src0.view_offs = 0;
-        src0.nb[0] = ggml_type_size(GGML_TYPE_F16);
-        src0.nb[1] = ggml_row_size(GGML_TYPE_F16, src0.ne[0]);
-        src0.nb[2] = src0.nb[1] * src0.ne[1];
-        src0.nb[3] = src0.nb[2] * src0.ne[2];
-
-        ggml_tensor probe = *out_prod;
-        probe.src[0] = &src0;
-        return ggml_backend_supports_op(backend, &probe);
-    }
-
-    static void ggml_opt_cache_f16_backward_activations(ggml_opt_context_t opt_ctx) {
-        const int n_nodes_f = opt_ctx->gf->n_nodes;
-        opt_ctx->n_forward_nodes = n_nodes_f;
-        opt_ctx->forward_node_indices.resize(n_nodes_f);
-        for (int i = 0; i < n_nodes_f; ++i) {
-            opt_ctx->forward_node_indices[i] = i;
-        }
-
-        if (opt_ctx->gradient_checkpointing) {
-            return;
-        }
-
-        std::unordered_set<ggml_tensor *> seen;
-        std::vector<ggml_opt_f16_cache_candidate> candidates;
-
-        for (int i = 0; i < n_nodes_f; ++i) {
-            ggml_tensor * activation = opt_ctx->gf->nodes[i];
-            if ((activation->flags & GGML_TENSOR_FLAG_F16_BACKWARD_CACHE) == 0) {
-                continue;
-            }
-            if (!seen.insert(activation).second || activation->op == GGML_OP_NONE ||
-                    activation->type != GGML_TYPE_F32 ||
-                    (activation->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT |
-                                          GGML_TENSOR_FLAG_PARAM | GGML_TENSOR_FLAG_LOSS))) {
-                continue;
-            }
-
-            int last_forward_use = -1;
-            bool has_view_alias = false;
-            for (int j = 0; j < n_nodes_f; ++j) {
-                ggml_tensor * forward_node = opt_ctx->gf->nodes[j];
-                if (ggml_opt_is_view_of(forward_node, activation)) {
-                    has_view_alias = true;
-                    break;
-                }
-                for (int k = 0; k < GGML_MAX_SRC; ++k) {
-                    if (forward_node->src[k] == activation) {
-                        last_forward_use = std::max(last_forward_use, j);
-                    } else if (ggml_opt_is_view_of(forward_node->src[k], activation)) {
-                        has_view_alias = true;
-                        break;
-                    }
-                }
-                if (has_view_alias) {
-                    break;
-                }
-            }
-            if (has_view_alias || last_forward_use < 0) {
-                continue;
-            }
-
-            ggml_opt_f16_cache_candidate candidate = {
-                 activation,
-                 last_forward_use,
-                 {},
-            };
-            bool safe = true;
-            for (int j = n_nodes_f; j < opt_ctx->gb_grad->n_nodes && safe; ++j) {
-                ggml_tensor * backward_node = opt_ctx->gb_grad->nodes[j];
-                if (ggml_opt_is_view_of(backward_node, activation)) {
-                    safe = false;
-                    break;
-                }
-                for (int k = 0; k < GGML_MAX_SRC; ++k) {
-                    ggml_tensor * backward_src = backward_node->src[k];
-                    if (backward_src != activation) {
-                        if (ggml_opt_is_view_of(backward_src, activation)) {
-                            safe = false;
-                            break;
-                        }
-                        continue;
-                    }
-
-                    if ((backward_node->op == GGML_OP_OUT_PROD ||
-                            backward_node->op == GGML_OP_OUT_PROD_ID) && k == 0 &&
-                            backward_node->src[1] && backward_node->src[1]->type == GGML_TYPE_F32 &&
-                            ggml_prec_get_bwd(backward_node) == GGML_PREC_F16) {
-                        candidate.backward_users.push_back({ backward_node, k, backward_node, false });
-                    } else if (backward_node->op == GGML_OP_REPEAT && k == 0) {
-                        // The expanded activation created by MUL_MAT_ID backward is consumed
-                        // by OUT_PROD_ID. Change this repeat to F16 together with its source.
-                        ggml_tensor * consumer = nullptr;
-                        bool has_other_use = false;
-                        for (int u = n_nodes_f; u < opt_ctx->gb_grad->n_nodes; ++u) {
-                            ggml_tensor * user = opt_ctx->gb_grad->nodes[u];
-                            for (int src = 0; src < GGML_MAX_SRC; ++src) {
-                                if (user->src[src] != backward_node) {
-                                    continue;
-                                }
-                                if (user->op == GGML_OP_OUT_PROD_ID && src == 0 &&
-                                        user->src[1] && user->src[1]->type == GGML_TYPE_F32 &&
-                                        ggml_prec_get_bwd(user) == GGML_PREC_F16 && !consumer) {
-                                    consumer = user;
-                                } else {
-                                    has_other_use = true;
-                                }
-                            }
-                        }
-                        if (!consumer || has_other_use) {
-                            safe = false;
-                            break;
-                        }
-                        candidate.backward_users.push_back({ backward_node, k, consumer, true });
-                    } else if (backward_node->op == GGML_OP_MUL_MAT_ID_BACK && k == 3) {
-                        // src[3] (b_like) is shape-only metadata in MUL_MAT_ID_BACK.
-                        candidate.backward_users.push_back({ backward_node, k, nullptr, false });
-                    } else {
-                        safe = false;
-                        break;
-                    }
-                }
-            }
-            if (!safe || candidate.backward_users.empty()) {
-                continue;
-            }
-
-            candidates.push_back(std::move(candidate));
-        }
-
-        if (candidates.empty() || !opt_ctx->backend_sched) {
-            return;
-        }
-
-        // Splitting a graph is not a read-only operation: the scheduler rewires
-        // node sources to backend-local copies, and backend graph optimizers may
-        // reorder the node array. Preserve the original graph while querying the
-        // backend assignment of the OUT_PROD nodes below.
-        const int n_nodes = opt_ctx->gb_grad->n_nodes;
-        const uint64_t graph_uid = opt_ctx->gb_grad->uid;
-        std::vector<ggml_tensor *> original_nodes(
-            opt_ctx->gb_grad->nodes, opt_ctx->gb_grad->nodes + n_nodes);
-        std::vector<ggml_tensor *> original_sources;
-        original_sources.reserve(static_cast<size_t>(n_nodes) * GGML_MAX_SRC);
-        for (ggml_tensor * node : original_nodes) {
-            for (int k = 0; k < GGML_MAX_SRC; ++k) {
-                original_sources.push_back(node->src[k]);
-            }
-        }
-
-        ggml_backend_sched_reset(opt_ctx->backend_sched);
-        ggml_backend_sched_split_graph(opt_ctx->backend_sched, opt_ctx->gb_grad);
-
-        // Restore the graph before the scheduler's temporary context is freed
-        // by the next split. Keep the backend assignments in the scheduler; they
-        // are keyed by the original tensor pointers and remain valid.
-        for (int i = 0; i < n_nodes; ++i) {
-            for (int k = 0; k < GGML_MAX_SRC; ++k) {
-                original_nodes[i]->src[k] = original_sources[static_cast<size_t>(i) * GGML_MAX_SRC + k];
-            }
-        }
-        std::copy(original_nodes.begin(), original_nodes.end(), opt_ctx->gb_grad->nodes);
-        opt_ctx->gb_grad->uid = graph_uid;
-
-        candidates.erase(std::remove_if(candidates.begin(), candidates.end(), [&](const auto & candidate) {
-            for (const ggml_opt_f16_cache_user & backward_user : candidate.backward_users) {
-                if (!backward_user.backend_node) {
-                    continue;
-                }
-                ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(opt_ctx->backend_sched, backward_user.backend_node);
-                if (!backend || !ggml_opt_backend_supports_f16_out_prod(backend, backward_user.backend_node)) {
-                    return true;
-                }
-            }
-            return false;
-        }), candidates.end());
-        ggml_backend_sched_reset(opt_ctx->backend_sched);
-
-        std::sort(candidates.begin(), candidates.end(), [](const auto & lhs, const auto & rhs) {
-            return lhs.last_forward_use > rhs.last_forward_use;
-        });
-
-        for (const ggml_opt_f16_cache_candidate & candidate : candidates) {
-            if (opt_ctx->gb_grad->n_nodes >= ggml_graph_size(opt_ctx->gb_grad)) {
-                break;
-            }
-
-            ggml_tensor * cache = ggml_cast(opt_ctx->ctx_compute, candidate.activation, GGML_TYPE_F16);
-            ggml_format_name(cache, "F16 backward cache for %s", candidate.activation->name);
-            ggml_build_forward_expand(opt_ctx->gb_grad, cache);
-
-            const int insert_at = candidate.last_forward_use + 1;
-            GGML_ASSERT(insert_at >= 0 && insert_at <= opt_ctx->gb_grad->n_nodes - 1);
-            ggml_tensor ** nodes = ggml_graph_nodes(opt_ctx->gb_grad);
-            const int n_nodes = ggml_graph_n_nodes(opt_ctx->gb_grad);
-            std::memmove(nodes + insert_at + 1, nodes + insert_at,
-                         static_cast<size_t>(n_nodes - insert_at - 1) * sizeof(*nodes));
-            nodes[insert_at] = cache;
-
-            const size_t old_hash = ggml_hash_find(&opt_ctx->gb_grad->visited_hash_set, candidate.activation);
-            const size_t new_hash = ggml_hash_find(&opt_ctx->gb_grad->visited_hash_set, cache);
-            GGML_ASSERT(old_hash != GGML_HASHSET_FULL && ggml_bitset_get(opt_ctx->gb_grad->visited_hash_set.used, old_hash));
-            GGML_ASSERT(new_hash != GGML_HASHSET_FULL && ggml_bitset_get(opt_ctx->gb_grad->visited_hash_set.used, new_hash));
-
-            for (const ggml_opt_f16_cache_user & backward_user : candidate.backward_users) {
-                GGML_ASSERT(backward_user.owner->src[backward_user.src_index] == candidate.activation);
-                GGML_ASSERT(opt_ctx->gb_grad->use_counts[old_hash] > 0);
-                --opt_ctx->gb_grad->use_counts[old_hash];
-                ++opt_ctx->gb_grad->use_counts[new_hash];
-                backward_user.owner->src[backward_user.src_index] = cache;
-
-                if (backward_user.replace_repeat) {
-                    ggml_tensor * repeat = backward_user.owner;
-                    GGML_ASSERT(repeat->op == GGML_OP_REPEAT && repeat->src[0] == cache);
-                    repeat->type = GGML_TYPE_F16;
-                    repeat->nb[0] = ggml_type_size(GGML_TYPE_F16);
-                    repeat->nb[1] = ggml_row_size(GGML_TYPE_F16, repeat->ne[0]);
-                    repeat->nb[2] = repeat->nb[1] * repeat->ne[1];
-                    repeat->nb[3] = repeat->nb[2] * repeat->ne[2];
-                }
-            }
-
-            opt_ctx->forward_node_indices.insert(opt_ctx->forward_node_indices.begin() + insert_at, -1);
-            ++opt_ctx->n_forward_nodes;
-        }
     }
 
     void ggml_opt_collect_grad_stats(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
@@ -1134,7 +857,6 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     // gb_grad == graph backward gradients, forward pass, then backward pass to calculate gradients.
     opt_ctx->gb_grad = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gf, /*force_grads =*/ true);
     ggml_build_backward_expand(opt_ctx->ctx_compute, opt_ctx->gb_grad, opt_ctx->grad_accs.data());
-    ggml_opt_cache_f16_backward_activations(opt_ctx);
     ggml_opt_recompute_checkpoints(opt_ctx);
 
     if (opt_ctx->buf_static) {
@@ -1156,11 +878,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     ggml_set_input(adamw_params);
     const char * optimizer_name = ggml_opt_optimizer_name(opt_ctx->optimizer);
     ggml_format_name(adamw_params, "%s_params", optimizer_name);
-    for (int i = opt_ctx->n_forward_nodes - 1; i >= 0; --i) {
-        const int original_index = opt_ctx->forward_node_indices[i];
-        if (original_index < 0) {
-            continue;
-        }
+    for (int i = opt_ctx->gf->n_nodes - 1; i >= 0; --i) {
         struct ggml_tensor * node = opt_ctx->gb_opt->nodes[i];
         struct ggml_tensor * grad = ggml_graph_get_grad(opt_ctx->gb_opt, node);
 
@@ -1174,8 +892,8 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             struct ggml_tensor * m = nullptr;
             struct ggml_tensor * v = nullptr;
             if (need_momenta) {
-                m = opt_ctx->grad_m[original_index];
-                v = opt_ctx->grad_v[original_index];
+                m = opt_ctx->grad_m[i];
+                v = opt_ctx->grad_v[i];
                 ggml_format_name(m, "AdamW m for %s", node->name);
                 ggml_format_name(v, "AdamW v for %s", node->name);
             }
