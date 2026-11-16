@@ -74,7 +74,6 @@ struct ggml_opt_context {
     int64_t iter               = 1;
     int32_t opt_period         = 1;
     int32_t opt_i              = 0;
-    int32_t grad_stats_interval = 0;
     float   loss_normalizer    = 0.0f;
     bool    loss_per_datapoint = false;
 
@@ -100,8 +99,6 @@ struct ggml_opt_result {
     bool                  loss_per_datapoint = false;
     double                loss_sum = 0.0;
     double                loss_squared_sum = 0.0;
-    bool                  has_grad_stats = false;
-    ggml_opt_grad_stats   grad_stats = {};
 };
 
 namespace {
@@ -236,78 +233,6 @@ namespace {
         ggml_graph_cpy(reordered, graph);
     }
 
-    void ggml_opt_collect_grad_stats(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
-        std::vector<const ggml_tensor *> tensors;
-        std::vector<size_t> offsets;
-        std::vector<size_t> sizes;
-        std::vector<size_t> data_offsets;
-        size_t total_bytes = 0;
-        int64_t total_elements = 0;
-
-        for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
-            const ggml_tensor * node = opt_ctx->gf->nodes[i];
-            if ((node->flags & GGML_TENSOR_FLAG_PARAM) == 0) {
-                continue;
-            }
-
-            ggml_tensor * grad = ggml_graph_get_grad_acc(opt_ctx->gb_opt, node);
-            if (!grad) {
-                continue;
-            }
-            GGML_ASSERT(grad->type == GGML_TYPE_F32);
-            const size_t size = ggml_nbytes(grad);
-            GGML_ASSERT(size == static_cast<size_t>(ggml_nelements(grad)) * sizeof(float));
-            GGML_ASSERT(size <= SIZE_MAX - total_bytes);
-
-            tensors.push_back(grad);
-            offsets.push_back(0);
-            sizes.push_back(size);
-            data_offsets.push_back(total_bytes);
-            total_bytes += size;
-            total_elements += ggml_nelements(grad);
-        }
-
-        ggml_opt_grad_stats stats = {};
-        stats.n_tensors = static_cast<int64_t>(tensors.size());
-        stats.n_elements = total_elements;
-        const float grad_scale = opt_ctx->loss_normalizer > 0.0f
-            ? static_cast<float>(ggml_nrows(opt_ctx->outputs) * opt_ctx->opt_period) / opt_ctx->loss_normalizer
-            : 1.0f;
-        stats.scale = grad_scale;
-
-        if (total_bytes > 0) {
-            std::vector<float> values(total_bytes / sizeof(float));
-            ggml_backend_tensor_get_n(
-                tensors.data(), values.data(), offsets.data(), sizes.data(), data_offsets.data(), tensors.size());
-
-            double sum_squares = 0.0;
-            double max_abs = 0.0;
-            for (const float value : values) {
-                const double scaled_value = static_cast<double>(value) * grad_scale;
-                if (!std::isfinite(scaled_value)) {
-                    ++stats.n_nonfinite;
-                    continue;
-                }
-                if (scaled_value == 0.0) {
-                    ++stats.n_zeros;
-                }
-                const double abs_value = std::fabs(scaled_value);
-                max_abs = std::max(max_abs, abs_value);
-                sum_squares += scaled_value * scaled_value;
-            }
-            stats.max_abs = max_abs;
-            stats.norm = stats.n_nonfinite == 0 ? std::sqrt(sum_squares) : NAN;
-            stats.rms = stats.n_nonfinite == 0 && stats.n_elements > 0
-                ? std::sqrt(sum_squares / static_cast<double>(stats.n_elements)) : NAN;
-        } else {
-            stats.norm = 0.0;
-            stats.rms = 0.0;
-            stats.max_abs = 0.0;
-        }
-
-        result->grad_stats = stats;
-        result->has_grad_stats = true;
-    }
 }
 
 // ====== Dataset ======
@@ -1371,14 +1296,6 @@ void ggml_opt_set_opt_period(ggml_opt_context_t opt_ctx, int32_t opt_period) {
     opt_ctx->opt_period = opt_period;
 }
 
-void ggml_opt_set_grad_stats_interval(ggml_opt_context_t opt_ctx, int32_t interval) {
-    GGML_ASSERT(opt_ctx != nullptr);
-    GGML_ASSERT(interval >= 0);
-    GGML_ASSERT(!opt_ctx->eval_ready);
-    GGML_ASSERT(opt_ctx->opt_i == 0);
-    opt_ctx->grad_stats_interval = interval;
-}
-
 void ggml_opt_set_gradient_checkpointing(ggml_opt_context_t opt_ctx, bool enabled) {
     GGML_ASSERT(opt_ctx != nullptr);
     GGML_ASSERT(!opt_ctx->static_graphs && "gradient checkpointing requires dynamic graphs");
@@ -1498,8 +1415,6 @@ void ggml_opt_result_reset(ggml_opt_result_t result) {
     result->naccuracy_data = 0;
     result->loss_sum = 0.0;
     result->loss_squared_sum = 0.0;
-    result->has_grad_stats = false;
-    result->grad_stats = {};
 }
 
 void ggml_opt_result_ndata(ggml_opt_result_t result, int64_t * ndata) {
@@ -1544,14 +1459,6 @@ void ggml_opt_result_last_loss(ggml_opt_result_t result, double * loss) {
     const size_t last = result->loss.size() - 1;
     *loss = result->loss_per_datapoint ?
         double(result->loss[last]) * result->opt_periods[last] : result->loss[last];
-}
-
-bool ggml_opt_result_grad_stats(ggml_opt_result_t result, struct ggml_opt_grad_stats * stats) {
-    if (!result || !stats || !result->has_grad_stats) {
-        return false;
-    }
-    *stats = result->grad_stats;
-    return true;
 }
 
 void ggml_opt_result_pred(ggml_opt_result_t result, int32_t * pred) {
@@ -1691,10 +1598,6 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     }
 
     ggml_backend_sched_graph_compute(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
-    if (result && opt_ctx->allocated_graph == opt_ctx->gb_opt && opt_ctx->grad_stats_interval > 0 &&
-        opt_ctx->iter % opt_ctx->grad_stats_interval == 0) {
-        ggml_opt_collect_grad_stats(opt_ctx, result);
-    }
     opt_ctx->iter += opt_ctx->allocated_graph == opt_ctx->gb_opt;
     opt_ctx->opt_i = (opt_ctx->opt_i + 1) % opt_ctx->opt_period;
     if (opt_ctx->allocated_graph == opt_ctx->gb_opt) {

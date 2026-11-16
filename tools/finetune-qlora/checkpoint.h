@@ -44,7 +44,7 @@ bool validate_resume_config(const qlora_checkpoint & checkpoint,
                             int32_t n_ctx,
                             int64_t dataset_windows);
 
-bool initialize_training_logs(const std::filesystem::path & output_root, bool write_grad_stats_log);
+bool initialize_training_logs(const std::filesystem::path & output_root);
 bool install_file_alias(const std::filesystem::path & source, const std::filesystem::path & destination);
 std::filesystem::path qlora_checkpoint_path(const std::filesystem::path & output_root, int64_t step);
 std::filesystem::path qlora_snapshot_path(const std::filesystem::path & output_root, int64_t step);

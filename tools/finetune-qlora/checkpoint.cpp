@@ -707,34 +707,8 @@ std::string qlora_serialize_loss_log(const std::vector<qlora_loss_log_entry> & h
     return stream.str();
 }
 
-std::string qlora_serialize_grad_stats_log(const std::vector<qlora_grad_stats_log_entry> & history) {
-    std::ostringstream stream;
-    stream << "step\ttensors\telements\tscale\tnorm\trms\tmax_abs\tzero_percent\tnonfinite\n";
-    stream << std::setprecision(std::numeric_limits<double>::max_digits10);
-    for (const qlora_grad_stats_log_entry & entry : history) {
-        const ggml_opt_grad_stats & stats = entry.stats;
-        const double zero_percent = stats.n_elements > 0
-            ? 100.0 * static_cast<double>(stats.n_zeros) / static_cast<double>(stats.n_elements) : 0.0;
-        stream << entry.step << '\t' << stats.n_tensors << '\t' << stats.n_elements << '\t'
-               << stats.scale << '\t' << stats.norm << '\t' << stats.rms << '\t'
-               << stats.max_abs << '\t' << zero_percent << '\t' << stats.n_nonfinite << '\n';
-    }
-    return stream.str();
-}
-
-bool initialize_training_logs(const std::filesystem::path & output_root, bool write_grad_stats_log) {
-    if (!write_text_file(output_root / "loss.log", qlora_serialize_loss_log({}))) {
-        return false;
-    }
-
-    const std::filesystem::path grad_stats_path = output_root / "grad-stats.log";
-    if (write_grad_stats_log) {
-        return write_text_file(grad_stats_path, qlora_serialize_grad_stats_log({}));
-    }
-
-    std::error_code ec;
-    std::filesystem::remove(grad_stats_path, ec);
-    return !ec;
+bool initialize_training_logs(const std::filesystem::path & output_root) {
+    return write_text_file(output_root / "loss.log", qlora_serialize_loss_log({}));
 }
 
 static bool write_checkpoint_from_snapshot(const qlora_save_job & job, std::string & error) {
@@ -767,9 +741,7 @@ static bool write_checkpoint_from_snapshot(const qlora_save_job & job, std::stri
     const bool optimizer_ok = adapter_ok && write_optimizer_file(
         temp_dir / "optimizer.gguf", job.optimizer_state, job.optimizer_name.c_str(), job.optimizer_state_type);
     const bool loss_log_ok = optimizer_ok && write_text_file(temp_dir / "loss.log", job.loss_log);
-    const bool grad_stats_log_ok = loss_log_ok && (!job.write_grad_stats_log ||
-        write_text_file(temp_dir / "grad-stats.log", job.grad_stats_log));
-    const bool state_ok = grad_stats_log_ok && write_text_file(temp_dir / "training-state.json", job.training_state_json);
+    const bool state_ok = loss_log_ok && write_text_file(temp_dir / "training-state.json", job.training_state_json);
     const bool manifest_ok = state_ok && write_text_file(temp_dir / "manifest.json", job.manifest_json);
     bool ok = manifest_ok;
 
@@ -853,12 +825,6 @@ bool write_qlora_save_job(const std::shared_ptr<qlora_save_job> & job, std::stri
         all_ok = false;
         if (!error.empty()) error += "; ";
         error += "failed to update loss log";
-    }
-    if ((job->snapshot_saved || job->checkpoint_saved) && job->write_grad_stats_log &&
-        !write_text_file(job->output_root / "grad-stats.log", job->grad_stats_log)) {
-        all_ok = false;
-        if (!error.empty()) error += "; ";
-        error += "failed to update gradient statistics log";
     }
     return all_ok;
 }

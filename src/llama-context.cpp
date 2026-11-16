@@ -4393,11 +4393,6 @@ void llama_context::opt_set_opt_period(int32_t opt_period) {
     opt_accumulation_period = opt_period;
 }
 
-void llama_context::opt_set_grad_stats_interval(int32_t interval) {
-    GGML_ASSERT(opt_ctx);
-    ggml_opt_set_grad_stats_interval(opt_ctx, interval);
-}
-
 void llama_context::opt_set_gradient_checkpointing(bool enabled) {
     GGML_ASSERT(opt_ctx);
     ggml_opt_set_gradient_checkpointing(opt_ctx, enabled);
@@ -5476,10 +5471,6 @@ void llama_opt_set_seed(struct llama_context * ctx, uint32_t seed) {
 
 void llama_opt_set_opt_period(struct llama_context * ctx, int32_t opt_period) {
     ctx->opt_set_opt_period(opt_period);
-}
-
-void llama_opt_set_grad_stats_interval(struct llama_context * ctx, int32_t interval) {
-    ctx->opt_set_grad_stats_interval(interval);
 }
 
 void llama_opt_set_gradient_checkpointing(struct llama_context * ctx, bool enabled) {

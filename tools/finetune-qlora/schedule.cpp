@@ -3,15 +3,19 @@
 #include <algorithm>
 #include <cmath>
 
-float qlora_lr_schedule::get_lr() const {
+float qlora_lr_schedule::get_lr(int64_t step) const {
     const float base_lr = lr->lr0;
 
-    if (step < warmup_steps) {
-        const float warmup_start_lr = base_lr * warmup_init_ratio;
-        const float warmup_progress = static_cast<float>(step) / static_cast<float>(warmup_steps);
-        return warmup_start_lr + (base_lr - warmup_start_lr) * warmup_progress;
+    if (warmup_steps > 0 && step == 0) {
+        return 0.0f;
+    }
+    if (warmup_steps > 0 && step <= warmup_steps) {
+        return base_lr * static_cast<float>(step) / static_cast<float>(warmup_steps);
     }
 
+    // `step` is the upcoming one-based optimizer update. Keep the decay schedule
+    // indexed by completed updates, as it was before the warmup change.
+    const int64_t completed_steps = std::max<int64_t>(0, step - 1);
     if (type != "cosine" || total_steps <= warmup_steps) {
         const float epoch = static_cast<float>(lr->epoch);
         return lr->lr_min <= 0.0f ? lr->lr0 :
@@ -21,7 +25,7 @@ float qlora_lr_schedule::get_lr() const {
 
     const float min_lr = std::max(0.0f, lr->lr_min);
     const double decay_progress =
-        static_cast<double>(step - warmup_steps) / static_cast<double>(total_steps - warmup_steps);
+        static_cast<double>(completed_steps - warmup_steps) / static_cast<double>(total_steps - warmup_steps);
     const double cosine_weight =
         0.5 * (1.0 + std::cos(std::acos(-1.0) * std::min(1.0, decay_progress)));
     return min_lr + (base_lr - min_lr) * static_cast<float>(cosine_weight);
@@ -30,7 +34,7 @@ float qlora_lr_schedule::get_lr() const {
 ggml_opt_optimizer_params qlora_opt_lr_pars(void * userdata) {
     qlora_lr_schedule & schedule = *static_cast<qlora_lr_schedule *>(userdata);
     ggml_opt_optimizer_params result = ggml_opt_get_default_optimizer_params(nullptr);
-    schedule.current_lr = schedule.get_lr();
+    schedule.current_lr = schedule.get_lr(schedule.step + 1);
     result.adamw.alpha = result.sgd.alpha = schedule.current_lr;
     result.sgd.wd = result.adamw.wd = schedule.lr->wd;
     return result;

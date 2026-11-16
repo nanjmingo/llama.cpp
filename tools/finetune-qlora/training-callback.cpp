@@ -110,12 +110,8 @@ bool qlora_prepare_save_job(qlora_training_state & state,
         prepared->write_snapshot = write_snapshot;
         prepared->write_checkpoint = write_checkpoint;
         prepared->write_final_adapter = write_final_adapter;
-        prepared->write_grad_stats_log = state.qparams->grad_stats_interval > 0;
         if (write_snapshot || write_checkpoint) {
             prepared->loss_log = qlora_serialize_loss_log(state.loss_history);
-            if (prepared->write_grad_stats_log) {
-                prepared->grad_stats_log = qlora_serialize_grad_stats_log(state.grad_stats_history);
-            }
         }
         if (write_snapshot) {
             prepared->snapshot_path = qlora_snapshot_path(state.output_root, prepared->step);
@@ -188,7 +184,6 @@ bool qlora_prepare_save_job(qlora_training_state & state,
                 metadata["skip_invalid_records"] = state.qparams->dataset.skip_invalid;
                 metadata["lr_scheduler"] = state.qparams->lr_scheduler;
                 metadata["warmup_steps"] = state.qparams->warmup_steps;
-                metadata["warmup_init_ratio"] = state.qparams->warmup_init_ratio;
                 metadata["learning_rate"] = state.params->lr.lr0;
                 metadata["learning_rate_min"] = state.params->lr.lr_min;
                 metadata["weight_decay"] = state.params->lr.wd;
@@ -514,29 +509,6 @@ void qlora_epoch_callback_progress_line(bool               train,
     fflush(stderr);
 }
 
-static void log_gradient_stats_if_due(qlora_training_state & state, ggml_opt_result_t result) {
-    const int32_t interval = state.qparams->grad_stats_interval;
-    const int64_t step = state.schedule->step;
-    if (interval <= 0 || step <= 0 || step % interval != 0) {
-        return;
-    }
-
-    ggml_opt_grad_stats stats = {};
-    if (!ggml_opt_result_grad_stats(result, &stats)) {
-        LOG_WRN("%s: gradient statistics were not available for optimizer step %ld\n",
-                __func__, static_cast<long>(step));
-        return;
-    }
-    state.grad_stats_history.push_back({ step, stats });
-
-    const double zero_percent = stats.n_elements > 0
-        ? 100.0 * static_cast<double>(stats.n_zeros) / static_cast<double>(stats.n_elements) : 0.0;
-    LOG_INF("gradient_stats step=%ld tensors=%ld elements=%ld scale=%.6g norm=%.6g rms=%.6g max_abs=%.6g "
-            "zero=%.4f%% nonfinite=%ld\n",
-            static_cast<long>(step), static_cast<long>(stats.n_tensors), static_cast<long>(stats.n_elements),
-            stats.scale, stats.norm, stats.rms, stats.max_abs, zero_percent, static_cast<long>(stats.n_nonfinite));
-}
-
 void qlora_save_step_callback(bool               train,
                         ggml_opt_context_t opt_ctx,
                         ggml_opt_dataset_t dataset,
@@ -554,9 +526,6 @@ void qlora_save_step_callback(bool               train,
         return;
     }
     update_training_step(*g_qlora_training_state, ibatch);
-    if (is_optimizer_update(*g_qlora_training_state, ibatch)) {
-        log_gradient_stats_if_due(*g_qlora_training_state, result);
-    }
     save_due_state(*g_qlora_training_state, ibatch);
 }
 

@@ -23,17 +23,6 @@ extern "C" {
     typedef struct ggml_opt_context * ggml_opt_context_t;
     typedef struct ggml_opt_result  * ggml_opt_result_t;
 
-    struct ggml_opt_grad_stats {
-        int64_t n_tensors;
-        int64_t n_elements;
-        int64_t n_zeros;
-        int64_t n_nonfinite;
-        double scale;
-        double norm;
-        double rms;
-        double max_abs;
-    };
-
     // ====== Loss ======
 
     // built-in loss types, i.e. the built-in quantities minimized by the optimizer
@@ -175,7 +164,6 @@ extern "C" {
     GGML_API void ggml_opt_set_seed(ggml_opt_context_t opt_ctx, uint32_t seed);
 
     GGML_API void ggml_opt_set_opt_period(ggml_opt_context_t opt_ctx, int32_t opt_period);
-    GGML_API void ggml_opt_set_grad_stats_interval(ggml_opt_context_t opt_ctx, int32_t interval);
     GGML_API void ggml_opt_set_gradient_checkpointing(ggml_opt_context_t opt_ctx, bool enabled);
 
     GGML_API void ggml_opt_set_loss_normalizer(ggml_opt_context_t opt_ctx, float loss_normalizer);
@@ -218,7 +206,6 @@ extern "C" {
     GGML_API void ggml_opt_result_ndata(   ggml_opt_result_t result, int64_t * ndata);                  // writes 1 value, number of datapoints
     GGML_API void ggml_opt_result_loss(    ggml_opt_result_t result, double  * loss,     double * unc); // writes 1 value
     GGML_API void ggml_opt_result_last_loss(ggml_opt_result_t result, double * loss);
-    GGML_API bool ggml_opt_result_grad_stats(ggml_opt_result_t result, struct ggml_opt_grad_stats * stats);
     GGML_API void ggml_opt_result_pred(    ggml_opt_result_t result, int32_t * pred);                   // writes ndata values
     GGML_API void ggml_opt_result_accuracy(ggml_opt_result_t result, double  * accuracy, double * unc); // writes 1 value
 

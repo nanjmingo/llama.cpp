@@ -9,12 +9,11 @@ struct qlora_lr_schedule {
     const lr_opt * lr = nullptr;
     std::string    type = "constant";
     int64_t        warmup_steps = 0;
-    float          warmup_init_ratio = 0.1f;
     int64_t        total_steps = 0;
-    int64_t        step = 0;
+    int64_t        step = 0; // completed optimizer updates
     float          current_lr = 0.0f;
 
-    float get_lr() const;
+    float get_lr(int64_t step) const; // upcoming one-based update; step 0 is the initial point
     void advance_step() { ++step; }
 };
 

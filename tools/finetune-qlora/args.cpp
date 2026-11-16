@@ -193,13 +193,6 @@ const std::vector<qlora_arg> & get_qlora_arg_defs() {
             }
         ));
         add_opt(qlora_arg(
-            {"--grad-stats-interval"}, "N",
-            "Log global LoRA gradient statistics every N optimizer updates; 0 disables (default: 0)",
-            [](qlora_params & params, const std::string & value) {
-                params.grad_stats_interval = parse_non_negative_int(value, "--grad-stats-interval");
-            }
-        ));
-        add_opt(qlora_arg(
             {"--gradient-checkpointing"}, "on/off",
             "Enable activation recomputation during backward (default: on)",
             [](qlora_params & params, const std::string & value) {
@@ -248,16 +241,6 @@ const std::vector<qlora_arg> & get_qlora_arg_defs() {
             "Linear LR warmup steps (default: 0)",
             [](qlora_params & params, const std::string & value) {
                 params.warmup_steps = parse_non_negative_int(value, "--warmup-steps");
-            }
-        ));
-        add_opt(qlora_arg(
-            {"--warmup-init-ratio"}, "RATIO",
-            "Initial warmup LR as a fraction of peak LR (default: 0.1)",
-            [](qlora_params & params, const std::string & value) {
-                params.warmup_init_ratio = parse_float(value, "--warmup-init-ratio");
-                if (!(params.warmup_init_ratio > 0.0f && params.warmup_init_ratio <= 1.0f)) {
-                    throw std::invalid_argument("--warmup-init-ratio must be greater than 0 and at most 1");
-                }
             }
         ));
         add_opt(qlora_arg(

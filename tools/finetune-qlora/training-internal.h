@@ -22,11 +22,6 @@ struct qlora_loss_log_entry {
     double average_loss = 0.0;
 };
 
-struct qlora_grad_stats_log_entry {
-    int64_t step = 0;
-    ggml_opt_grad_stats stats = {};
-};
-
 struct qlora_save_job {
     std::filesystem::path output_root;
     std::filesystem::path snapshot_path;
@@ -43,7 +38,6 @@ struct qlora_save_job {
     bool write_snapshot = false;
     bool write_checkpoint = false;
     bool write_final_adapter = false;
-    bool write_grad_stats_log = false;
     bool snapshot_saved = false;
     bool checkpoint_saved = false;
     bool final_adapter_saved = false;
@@ -52,7 +46,6 @@ struct qlora_save_job {
     std::string optimizer_name;
     std::string optimizer_state_type;
     std::string loss_log;
-    std::string grad_stats_log;
     std::string training_state_json;
     std::string manifest_json;
 };
@@ -88,7 +81,6 @@ struct qlora_training_state {
     bool training_statistics_complete = true;
     double validation_weight_sum = 0.0;
     std::vector<qlora_loss_log_entry> loss_history;
-    std::vector<qlora_grad_stats_log_entry> grad_stats_history;
     bool abort_requested = false;
     int64_t last_checkpoint_step = -1;
     int64_t last_checkpoint_next_epoch = -1;
@@ -101,6 +93,5 @@ struct qlora_training_state {
 };
 
 std::string qlora_serialize_loss_log(const std::vector<qlora_loss_log_entry> & history);
-std::string qlora_serialize_grad_stats_log(const std::vector<qlora_grad_stats_log_entry> & history);
 
 bool write_qlora_save_job(const std::shared_ptr<qlora_save_job> & job, std::string & error);

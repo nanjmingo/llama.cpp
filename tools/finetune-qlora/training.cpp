@@ -106,8 +106,7 @@ bool train_adapter(const qlora_params & qparams,
         return false;
     }
 
-    qlora_lr_schedule schedule{ &params.lr, qparams.lr_scheduler, qparams.warmup_steps,
-                                qparams.warmup_init_ratio, 0, 0 };
+    qlora_lr_schedule schedule{ &params.lr, qparams.lr_scheduler, qparams.warmup_steps, 0, 0 };
     llama_opt_params opt_params{
         0,
         lora_param_filter,
@@ -172,7 +171,6 @@ bool train_adapter(const qlora_params & qparams,
     llama_opt_init(ctx, model, opt_params);
     llama_opt_set_gradient_checkpointing(ctx, qparams.gradient_checkpointing);
     llama_opt_set_opt_period(ctx, qparams.gradient_accumulation_steps);
-    llama_opt_set_grad_stats_interval(ctx, qparams.grad_stats_interval);
     if (qparams.gradient_checkpointing) {
         LOG_INF("%s: gradient checkpointing enabled\n", __func__);
     }
@@ -223,7 +221,7 @@ bool train_adapter(const qlora_params & qparams,
     save_state.gradient_accumulation_steps = qparams.gradient_accumulation_steps;
     save_state.dataset_windows = dataset_windows;
     save_state.schedule = &schedule;
-    if (!initialize_training_logs(save_state.output_root, qparams.grad_stats_interval > 0)) {
+    if (!initialize_training_logs(save_state.output_root)) {
         LOG_ERR("%s: failed to initialize training logs in '%s'\n", __func__,
                 save_state.output_root.string().c_str());
         return false;
@@ -243,12 +241,8 @@ bool train_adapter(const qlora_params & qparams,
     if (qparams.val_windows >= 0) {
         LOG_INF("%s: validation window limit=%d (0 disables validation)\n", __func__, qparams.val_windows);
     }
-    if (qparams.grad_stats_interval > 0) {
-        LOG_INF("%s: logging global LoRA gradient statistics every %d optimizer updates\n",
-                __func__, qparams.grad_stats_interval);
-    }
-    LOG_INF("%s: lr scheduler=%s warmup_steps=%d warmup_init_ratio=%.3g total_steps=%ld lr=%.3g lr_min=%.3g\n",
-            __func__, qparams.lr_scheduler.c_str(), qparams.warmup_steps, static_cast<double>(qparams.warmup_init_ratio),
+    LOG_INF("%s: lr scheduler=%s warmup_steps=%d total_steps=%ld lr=%.3g lr_min=%.3g\n",
+            __func__, qparams.lr_scheduler.c_str(), qparams.warmup_steps,
             static_cast<long>(schedule.total_steps), static_cast<double>(params.lr.lr0),
             static_cast<double>(std::max(0.0f, params.lr.lr_min)));
     if (qparams.save_snapshot_limit > 0 && qparams.save_snapshot_steps > 0) {
