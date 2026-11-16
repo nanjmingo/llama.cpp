@@ -28,9 +28,11 @@
 #include <cstdint>
 #include <cinttypes>
 #include <clocale>
+#include <cstdlib>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <iterator>
 #include <iomanip>
 #include <limits>
@@ -87,6 +89,20 @@ struct remove_file_scope {
     }
 };
 
+bool has_option(const std::vector<std::string> & args, std::initializer_list<const char *> names) {
+    for (size_t i = 1; i < args.size(); ++i) {
+        const std::string & arg = args[i];
+        const size_t equals = arg.find('=');
+        const std::string option = arg.substr(0, equals);
+        for (const char * name : names) {
+            if (option == name) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -94,8 +110,15 @@ int main(int argc, char ** argv) {
 
     qlora_params qparams;
     common_params params;
+    params.lr.lr0 = 5e-5f;
+    params.lr.epochs = 3;
+    params.sampling.seed = 42;
+    params.load_mode = LLAMA_LOAD_MODE_NONE;
+    params.lazy_mode = LLAMA_LAZY_MODE_OFF;
     params.cache_type_k = GGML_TYPE_F32;
     params.cache_type_v = GGML_TYPE_F32;
+    bool batch_size_specified = false;
+    bool ubatch_size_specified = false;
     {
         std::vector<std::string> common_args_storage;
         std::string parse_error;
@@ -104,6 +127,13 @@ int main(int argc, char ** argv) {
             qlora_print_usage(argc, argv);
             return 1;
         }
+
+        const char * batch_env = std::getenv("LLAMA_ARG_BATCH");
+        const char * ubatch_env = std::getenv("LLAMA_ARG_UBATCH");
+        batch_size_specified = has_option(common_args_storage, {"-b", "--batch-size"}) ||
+            (batch_env != nullptr && batch_env[0] != '\0');
+        ubatch_size_specified = has_option(common_args_storage, {"-ub", "--ubatch-size"}) ||
+            (ubatch_env != nullptr && ubatch_env[0] != '\0');
 
         std::vector<char *> common_argv;
         common_argv.reserve(common_args_storage.size());
@@ -171,13 +201,13 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    params.load_mode = LLAMA_LOAD_MODE_NONE;
     params.warmup = false;
     params.no_alloc_kv_cache = true;
 
     const float lora_alpha = qparams.lora_alpha > 0.0f ? qparams.lora_alpha : static_cast<float>(qparams.lora_rank);
 
     std::string arch;
+    int32_t model_context_length = 0;
     {
         ggml_context * meta_ctx_raw = nullptr;
         ggml_context_ptr meta_ctx;
@@ -191,6 +221,31 @@ int main(int argc, char ** argv) {
         const int key_id = gguf_find_key(gguf.get(), "general.architecture");
         if (key_id >= 0) {
             arch = gguf_get_val_str(gguf.get(), key_id);
+        }
+        if (!arch.empty()) {
+            const std::string context_key = arch + ".context_length";
+            const int context_id = gguf_find_key(gguf.get(), context_key.c_str());
+            if (context_id >= 0 && gguf_get_kv_type(gguf.get(), context_id) == GGUF_TYPE_UINT32) {
+                const uint32_t context_length = gguf_get_val_u32(gguf.get(), context_id);
+                if (context_length > 0 && context_length <= static_cast<uint32_t>(INT32_MAX)) {
+                    model_context_length = static_cast<int32_t>(context_length);
+                }
+            }
+        }
+    }
+
+    // QLoRA trains one full-context window per microbatch. When the user omits
+    // either batch size, default it to the requested context length (or the
+    // model's native context length when -c is omitted).
+    if (params.n_ctx == 0 && model_context_length > 0) {
+        params.n_ctx = model_context_length;
+    }
+    if (params.n_ctx > 0) {
+        if (!batch_size_specified) {
+            params.n_batch = params.n_ctx;
+        }
+        if (!ubatch_size_specified) {
+            params.n_ubatch = params.n_ctx;
         }
     }
 

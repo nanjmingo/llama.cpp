@@ -37,15 +37,15 @@ Train a LoRA adapter with context size 512:
   --output-dir ./output \
   --lora-rank 16 \
   --lora-alpha 16 \
-  -c 512 -b 512 -ub 512
+  -c 512
 ```
 
 > [!IMPORTANT]
 > **Context and Batch Size Rule:**
 > QLoRA processes each training window as one full-context graph. You must set:
 > - `-c <N>` : Context window length in tokens.
-> - `-ub <N>`: Must equal `-c` (`-ub == -c`).
-> - `-b <N>` : Must be greater than or equal to `-c` (`-b >= -c`). Causal models clamp effective batch size to `-c`.
+> - `-ub <N>`: Must equal `-c` (`-ub == -c`). If omitted, QLoRA sets it to `-c`.
+> - `-b <N>` : Must be greater than or equal to `-c` (`-b >= -c`). If omitted, QLoRA sets it to `-c`.
 >
 > Windows cannot be split into smaller microbatches. If you run out of VRAM/memory, reduce `-c` or offload more layers to GPU.
 
@@ -59,13 +59,15 @@ Train a LoRA adapter with context size 512:
 |---|---|---|
 | `-m`, `--model` | *(required)* | Path to the base GGUF model file. |
 | `-c`, `--ctx-size` | `0` (model default) | Training context window size (tokens). Used as-is without rounding up. |
-| `-b`, `--batch-size` | `2048` | Physical batch size. Must be `>= -c`. Clamped to `-c`. |
-| `-ub`, `--ubatch-size` | `512` | Microbatch size. Must equal `-c`. |
+| `-b`, `--batch-size` | `-c` when omitted | Logical batch size. Must be `>= -c`. Causal models clamp effective batch size to `-c`. |
+| `-ub`, `--ubatch-size` | `-c` when omitted | Microbatch size. Must equal `-c`. |
 | `-t`, `--threads` | auto | CPU threads for training, JSONL reading, and tokenization. |
 | `-ngl`, `--n-gpu-layers` | `auto` | Number of layers to offload to GPU (`auto`, `all`, or integer). |
 | `-fa`, `--flash-attn` | `auto` | Flash Attention mode (`on`, `off`, `auto`). CPU and CUDA backward supported. |
 | `-ctk`, `--cache-type-k` | `f32` | KV cache K type (`f32`, `f16`, `bf16`, `q8_0`, etc.). |
 | `-ctv`, `--cache-type-v` | `f32` | KV cache V type (`f32`, `f16`, `bf16`, `q8_0`, etc.). |
+| `-lm`, `--load-mode` | `none` | Model loading mode (`auto`, `none`, `mmap`, `mlock`, `mmap+mlock`, or `dio`). |
+| `-lzm`, `--lazy-mode` | `off` | On-demand tensor loading mode (`on`, `auto`, or `off`). |
 | `-ncmoe`, `--n-cpu-moe N` | `0` | Keep MoE expert weights in CPU memory for the first N layers. |
 | `--moe-cache-mib N` | `0` (disabled) | GPU cache capacity (in MiB) for CPU-resident MoE experts. |
 | `--op-offload` / `--no-op-offload` | enabled | Offload host-tensor operations to devices. |
@@ -76,8 +78,8 @@ Train a LoRA adapter with context size 512:
 |---|---|---|
 | `--train-file` | *(required)* | Path to JSONL dataset. Repeat this flag to load multiple files. |
 | `--fail-on-invalid-records` | off | Exit with an error on the first bad record instead of skipping it. |
-| `--shuffle-dataset` | off | Shuffle dataset windows at the start of each epoch. |
-| `-s`, `--seed` | random | Random seed for dataset shuffling. |
+| `--shuffle-dataset on/off` | `on` | Shuffle dataset windows at the start of each epoch. Use `off` to disable shuffling. |
+| `-s`, `--seed` | `42` | Random seed for dataset shuffling. |
 
 ### LoRA Options
 
@@ -94,21 +96,21 @@ Train a LoRA adapter with context size 512:
 | Option | Default | Description |
 |---|---|---|
 | `-opt`, `--optimizer` | `adamw` | Optimizer: `adamw` or `sgd`. |
-| `-lr`, `--learning-rate` | `1e-5` | Peak learning rate. |
+| `-lr`, `--learning-rate` | `5e-5` | Peak learning rate. |
 | `-wd`, `--weight-decay` | `0` | Weight decay for LoRA tensors. |
-| `-epochs`, `--epochs` | `2` | Number of training epochs (ignored when `--max-steps` is set). |
+| `-epochs`, `--epochs` | `3` | Number of training epochs (ignored when `--max-steps` is set). |
 | `--max-steps` | disabled | Stop after N optimizer updates. Loops the dataset if needed. |
-| `--gradient-accumulation-steps` | `1` | Accumulate gradients across N windows before each optimizer update. |
+| `--gradient-accumulation-steps` | `8` | Accumulate gradients across N windows before each optimizer update. |
 | `--optimizer-state-type` | `f32` | AdamW moment storage type: `f32`, `f16`, or `bf16`. (SGD is F32 only). |
 | `--lr-scheduler` | `constant` | Schedule: `constant` or `cosine`. |
 | `--warmup-steps` | `0` | Linear warmup duration in optimizer updates. |
 | `--warmup-init-ratio` | `0.1` | Starting LR ratio during warmup (`start_lr = peak_lr * ratio`). |
 | `-lr-min`, `--learning-rate-min` | `-1` (0) | Floor LR for cosine schedule or constant decay. |
 | `-decay-epochs` | `-1` | Epochs to decay constant LR toward `--learning-rate-min`. |
-| `--compute-type` | `f32` | GEMM compute type: `f32`, `f16`, `bf16`, or `q8`. `q8` requests Q8 for forward GEMM and F16 for backward GEMM. |
+| `--compute-type` | `f16` | GEMM compute type: `f32`, `f16`, `bf16`, or `q8`. `q8` requests Q8 for forward GEMM and F16 for backward GEMM. |
 | `--val-windows` | all remaining | Max windows evaluated after training range (`0` disables validation). |
 | `--grad-stats-interval` | `0` | Log gradient norm/stats every N updates (`0` disables logging). |
-| `--gradient-checkpointing` | `off` | Recompute intermediate layer activations during backward to reduce activation memory (`on` or `off`). |
+| `--gradient-checkpointing` | `on` | Recompute intermediate layer activations during backward to reduce activation memory (`on` or `off`). |
 
 When enabled, gradient checkpointing retains every `l_out` layer boundary and recomputes intermediate activations during backward. MoE I32 expert-selection indices and `GET_ROWS` outputs are reused from the original forward pass.
 
@@ -129,7 +131,7 @@ CPU support for applying F16/BF16 precision to F32 weights is not included in th
 | Option | Default | Description |
 |---|---|---|
 | `--output-dir` | *(required)* | Directory to save checkpoints, snapshots, and final `adapter.gguf`. |
-| `--save-checkpoint-steps` | `0` | Save a full checkpoint every N updates (`0` = only save final). |
+| `--save-checkpoint-steps` | `500` | Save a full checkpoint every N updates (`0` = only save final). Periodic/final resumable checkpoint saving remains disabled while `--save-checkpoint-limit` is `0`. |
 | `--save-checkpoint-limit` | `0` (disabled) | Keep at most N checkpoints (`0` disables all checkpoints). |
 | `--save-snapshot-steps` | `0` | Save adapter-only snapshot every N updates (`0` = disabled). |
 | `--save-snapshot-limit` | `0` (disabled) | Keep at most N snapshots (`0` disables snapshot retention). |

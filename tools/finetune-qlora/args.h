@@ -12,26 +12,26 @@ struct qlora_params {
     float       lora_alpha         = 0.0f;
     std::string lora_type          = "f32";
     std::string optimizer_state_type = "f32";
-    std::string compute_type = "f32";
-    ggml_prec compute_precision = GGML_PREC_F32;
+    std::string compute_type = "f16";
+    ggml_prec compute_precision = GGML_PREC_F16;
     std::string lora_targets       = "attn_q,attn_k,attn_v,attn_output,ffn_gate,ffn_up,ffn_down";
     std::string output_dir;
     std::string resume_from;
     dataset_options dataset;
-    int32_t     save_checkpoint_steps = 0;
+    int32_t     save_checkpoint_steps = 500;
     int32_t     save_checkpoint_limit = 0;
     int32_t     save_snapshot_steps = 0;
     int32_t     save_snapshot_limit = 0;
-    int32_t     gradient_accumulation_steps = 1;
+    int32_t     gradient_accumulation_steps = 8;
     int32_t     grad_stats_interval = 0;
-    bool        gradient_checkpointing = false;
+    bool        gradient_checkpointing = true;
     int32_t     max_steps          = 0;
     int32_t     val_windows        = -1;
     int32_t     freeze_layers      = 0;
     std::string lr_scheduler       = "constant";
     int32_t     warmup_steps       = 0;
     float       warmup_init_ratio  = 0.1f;
-    bool        shuffle_dataset    = false;
+    bool        shuffle_dataset    = true;
 };
 
 struct qlora_arg {

@@ -120,7 +120,7 @@ const std::vector<qlora_arg> & get_qlora_arg_defs() {
         ));
         add_opt(qlora_arg(
             {"--compute-type"}, "TYPE",
-            "Matrix-multiplication compute type: f32, f16, bf16, or q8 (q8 uses f16 for backward)",
+            "Matrix-multiplication compute type: f32, f16, bf16, or q8 (q8 uses f16 for backward; default: f16)",
             [](qlora_params & params, const std::string & value) {
                 params.compute_type = value;
                 params.compute_precision = qlora_compute_type_from_name(value);
@@ -152,7 +152,7 @@ const std::vector<qlora_arg> & get_qlora_arg_defs() {
         ));
         add_opt(qlora_arg(
             {"--save-checkpoint-steps"}, "N",
-            "Save a resumable checkpoint every N optimizer steps; 0 saves only the final checkpoint when enabled",
+            "Save a resumable checkpoint every N optimizer steps; 0 saves only the final checkpoint when enabled (default: 500)",
             [](qlora_params & params, const std::string & value) {
                 params.save_checkpoint_steps = parse_non_negative_int(value, "--save-checkpoint-steps");
             }
@@ -187,7 +187,7 @@ const std::vector<qlora_arg> & get_qlora_arg_defs() {
         ));
         add_opt(qlora_arg(
             {"--gradient-accumulation-steps"}, "N",
-            "Accumulate gradients across up to N full-context windows before each optimizer update (default: 1)",
+            "Accumulate gradients across up to N full-context windows before each optimizer update (default: 8)",
             [](qlora_params & params, const std::string & value) {
                 params.gradient_accumulation_steps = parse_positive_int(value, "--gradient-accumulation-steps");
             }
@@ -201,7 +201,7 @@ const std::vector<qlora_arg> & get_qlora_arg_defs() {
         ));
         add_opt(qlora_arg(
             {"--gradient-checkpointing"}, "on/off",
-            "Enable activation recomputation during backward (default: off)",
+            "Enable activation recomputation during backward (default: on)",
             [](qlora_params & params, const std::string & value) {
                 if (value == "on") {
                     params.gradient_checkpointing = true;
@@ -261,10 +261,16 @@ const std::vector<qlora_arg> & get_qlora_arg_defs() {
             }
         ));
         add_opt(qlora_arg(
-            {"--shuffle-dataset"},
-            "Shuffle dataset windows each epoch",
-            [](qlora_params & params) {
-                params.shuffle_dataset = true;
+            {"--shuffle-dataset"}, "on/off",
+            "Shuffle dataset windows at the start of each epoch (default: on)",
+            [](qlora_params & params, const std::string & value) {
+                if (value == "on") {
+                    params.shuffle_dataset = true;
+                } else if (value == "off") {
+                    params.shuffle_dataset = false;
+                } else {
+                    throw std::invalid_argument("--shuffle-dataset must be on or off");
+                }
             }
         ));
 
