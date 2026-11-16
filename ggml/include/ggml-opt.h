@@ -23,6 +23,17 @@ extern "C" {
     typedef struct ggml_opt_context * ggml_opt_context_t;
     typedef struct ggml_opt_result  * ggml_opt_result_t;
 
+    struct ggml_opt_grad_stats {
+        int64_t n_tensors;
+        int64_t n_elements;
+        int64_t n_zeros;
+        int64_t n_nonfinite;
+        double scale;
+        double norm;
+        double rms;
+        double max_abs;
+    };
+
     // ====== Loss ======
 
     // built-in loss types, i.e. the built-in quantities minimized by the optimizer
@@ -43,12 +54,25 @@ extern "C" {
             int64_t        ne_label,     // number of elements per label
             int64_t        ndata,        // total number of datapoints/labels
             int64_t        ndata_shard); // number of datapoints/labels per shard (unit at which the dataset is shuffled/copied)
+    GGML_API ggml_opt_dataset_t ggml_opt_dataset_init_with_weights(
+            enum ggml_type type_data,
+            enum ggml_type type_label,
+            enum ggml_type type_weights,
+            int64_t        ne_datapoint,
+            int64_t        ne_label,
+            int64_t        ne_weights,
+            int64_t        ndata,
+            int64_t        ndata_shard);
     GGML_API void ggml_opt_dataset_free(ggml_opt_dataset_t dataset);
 
     // get underlying tensors that store the data
     GGML_API int64_t              ggml_opt_dataset_ndata (ggml_opt_dataset_t dataset);
+    GGML_API int64_t              ggml_opt_dataset_permutation_size(ggml_opt_dataset_t dataset);
+    GGML_API bool                 ggml_opt_dataset_get_permutation(ggml_opt_dataset_t dataset, int64_t * permutation, int64_t size);
+    GGML_API bool                 ggml_opt_dataset_set_permutation(ggml_opt_dataset_t dataset, const int64_t * permutation, int64_t size);
     GGML_API struct ggml_tensor * ggml_opt_dataset_data  (ggml_opt_dataset_t dataset); // shape = [ne_datapoint, ndata]
     GGML_API struct ggml_tensor * ggml_opt_dataset_labels(ggml_opt_dataset_t dataset); // shape = [nd_label,     ndata]
+    GGML_API struct ggml_tensor * ggml_opt_dataset_weights(ggml_opt_dataset_t dataset);
 
     // shuffle idata first datapoints from dataset with RNG from opt_ctx, shuffle all datapoints if idata is negative
     GGML_API void ggml_opt_dataset_shuffle(ggml_opt_context_t opt_ctx, ggml_opt_dataset_t dataset, int64_t idata);
@@ -64,6 +88,14 @@ extern "C" {
             void               * data_batch,
             size_t               nb_data_batch,
             void               * labels_batch,
+            int64_t              ibatch);
+    GGML_API void ggml_opt_dataset_get_batch_host_with_weights(
+            ggml_opt_dataset_t   dataset,
+            void               * data_batch,
+            size_t               nb_data_batch,
+            void               * labels_batch,
+            void               * weights_batch,
+            size_t               nb_weights_batch,
             int64_t              ibatch);
 
     // ====== Model / Context ======
@@ -127,6 +159,8 @@ extern "C" {
 
         // only GGML_OPT_OPTIMIZER_TYPE_ADAMW needs m, v momenta per parameter tensor
         enum ggml_opt_optimizer_type optimizer;
+
+        enum ggml_type optimizer_state_type;
     };
 
     // get parameters for an optimization context with defaults set where possible
@@ -137,6 +171,19 @@ extern "C" {
 
     GGML_API ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params);
     GGML_API void ggml_opt_free(ggml_opt_context_t opt_ctx);
+
+    GGML_API void ggml_opt_set_seed(ggml_opt_context_t opt_ctx, uint32_t seed);
+
+    GGML_API void ggml_opt_set_opt_period(ggml_opt_context_t opt_ctx, int32_t opt_period);
+    GGML_API void ggml_opt_set_grad_stats_interval(ggml_opt_context_t opt_ctx, int32_t interval);
+    GGML_API void ggml_opt_set_gradient_checkpointing(ggml_opt_context_t opt_ctx, bool enabled);
+
+    GGML_API void ggml_opt_set_loss_normalizer(ggml_opt_context_t opt_ctx, float loss_normalizer);
+
+    GGML_API size_t ggml_opt_state_size(ggml_opt_context_t opt_ctx);
+    GGML_API bool ggml_opt_state_export(ggml_opt_context_t opt_ctx, void * data, size_t size);
+    GGML_API bool ggml_opt_state_import(ggml_opt_context_t opt_ctx, const void * data, size_t size);
+    GGML_API bool ggml_opt_state_data_is_finite(const void * data, size_t size);
 
     // set gradients to zero, initialize loss, and optionally reset the optimizer
     GGML_API void ggml_opt_reset(ggml_opt_context_t opt_ctx, bool optimizer);
@@ -155,6 +202,8 @@ extern "C" {
     // get the gradient accumulator for a node from the forward graph
     GGML_API struct ggml_tensor * ggml_opt_grad_acc(ggml_opt_context_t opt_ctx, struct ggml_tensor * node);
 
+    GGML_API bool ggml_opt_has_grad(ggml_opt_context_t opt_ctx, const struct ggml_tensor * node);
+
     GGML_API enum ggml_opt_optimizer_type ggml_opt_context_optimizer_type(ggml_opt_context_t); //TODO consistent naming scheme
 
     GGML_API const char * ggml_opt_optimizer_name(enum ggml_opt_optimizer_type);
@@ -168,6 +217,8 @@ extern "C" {
     // get data from result, uncertainties are optional and can be ignored by passing NULL
     GGML_API void ggml_opt_result_ndata(   ggml_opt_result_t result, int64_t * ndata);                  // writes 1 value, number of datapoints
     GGML_API void ggml_opt_result_loss(    ggml_opt_result_t result, double  * loss,     double * unc); // writes 1 value
+    GGML_API void ggml_opt_result_last_loss(ggml_opt_result_t result, double * loss);
+    GGML_API bool ggml_opt_result_grad_stats(ggml_opt_result_t result, struct ggml_opt_grad_stats * stats);
     GGML_API void ggml_opt_result_pred(    ggml_opt_result_t result, int32_t * pred);                   // writes ndata values
     GGML_API void ggml_opt_result_accuracy(ggml_opt_result_t result, double  * accuracy, double * unc); // writes 1 value
 
