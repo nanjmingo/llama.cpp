@@ -23,6 +23,11 @@ on:
         description: Package asset filename.
         required: true
         type: string
+      skip_build:
+        description: Skip this build when its release asset already exists.
+        required: false
+        default: false
+        type: boolean
       release_tag:
         description: Prerelease tag created by the orchestrator.
         required: true
@@ -35,6 +40,7 @@ on:
 
 jobs:
   build:
+    if: ${{ !inputs.skip_build }}
     name: CUDA ${{ inputs.cuda_display_version }}
     runs-on: ubuntu-22.04
     container: ${{ inputs.container_image }}

@@ -24,6 +24,12 @@ jobs:
       windows_arm64_cpu_asset_name: ${{ steps.metadata.outputs.windows_arm64_cpu_asset_name }}
       ubuntu_x64_cuda_13_0_asset_name: ${{ steps.metadata.outputs.ubuntu_x64_cuda_13_0_asset_name }}
       ubuntu_x64_cuda_12_8_asset_name: ${{ steps.metadata.outputs.ubuntu_x64_cuda_12_8_asset_name }}
+      skip_ubuntu_x64_cpu_build: ${{ steps.metadata.outputs.skip_ubuntu_x64_cpu_build }}
+      skip_ubuntu_arm64_cpu_build: ${{ steps.metadata.outputs.skip_ubuntu_arm64_cpu_build }}
+      skip_windows_x64_cpu_build: ${{ steps.metadata.outputs.skip_windows_x64_cpu_build }}
+      skip_windows_arm64_cpu_build: ${{ steps.metadata.outputs.skip_windows_arm64_cpu_build }}
+      skip_ubuntu_x64_cuda_13_0_build: ${{ steps.metadata.outputs.skip_ubuntu_x64_cuda_13_0_build }}
+      skip_ubuntu_x64_cuda_12_8_build: ${{ steps.metadata.outputs.skip_ubuntu_x64_cuda_12_8_build }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -46,7 +52,6 @@ jobs:
           COMMIT_TIMESTAMP="$(date -u --date="$COMMIT_DATE" '+%Y-%m-%d-%H%M')"
           COMMIT_DATE_UTC="$(date -u --date="$COMMIT_DATE" '+%Y-%m-%dT%H:%M:%SZ')"
           RELEASE_BASE="${COMMIT_TIMESTAMP}-${BRANCH_SLUG}"
-          SHORT_SHA="${GITHUB_SHA::7}"
           RELEASE_TAG="$RELEASE_BASE"
 
           UBUNTU_X64_CPU_ASSET_NAME="${RELEASE_BASE}-ubuntu-x64-cpu.tar.gz"
@@ -55,15 +60,6 @@ jobs:
           WINDOWS_ARM64_CPU_ASSET_NAME="${RELEASE_BASE}-windows-arm64-cpu.zip"
           UBUNTU_X64_CUDA_13_0_ASSET_NAME="${RELEASE_BASE}-ubuntu-x64-cuda-13.0.tar.gz"
           UBUNTU_X64_CUDA_12_8_ASSET_NAME="${RELEASE_BASE}-ubuntu-x64-cuda-12.8.tar.gz"
-
-          tag_or_release_exists() {
-            gh release view "$1" >/dev/null 2>&1 || \
-              git ls-remote --exit-code --tags origin "refs/tags/$1" >/dev/null 2>&1
-          }
-
-          if tag_or_release_exists "$RELEASE_TAG"; then
-            RELEASE_TAG="${RELEASE_BASE}-${SHORT_SHA}"
-          fi
 
           RELEASE_TITLE="$RELEASE_TAG"
 
@@ -78,32 +74,43 @@ jobs:
 
           EOF_NOTES
 
-          create_or_update_release() {
-            if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-              gh release edit "$RELEASE_TAG" \
-                --title "$RELEASE_TITLE" \
-                --notes-file release-notes.md \
-                --prerelease
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Reusing existing release: $RELEASE_TAG"
+          else
+            if ! gh release create "$RELEASE_TAG" \
+              --target "$GITHUB_SHA" \
+              --title "$RELEASE_TITLE" \
+              --notes-file release-notes.md \
+              --draft \
+              --prerelease \
+              --latest=false; then
+              # Another run may have created the release after the initial lookup.
+              if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+                echo "::error::Failed to create or find release: $RELEASE_TAG"
+                exit 1
+              fi
+              echo "Reusing release created by another run: $RELEASE_TAG"
+            fi
+          fi
+
+          RELEASE_ASSET_NAMES="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')"
+          asset_exists() {
+            grep -Fqx -- "$1" <<< "$RELEASE_ASSET_NAMES"
+          }
+          should_skip_build() {
+            if asset_exists "$1"; then
+              printf 'true'
             else
-              gh release create "$RELEASE_TAG" \
-                --target "$GITHUB_SHA" \
-                --title "$RELEASE_TITLE" \
-                --notes-file release-notes.md \
-                --draft \
-                --prerelease \
-                --latest=false
+              printf 'false'
             fi
           }
 
-          if ! create_or_update_release; then
-            if [[ "$RELEASE_TAG" == "$RELEASE_BASE" ]] && tag_or_release_exists "$RELEASE_BASE"; then
-              RELEASE_TAG="${RELEASE_BASE}-${SHORT_SHA}"
-              RELEASE_TITLE="$RELEASE_TAG"
-              create_or_update_release
-            else
-              exit 1
-            fi
-          fi
+          SKIP_UBUNTU_X64_CPU_BUILD="$(should_skip_build "$UBUNTU_X64_CPU_ASSET_NAME")"
+          SKIP_UBUNTU_ARM64_CPU_BUILD="$(should_skip_build "$UBUNTU_ARM64_CPU_ASSET_NAME")"
+          SKIP_WINDOWS_X64_CPU_BUILD="$(should_skip_build "$WINDOWS_X64_CPU_ASSET_NAME")"
+          SKIP_WINDOWS_ARM64_CPU_BUILD="$(should_skip_build "$WINDOWS_ARM64_CPU_ASSET_NAME")"
+          SKIP_UBUNTU_X64_CUDA_13_0_BUILD="$(should_skip_build "$UBUNTU_X64_CUDA_13_0_ASSET_NAME")"
+          SKIP_UBUNTU_X64_CUDA_12_8_BUILD="$(should_skip_build "$UBUNTU_X64_CUDA_12_8_ASSET_NAME")"
 
           {
             echo "release_tag=${RELEASE_TAG}"
@@ -113,6 +120,12 @@ jobs:
             echo "windows_arm64_cpu_asset_name=${WINDOWS_ARM64_CPU_ASSET_NAME}"
             echo "ubuntu_x64_cuda_13_0_asset_name=${UBUNTU_X64_CUDA_13_0_ASSET_NAME}"
             echo "ubuntu_x64_cuda_12_8_asset_name=${UBUNTU_X64_CUDA_12_8_ASSET_NAME}"
+            echo "skip_ubuntu_x64_cpu_build=${SKIP_UBUNTU_X64_CPU_BUILD}"
+            echo "skip_ubuntu_arm64_cpu_build=${SKIP_UBUNTU_ARM64_CPU_BUILD}"
+            echo "skip_windows_x64_cpu_build=${SKIP_WINDOWS_X64_CPU_BUILD}"
+            echo "skip_windows_arm64_cpu_build=${SKIP_WINDOWS_ARM64_CPU_BUILD}"
+            echo "skip_ubuntu_x64_cuda_13_0_build=${SKIP_UBUNTU_X64_CUDA_13_0_BUILD}"
+            echo "skip_ubuntu_x64_cuda_12_8_build=${SKIP_UBUNTU_X64_CUDA_12_8_BUILD}"
           } >> "$GITHUB_OUTPUT"
 
   build-ubuntu-x64-cpu:
@@ -128,6 +141,7 @@ jobs:
       cache_key_prefix: llamango-cache-ubuntu-cpu-22.04-x64
       release_tag: ${{ needs.prepare-prerelease.outputs.release_tag }}
       asset_name: ${{ needs.prepare-prerelease.outputs.ubuntu_x64_cpu_asset_name }}
+      skip_build: ${{ needs.prepare-prerelease.outputs.skip_ubuntu_x64_cpu_build == 'true' }}
 
   build-ubuntu-arm64-cpu:
     permissions:
@@ -142,6 +156,7 @@ jobs:
       cache_key_prefix: llamango-cache-ubuntu-cpu-24.04-arm64
       release_tag: ${{ needs.prepare-prerelease.outputs.release_tag }}
       asset_name: ${{ needs.prepare-prerelease.outputs.ubuntu_arm64_cpu_asset_name }}
+      skip_build: ${{ needs.prepare-prerelease.outputs.skip_ubuntu_arm64_cpu_build == 'true' }}
 
   build-windows-x64-cpu:
     permissions:
@@ -158,6 +173,7 @@ jobs:
       openmp_args: -DGGML_OPENMP_FETCH=ON
       release_tag: ${{ needs.prepare-prerelease.outputs.release_tag }}
       asset_name: ${{ needs.prepare-prerelease.outputs.windows_x64_cpu_asset_name }}
+      skip_build: ${{ needs.prepare-prerelease.outputs.skip_windows_x64_cpu_build == 'true' }}
 
   build-windows-arm64-cpu:
     permissions:
@@ -174,6 +190,7 @@ jobs:
       openmp_args: -DGGML_OPENMP_FETCH=ON
       release_tag: ${{ needs.prepare-prerelease.outputs.release_tag }}
       asset_name: ${{ needs.prepare-prerelease.outputs.windows_arm64_cpu_asset_name }}
+      skip_build: ${{ needs.prepare-prerelease.outputs.skip_windows_arm64_cpu_build == 'true' }}
 
   build-ubuntu-x64-cuda-13-0:
     permissions:
@@ -187,6 +204,7 @@ jobs:
       container_image: nvidia/cuda:13.0.3-devel-ubuntu22.04
       cache_key_prefix: llamango-cache-ubuntu-cuda-13.0.3-22.04
       asset_name: ${{ needs.prepare-prerelease.outputs.ubuntu_x64_cuda_13_0_asset_name }}
+      skip_build: ${{ needs.prepare-prerelease.outputs.skip_ubuntu_x64_cuda_13_0_build == 'true' }}
       release_tag: ${{ needs.prepare-prerelease.outputs.release_tag }}
       cccl_version: v3.4.3
 
@@ -202,6 +220,7 @@ jobs:
       container_image: nvidia/cuda:12.8.2-devel-ubuntu22.04
       cache_key_prefix: llamango-cache-ubuntu-cuda-12.8.2-22.04
       asset_name: ${{ needs.prepare-prerelease.outputs.ubuntu_x64_cuda_12_8_asset_name }}
+      skip_build: ${{ needs.prepare-prerelease.outputs.skip_ubuntu_x64_cuda_12_8_build == 'true' }}
       release_tag: ${{ needs.prepare-prerelease.outputs.release_tag }}
 
   cleanup-caches:

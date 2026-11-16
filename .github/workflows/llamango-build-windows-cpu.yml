@@ -35,9 +35,15 @@ on:
         description: Package asset filename.
         required: true
         type: string
+      skip_build:
+        description: Skip this build when its release asset already exists.
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   build:
+    if: ${{ !inputs.skip_build }}
     name: CPU
     runs-on: ${{ inputs.runner }}
     permissions:
