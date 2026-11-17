@@ -228,7 +228,7 @@ jobs:
             -DLLAMA_FATAL_WARNINGS=OFF ^
             -DLLAMA_BUILD_BORINGSSL=ON ^
             -DGGML_NATIVE=OFF ^
-            -DGGML_OPENMP=OFF ^
+            -DGGML_OPENMP=ON ^
             -DGGML_CPU=ON ^
             -DGGML_CUDA=OFF
           if errorlevel 1 exit /b %errorlevel%
@@ -319,7 +319,6 @@ jobs:
           $ctestArgs = @(
             '--test-dir', 'build',
             '-C', 'Release',
-            '-L', 'main',
             '--output-on-failure',
             '--timeout', '900',
             '--parallel', "$env:NUMBER_OF_PROCESSORS"
