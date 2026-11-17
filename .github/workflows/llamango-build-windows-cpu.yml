@@ -218,7 +218,6 @@ jobs:
             -DCMAKE_CXX_COMPILER_TARGET=$targetTriple ^
             -DCMAKE_C_COMPILER_LAUNCHER=ccache ^
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache ^
-            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded ^
             -DLLAMA_BUILD_COMMON=ON ^
             -DLLAMA_BUILD_TOOLS=ON ^
             -DLLAMA_BUILD_TESTS=ON ^
@@ -229,7 +228,6 @@ jobs:
             -DLLAMA_FATAL_WARNINGS=OFF ^
             -DLLAMA_BUILD_BORINGSSL=ON ^
             -DGGML_NATIVE=OFF ^
-            -DGGML_OPENMP=OFF ^
             -DGGML_CPU=ON ^
             -DGGML_CUDA=OFF
           if errorlevel 1 exit /b %errorlevel%
@@ -278,7 +276,6 @@ jobs:
             "Backend: CPU"
             "Build scope: all default CMake targets"
             "Build type: Release"
-            "MSVC runtime: static (/MT)"
             "C/C++ compiler: Clang (clang-cl)"
             "Executables included: $($executables.Count)"
             "Runtime DLLs included: $($runtimeDlls.Count)"
