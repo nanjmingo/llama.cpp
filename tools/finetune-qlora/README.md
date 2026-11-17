@@ -71,6 +71,7 @@ Train a LoRA adapter with context size 512:
 | `-ncmoe`, `--n-cpu-moe N` | `0` | Keep MoE expert weights in CPU memory for the first N layers. |
 | `--moe-cache-mib N` | `0` (disabled) | GPU cache capacity (in MiB) for CPU-resident MoE experts. |
 | `--op-offload` / `--no-op-offload` | enabled | Offload host-tensor operations to devices. |
+| `--repack` / `-nr`, `--no-repack` | disabled | Enable weight repacking. |
 
 ### Dataset Options
 

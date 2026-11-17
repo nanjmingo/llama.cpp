@@ -1,6 +1,6 @@
 name: Cleanup Llamango ccache
 
-description: Delete ccache entries that have not been accessed for more than 100 hours.
+description: Retain the latest ccache entry for a Llamango build target.
 
 inputs:
   cache-key-prefix:
@@ -10,7 +10,7 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Delete ccache entries unused for more than 100 hours
+    - name: Retain the latest cache for this build target
       uses: actions/github-script@v9
       continue-on-error: true
       env:
@@ -21,8 +21,6 @@ runs:
           const prefix = process.env.CACHE_KEY_PREFIX;
           const { owner, repo } = context.repo;
           const ref = context.ref;
-          const maxUnusedMs = 100 * 60 * 60 * 1000;
-          const cutoff = Date.now() - maxUnusedMs;
           const caches = [];
 
           for (let page = 1; ; page += 1) {
@@ -33,6 +31,8 @@ runs:
                 repo,
                 ref,
                 key: prefix,
+                sort: "created_at",
+                direction: "desc",
                 per_page: 100,
                 page,
               },
@@ -50,12 +50,13 @@ runs:
             }
           }
 
-          for (const cache of caches) {
-            const lastAccessedAt = Date.parse(cache.last_accessed_at);
-            if (!Number.isFinite(lastAccessedAt) || lastAccessedAt > cutoff) {
-              continue;
-            }
+          caches.sort(
+            (left, right) =>
+              Date.parse(right.created_at) - Date.parse(left.created_at) ||
+              right.id - left.id,
+          );
 
+          for (const cache of caches.slice(1)) {
             try {
               await github.request(
                 "DELETE /repos/{owner}/{repo}/actions/caches/{cache_id}",

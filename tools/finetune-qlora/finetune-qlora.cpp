@@ -117,6 +117,7 @@ int main(int argc, char ** argv) {
     params.lazy_mode = LLAMA_LAZY_MODE_OFF;
     params.cache_type_k = GGML_TYPE_F32;
     params.cache_type_v = GGML_TYPE_F32;
+    params.no_extra_bufts = true; // Disable weight repacking by default.
     bool batch_size_specified = false;
     bool ubatch_size_specified = false;
     {
