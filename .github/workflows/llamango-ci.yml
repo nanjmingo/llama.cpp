@@ -225,12 +225,20 @@ jobs:
       - build-windows-x64-cpu
       - build-windows-arm64-cpu
     if: always() && needs.prepare-prerelease.result == 'success'
+    runs-on: ubuntu-22.04
     permissions:
       contents: write
-    uses: ./.github/workflows/llamango-test-cpu-results.yml
-    with:
-      release_tag: ${{ needs.prepare-prerelease.outputs.release_tag }}
-      ubuntu_x64_result: ${{ needs.build-ubuntu-x64-cpu.result }}
-      ubuntu_arm64_result: ${{ needs.build-ubuntu-arm64-cpu.result }}
-      windows_x64_result: ${{ needs.build-windows-x64-cpu.result }}
-      windows_arm64_result: ${{ needs.build-windows-arm64-cpu.result }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Aggregate CPU JUnit results and update prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare-prerelease.outputs.release_tag }}
+          UBUNTU_X64_JOB_RESULT: ${{ needs.build-ubuntu-x64-cpu.result }}
+          UBUNTU_ARM64_JOB_RESULT: ${{ needs.build-ubuntu-arm64-cpu.result }}
+          WINDOWS_X64_JOB_RESULT: ${{ needs.build-windows-x64-cpu.result }}
+          WINDOWS_ARM64_JOB_RESULT: ${{ needs.build-windows-arm64-cpu.result }}
+        run: bash .github/scripts/llamango/update-cpu-test-results.sh

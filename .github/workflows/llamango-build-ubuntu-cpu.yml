@@ -75,7 +75,7 @@ jobs:
           echo "$GITHUB_WORKSPACE/.venv-ci/bin" >> "$GITHUB_PATH"
 
       - name: Setup ccache
-        uses: ./.github/actions/llamango-cache-linux
+        uses: ./.github/actions/llamango-ccache-linux
         with:
           cache-key-prefix: ${{ inputs.cache_key_prefix }}
 
@@ -129,7 +129,7 @@ jobs:
 
       - name: Publish Ubuntu CPU package
         if: always() && steps.package.outcome == 'success'
-        uses: ./.github/actions/llamango-release-upload
+        uses: ./.github/actions/llamango-upload-release-asset
         with:
           release-tag: ${{ inputs.release_tag }}
           asset-path: ${{ inputs.asset_name }}
@@ -178,7 +178,7 @@ jobs:
 
       - name: Publish Ubuntu CPU JUnit XML
         if: always() && steps.test.outputs.junit_file != ''
-        uses: ./.github/actions/llamango-release-upload
+        uses: ./.github/actions/llamango-upload-release-asset
         with:
           release-tag: ${{ inputs.release_tag }}
           asset-path: ${{ steps.test.outputs.junit_file }}
@@ -190,7 +190,7 @@ jobs:
     name: Cleanup ccache
     needs: build
     if: ${{ always() && !cancelled() }}
-    uses: ./.github/workflows/llamango-cleanup-cache.yml
+    uses: ./.github/workflows/llamango-cleanup-ccache.yml
     with:
       cache_key_prefix: ${{ inputs.cache_key_prefix }}
     permissions:

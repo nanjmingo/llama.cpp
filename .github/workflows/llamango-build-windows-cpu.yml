@@ -291,7 +291,7 @@ jobs:
 
       - name: Publish Windows CPU package
         if: always() && steps.package.outcome == 'success'
-        uses: ./.github/actions/llamango-release-upload
+        uses: ./.github/actions/llamango-upload-release-asset
         with:
           release-tag: ${{ inputs.release_tag }}
           asset-path: dist/${{ inputs.asset_name }}
@@ -345,7 +345,7 @@ jobs:
 
       - name: Publish Windows CPU JUnit XML
         if: always() && steps.test.outputs.junit_file != ''
-        uses: ./.github/actions/llamango-release-upload
+        uses: ./.github/actions/llamango-upload-release-asset
         with:
           release-tag: ${{ inputs.release_tag }}
           asset-path: ${{ steps.test.outputs.junit_file }}
@@ -357,7 +357,7 @@ jobs:
     name: Cleanup ccache
     needs: build
     if: ${{ always() && !cancelled() }}
-    uses: ./.github/workflows/llamango-cleanup-cache.yml
+    uses: ./.github/workflows/llamango-cleanup-ccache.yml
     with:
       cache_key_prefix: ${{ inputs.cache_key_prefix }}
     permissions:

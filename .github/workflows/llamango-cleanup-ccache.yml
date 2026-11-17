@@ -1,4 +1,4 @@
-name: Cleanup Llamango build cache
+name: Cleanup Llamango ccache
 
 on:
   workflow_call:
