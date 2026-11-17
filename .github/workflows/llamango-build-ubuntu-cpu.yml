@@ -188,7 +188,7 @@ jobs:
           publish-release: 'false'
 
       - name: Cleanup ccache
-        if: always() && !cancelled()
+        if: always() && !cancelled() && steps.build.outcome == 'success'
         uses: ./.github/actions/llamango-ccache-cleanup
         with:
           cache-key-prefix: ${{ inputs.cache_key_prefix }}
