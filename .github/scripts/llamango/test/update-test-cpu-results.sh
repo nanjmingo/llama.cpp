@@ -143,4 +143,3 @@ awk \
 ' release-notes-current.md > release-notes-updated.md
 
 gh release edit "$RELEASE_TAG" --notes-file release-notes-updated.md
-cat release-notes-updated.md

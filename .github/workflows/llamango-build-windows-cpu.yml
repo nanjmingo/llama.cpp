@@ -88,11 +88,8 @@ jobs:
           }
 
           $pythonCheck = @'
-          import platform
-          import sys
           from importlib.metadata import version
 
-          import jinja2
           import numpy
           import safetensors
           import torch
@@ -102,12 +99,6 @@ jobs:
           if 'items' not in Environment().filters:
               raise SystemExit(f'Jinja2 items filter is unavailable (found {jinja_version})')
 
-          print(f'Python: {sys.version}')
-          print(f'Architecture: {platform.machine()}')
-          print(f'Jinja2: {jinja_version}')
-          print(f'NumPy: {numpy.__version__}')
-          print(f'PyTorch: {torch.__version__}')
-          print(f'Safetensors: {safetensors.__version__}')
           '@
           $pythonCheck | python -
           if ($LASTEXITCODE -ne 0) {
@@ -115,7 +106,6 @@ jobs:
           }
 
       - name: Install ccache
-        id: install_ccache
         shell: pwsh
         env:
           TARGET_ARCHITECTURE: ${{ inputs.architecture }}
@@ -157,21 +147,9 @@ jobs:
 
           $ccacheBinDir = Split-Path -Parent $ccacheExe.FullName
           Add-Content -LiteralPath $env:GITHUB_PATH -Value $ccacheBinDir
-          & $ccacheExe.FullName --version
+          & $ccacheExe.FullName --version *> $null
           if ($LASTEXITCODE -ne 0) {
             throw "ccache --version failed with exit code $LASTEXITCODE"
-          }
-
-      - name: Verify ccache is available on PATH
-        id: verify_ccache
-        shell: pwsh
-        run: |
-          $ccache = Get-Command ccache -CommandType Application -ErrorAction Stop |
-            Select-Object -First 1
-          Write-Host "Using ccache: $($ccache.Source)"
-          & $ccache.Source --version
-          if ($LASTEXITCODE -ne 0) {
-            exit $LASTEXITCODE
           }
 
       - name: Initialize ccache
@@ -219,24 +197,19 @@ jobs:
           $targetArchitecture = $buildTarget.VsArchitecture
           $targetTriple = $buildTarget.Triple
 
-          # The selected GitHub-hosted VS2026 images install Enterprise at this path.
           $vsInstallPath = Join-Path $env:ProgramFiles 'Microsoft Visual Studio/18/Enterprise'
           $vsDevCmd = Join-Path $vsInstallPath 'Common7/Tools/VsDevCmd.bat'
           if (-not (Test-Path -LiteralPath $vsDevCmd -PathType Leaf)) {
             throw "VsDevCmd.bat was not found: $vsDevCmd"
           }
 
-          # clang-cl uses the MSVC command-line ABI and needs the VS headers,
-          # libraries, linker, and Windows SDK environment initialized in-process.
           $buildScript = Join-Path $env:RUNNER_TEMP 'llamango-build-windows-cpu.cmd'
           @"
           @echo off
           call "$vsDevCmd" -no_logo -arch=$targetArchitecture -host_arch=amd64
           if errorlevel 1 exit /b %errorlevel%
-          where clang-cl
+          where clang-cl >nul
           if errorlevel 1 exit /b 1
-          clang-cl --version
-          if errorlevel 1 exit /b %errorlevel%
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -DCMAKE_C_COMPILER=clang-cl ^
             -DCMAKE_CXX_COMPILER=clang-cl ^
@@ -341,7 +314,6 @@ jobs:
           ARCH: ${{ inputs.architecture }}
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
-          $logPath = Join-Path $env:GITHUB_WORKSPACE "ctest-windows-$env:ARCH.log"
           $junitFileName = "test-$env:RELEASE_TAG-windows-$env:ARCH-cpu.xml"
           $junitPath = Join-Path $env:GITHUB_WORKSPACE $junitFileName
           $ctestHelp = (& ctest --help 2>&1 | Out-String)
@@ -359,14 +331,13 @@ jobs:
 
           $testOutput = & ctest @ctestArgs 2>&1
           $testStatus = $LASTEXITCODE
-          $testOutput | Tee-Object -FilePath $logPath
+          $testOutput
           if (Test-Path -LiteralPath $junitPath -PathType Leaf) {
             "junit_file=$junitFileName" | Add-Content -Path $env:GITHUB_OUTPUT
           } else {
             Write-Warning "CTest did not produce JUnit XML: $junitPath"
           }
 
-          "exit_code=$testStatus" | Add-Content -Path $env:GITHUB_OUTPUT
 
           if ($testStatus -ne 0) {
             exit $testStatus

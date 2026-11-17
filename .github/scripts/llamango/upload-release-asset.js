@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 
-module.exports = async ({ github, core }) => {
+module.exports = async ({ github }) => {
     const [owner, repo] = process.env.REPOSITORY.split('/');
     if (!owner || !repo) {
         throw new Error(`Invalid repository name: ${process.env.REPOSITORY}`);
@@ -69,6 +69,4 @@ module.exports = async ({ github, core }) => {
             prerelease: true,
         });
     }
-
-    core.info(`Uploaded ${assetName} to ${releaseTag}.`);
 };

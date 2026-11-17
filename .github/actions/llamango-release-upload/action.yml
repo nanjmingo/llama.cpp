@@ -35,4 +35,4 @@ runs:
         retries: 3
         script: |
           const uploadReleaseAsset = require('./.github/scripts/llamango/upload-release-asset.js');
-          await uploadReleaseAsset({ github, core });
+          await uploadReleaseAsset({ github });

@@ -74,9 +74,7 @@ jobs:
 
           EOF_NOTES
 
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            echo "Reusing existing release: $RELEASE_TAG"
-          else
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             if ! gh release create "$RELEASE_TAG" \
               --target "$GITHUB_SHA" \
               --title "$RELEASE_TITLE" \
@@ -84,12 +82,10 @@ jobs:
               --draft \
               --prerelease \
               --latest=false; then
-              # Another run may have created the release after the initial lookup.
               if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
                 echo "::error::Failed to create or find release: $RELEASE_TAG"
                 exit 1
               fi
-              echo "Reusing release created by another run: $RELEASE_TAG"
             fi
           fi
 

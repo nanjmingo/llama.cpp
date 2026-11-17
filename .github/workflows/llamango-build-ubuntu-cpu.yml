@@ -70,10 +70,6 @@ jobs:
           if 'items' not in Environment().filters:
               raise SystemExit(f'Jinja2 items filter is unavailable (found {jinja_version})')
 
-          print(f'Jinja2: {jinja_version}')
-          print(f'NumPy: {numpy.__version__}')
-          print(f'PyTorch: {torch.__version__}')
-          print(f'Safetensors: {safetensors.__version__}')
           PYTHON
 
           echo "$GITHUB_WORKSPACE/.venv-ci/bin" >> "$GITHUB_PATH"
@@ -168,8 +164,8 @@ jobs:
           else
             echo "::warning::CTest does not support --output-junit (requires CTest 3.21 or newer); JUnit XML will not be published."
           fi
-          ctest "${ctest_args[@]}" 2>&1 | tee ctest.log
-          test_status=${PIPESTATUS[0]}
+          ctest "${ctest_args[@]}"
+          test_status=$?
           set -e
 
           if [[ -s "$junit_file" ]]; then
@@ -178,7 +174,6 @@ jobs:
             echo "::warning::CTest did not produce JUnit XML: $junit_file"
           fi
 
-          printf 'exit_code=%s\n' "$test_status" >> "$GITHUB_OUTPUT"
           exit "$test_status"
 
       - name: Publish Ubuntu CPU JUnit XML

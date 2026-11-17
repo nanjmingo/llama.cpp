@@ -66,20 +66,14 @@ jobs:
             );
 
             const staleCaches = caches.slice(keepCount);
-            core.info(
-              `${prefix} (${ref}): found ${caches.length}, keeping ${Math.min(caches.length, keepCount)}, deleting ${staleCaches.length}.`,
-            );
-
             for (const cache of staleCaches) {
               try {
                 await github.request(
                   "DELETE /repos/{owner}/{repo}/actions/caches/{cache_id}",
                   { owner, repo, cache_id: cache.id },
                 );
-                core.info(`Deleted cache ${cache.id}: ${cache.key}`);
               } catch (error) {
                 if (error.status === 404) {
-                  core.info(`Cache ${cache.id} was already removed.`);
                   continue;
                 }
                 throw error;
