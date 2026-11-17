@@ -144,6 +144,10 @@ struct llama_context {
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
+    void set_lora_dropout(float probability, uint64_t seed, uint64_t counter = 0);
+    uint64_t get_lora_dropout_seed() const { return lora_dropout_seed; }
+    uint64_t get_lora_dropout_counter() const { return lora_dropout_counter; }
+
     bool set_adapter_cvec(
             const float * data,
                  size_t   len,
@@ -358,6 +362,10 @@ private:
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
+
+    float lora_dropout = 0.0f;
+    uint64_t lora_dropout_seed = 0;
+    mutable uint64_t lora_dropout_counter = 0;
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 

@@ -23,6 +23,7 @@
 #include <array>
 #include <cstring>
 #include <numeric>
+#include <random>
 #include <sstream>
 #include <string>
 #include <unordered_set>
@@ -134,6 +135,40 @@ static llm_attn_mask build_attn_inp_attn_mask(
 }
 
 // impl
+
+void llm_graph_input_dropout::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+
+    const float scale = 1.0f / (1.0f - probability);
+    std::mt19937_64 rng(seed);
+    std::bernoulli_distribution keep(1.0 - static_cast<double>(probability));
+    const size_t n = static_cast<size_t>(ggml_nelements(tensor));
+
+    if (tensor->type == GGML_TYPE_F32) {
+        std::vector<float> values(n);
+        for (float & value : values) {
+            value = keep(rng) ? scale : 0.0f;
+        }
+        ggml_backend_tensor_set(tensor, values.data(), 0, ggml_nbytes(tensor));
+    } else if (tensor->type == GGML_TYPE_F16) {
+        const ggml_fp16_t kept = ggml_fp32_to_fp16(scale);
+        std::vector<ggml_fp16_t> values(n);
+        for (ggml_fp16_t & value : values) {
+            value = keep(rng) ? kept : 0;
+        }
+        ggml_backend_tensor_set(tensor, values.data(), 0, ggml_nbytes(tensor));
+    } else if (tensor->type == GGML_TYPE_BF16) {
+        const ggml_bf16_t kept = ggml_fp32_to_bf16(scale);
+        const ggml_bf16_t dropped = ggml_fp32_to_bf16(0.0f);
+        std::vector<ggml_bf16_t> values(n);
+        for (ggml_bf16_t & value : values) {
+            value = keep(rng) ? kept : dropped;
+        }
+        ggml_backend_tensor_set(tensor, values.data(), 0, ggml_nbytes(tensor));
+    } else {
+        GGML_ABORT("unsupported LoRA dropout input type: %s", ggml_type_name(tensor->type));
+    }
+}
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
@@ -1651,6 +1686,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     hparams          (params.hparams),
     cparams          (params.cparams),
     training_graph   (params.training_graph),
+    lora_dropout     (params.lora_dropout),
+    lora_dropout_seed(params.lora_dropout_seed),
     ubatch           (params.ubatch),
     n_embd           (hparams.n_embd),
     n_layer          (hparams.n_layer()),
@@ -1743,6 +1780,22 @@ ggml_tensor * llm_graph_context::build_hadamard_input(
     return x;
 }
 
+ggml_tensor * llm_graph_context::build_lora_dropout(ggml_tensor * cur, bool per_token) const {
+    if (!training_graph || lora_dropout == 0.0f) {
+        return cur;
+    }
+
+    GGML_ASSERT(cur->type == GGML_TYPE_F32 || cur->type == GGML_TYPE_F16 || cur->type == GGML_TYPE_BF16);
+    ggml_tensor * mask = per_token
+        ? ggml_new_tensor_2d(ctx0, cur->type, 1, cur->ne[1])
+        : ggml_new_tensor(ctx0, cur->type, ggml_n_dims(cur), cur->ne);
+    ggml_set_input(mask);
+    res->add_input(std::make_unique<llm_graph_input_dropout>(
+        mask, lora_dropout, lora_dropout_seed + 0x9e3779b97f4a7c15ULL * lora_dropout_mask_index++));
+
+    return ggml_mul(ctx0, cur, mask);
+}
+
 static ggml_tensor * build_rope_impl(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * pos, const llama_hparams & hparams, const llama_rope_params & rp) {
     if (rp.n_rot == 0) {
         return cur;
@@ -1814,7 +1867,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         const float adapter_scale = lora.second;
         const float scale = lw->get_scale(lora.first->alpha, adapter_scale);
 
-        ggml_tensor * lora_a_cur = ggml_mul_mat(ctx0, lw->a, cur);
+        ggml_tensor * lora_a_cur = ggml_mul_mat(ctx0, lw->a, build_lora_dropout(cur));
         llama_prec_policy_apply_matmul(prec_policy, lora_a_cur);
         ggml_tensor * ab_cur = ggml_mul_mat(ctx0, lw->b, lora_a_cur);
         llama_prec_policy_apply_matmul(prec_policy, ab_cur);
@@ -1902,7 +1955,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         const float rank  = (float) lw->b->ne[0];
         const float scale = alpha ? lora.second * alpha / rank : lora.second;
 
-        ggml_tensor * lora_a_cur = ggml_mul_mat_id(ctx0, lw->a, cur, ids);
+        ggml_tensor * lora_a_cur = ggml_mul_mat_id(ctx0, lw->a, build_lora_dropout(cur), ids);
         llama_prec_policy_apply_matmul(prec_policy, lora_a_cur);
         ggml_tensor * ab_cur = ggml_mul_mat_id(ctx0, lw->b, lora_a_cur, ids);
         llama_prec_policy_apply_matmul(prec_policy, ab_cur);
@@ -2848,9 +2901,11 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
             const float adapter_scale = lora.second;
             const float scale = lw->get_scale(lora.first->alpha, adapter_scale);
 
+            ggml_tensor * lora_a_cur = ggml_get_rows(ctx0, lw->a, ids);
+            lora_a_cur = build_lora_dropout(lora_a_cur, true);
             ggml_tensor * inpL_delta = ggml_scale(ctx0, ggml_mul_mat(
                         ctx0, lw->b, // non-transposed lora_b
-                        ggml_get_rows(ctx0, lw->a, ids)
+                        lora_a_cur
                         ), scale);
 
             cur = ggml_add(ctx0, cur, inpL_delta);

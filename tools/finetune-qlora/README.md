@@ -89,6 +89,9 @@ Train a LoRA adapter with context size 512:
 |---|---|---|
 | `--lora-rank` | `16` | LoRA rank $r$. |
 | `--lora-alpha` | `0` (= rank) | LoRA scaling factor $\alpha$. Effective scale is $\alpha / r$. |
+| `--lora-dropout` | `0` | Element-wise dropout probability applied to each LoRA input before the A projection during training; must be in `[0, 1)`. Disabled during evaluation and inference. |
+
+LoRA dropout uses inverted dropout masks. Non-zero values add one mask tensor per adapted projection to the training graph, increasing memory use with the number of LoRA targets and context length. Set the value to `0` to retain the original memory use and behavior.
 | `--lora-type` | `f32` | Storage type for trainable LoRA A/B tensors: `f32`, `f16`, or `bf16`. |
 | `--lora-targets` | (standard targets) | Comma-separated internal GGUF tensor-name components. Missing boundary periods are added automatically. |
 | `--freeze-layers` | `0` | Skip LoRA adapters on the first N layers (`blk.0` ... `blk.N-1`). |
