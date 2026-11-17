@@ -26,6 +26,7 @@ runs:
     - name: Upload asset and publish prerelease
       uses: actions/github-script@v9
       env:
+        ACTION_PATH: ${{ github.action_path }}
         RELEASE_TAG: ${{ inputs.release-tag }}
         ASSET_PATH: ${{ inputs.asset-path }}
         REPOSITORY: ${{ inputs.repository }}
@@ -34,5 +35,5 @@ runs:
         github-token: ${{ inputs.token }}
         retries: 3
         script: |
-          const uploadReleaseAsset = require('./.github/scripts/llamango/upload-release-asset.js');
+          const uploadReleaseAsset = require(`${process.env.ACTION_PATH}/upload-release-asset.js`);
           await uploadReleaseAsset({ github });

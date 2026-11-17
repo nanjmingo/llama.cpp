@@ -233,12 +233,12 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Aggregate CPU JUnit results and update prerelease
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ needs.prepare-prerelease.outputs.release_tag }}
-          UBUNTU_X64_JOB_RESULT: ${{ needs.build-ubuntu-x64-cpu.result }}
-          UBUNTU_ARM64_JOB_RESULT: ${{ needs.build-ubuntu-arm64-cpu.result }}
-          WINDOWS_X64_JOB_RESULT: ${{ needs.build-windows-x64-cpu.result }}
-          WINDOWS_ARM64_JOB_RESULT: ${{ needs.build-windows-arm64-cpu.result }}
-        run: bash .github/scripts/llamango/update-cpu-test-results.sh
+        uses: ./.github/actions/llamango-update-cpu-test-results
+        with:
+          release-tag: ${{ needs.prepare-prerelease.outputs.release_tag }}
+          repository: ${{ github.repository }}
+          token: ${{ github.token }}
+          ubuntu-x64-job-result: ${{ needs.build-ubuntu-x64-cpu.result }}
+          ubuntu-arm64-job-result: ${{ needs.build-ubuntu-arm64-cpu.result }}
+          windows-x64-job-result: ${{ needs.build-windows-x64-cpu.result }}
+          windows-arm64-job-result: ${{ needs.build-windows-arm64-cpu.result }}
