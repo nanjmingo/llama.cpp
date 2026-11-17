@@ -6979,22 +6979,15 @@ static bool ggml_backend_cuda_device_supports_op_impl(ggml_backend_dev_t dev, co
             const ggml_tensor * pars = op->src[4];
             if (!x || !g || !m || !v || !pars || op->type != x->type ||
                 (x->type != GGML_TYPE_F32 && x->type != GGML_TYPE_F16 &&
-                 x->type != GGML_TYPE_BF16 && x->type != GGML_TYPE_Q8_0) ||
+                 x->type != GGML_TYPE_BF16) ||
                 g->type != GGML_TYPE_F32 || m->type != v->type ||
                 (m->type != GGML_TYPE_F32 && m->type != GGML_TYPE_F16 &&
-                 m->type != GGML_TYPE_BF16 && m->type != GGML_TYPE_Q8_0) ||
+                 m->type != GGML_TYPE_BF16) ||
                 pars->type != GGML_TYPE_F32 || ggml_nelements(pars) != 7 ||
                 !ggml_are_same_shape(x, g) || !ggml_is_contiguous(x) ||
                 !ggml_is_contiguous(g) || !ggml_is_contiguous(m) ||
                 !ggml_is_contiguous(v) || !ggml_is_contiguous(pars)) {
                 return false;
-            }
-            if (x->type == GGML_TYPE_Q8_0 && ggml_nelements(x) % ggml_blck_size(GGML_TYPE_Q8_0) != 0) {
-                return false;
-            }
-            if (m->type == GGML_TYPE_Q8_0) {
-                const int64_t padded = GGML_PAD(ggml_nelements(x), ggml_blck_size(GGML_TYPE_Q8_0));
-                return ggml_nelements(m) == padded && ggml_nelements(v) == padded;
             }
             return ggml_are_same_shape(x, m) && ggml_are_same_shape(x, v);
         }
