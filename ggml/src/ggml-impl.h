@@ -114,6 +114,8 @@ GGML_API void ggml_rope_yarn_corr_dims(
 
 GGML_API bool ggml_rope_get_truncate(const struct ggml_tensor * a);
 
+GGML_API int64_t ggml_flash_attn_back_offset(const struct ggml_tensor * back, int part);
+
 //
 // logging
 //
