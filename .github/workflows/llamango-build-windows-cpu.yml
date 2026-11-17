@@ -228,6 +228,7 @@ jobs:
             -DLLAMA_FATAL_WARNINGS=OFF ^
             -DLLAMA_BUILD_BORINGSSL=ON ^
             -DGGML_NATIVE=OFF ^
+            -DGGML_OPENMP=ON ^
             -DGGML_CPU=ON ^
             -DGGML_CUDA=OFF
           if errorlevel 1 exit /b %errorlevel%
