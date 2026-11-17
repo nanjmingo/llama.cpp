@@ -56,7 +56,7 @@ Keep these invariants in mind when editing the initialization sequence:
 2. **`params.warmup = false`**:
    Inference warmup is disabled during initialization.
 3. **`params.no_alloc_kv_cache = true`**:
-   Tells the runtime not to allocate KV cache buffers for layers that compute self-attention directly within the window. Shared-KV layers still allocate the cache buffers they require.
+   Tells the runtime not to allocate KV cache buffers for layers that compute self-attention directly within the window. Shared-KV contexts still allocate cache buffers for non-training paths; Gemma 4 full-context training bypasses them with direct K/V tensor routing.
 4. **Parameter Tagging (`PARAM`)**:
    Trainable adapter tensors are marked `PARAM` using `ggml_set_param()` on tensors loaded by `llama_adapter_lora_init()`, **not** on temporary scratch buffers.
 5. **Initialization Order**:
@@ -94,7 +94,7 @@ The backend scheduler must be instantiated with `sched_size` before `ggml_opt_in
 | File | Purpose / Change |
 |---|---|
 | `ggml/src/ggml.c` | Backward support for 3D `GET_ROWS_BACK`, `MUL_MAT_ID`, and `FLASH_ATTN_EXT` (with attention sinks). |
-| `src/llama-context.cpp` | Preserves unrounded context capacity for full-context training; sizes scheduler before `ggml_opt_init`; warns on Shared-KV source targets; manages gradient accumulation groups. |
+| `src/llama-context.cpp` | Preserves unrounded context capacity for full-context training; sizes scheduler before `ggml_opt_init`; warns on unsupported Shared-KV source targets; manages gradient accumulation groups. |
 | `src/llama-adapter.cpp` | Adds repack-buffer fallback for LoRA tensors (tries device-native buffer before CPU). |
 | `common/common.h`, `common/common.cpp` | Adds `no_alloc_kv_cache` to context params. |
 | `tools/finetune-qlora/args.cpp` | Local CLI parser for QLoRA-specific parameters. |

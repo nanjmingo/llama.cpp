@@ -23,7 +23,7 @@ QLoRA bypasses this 256-token rounding when all of the following conditions are 
 
 When these conditions hold:
 - **Requested context size is exact:** A context of `900` creates a 900-token graph, not 1024.
-- **KV data buffers are omitted:** For standard models, forward passes read the input window directly; KV buffers are not allocated. (Shared-KV models still allocate their required cache).
+- **KV data buffers are omitted:** For standard models, forward passes read the input window directly; KV buffers are not allocated. Shared-KV contexts still allocate cache buffers for non-training paths, although Gemma 4 full-context training bypasses the cache and routes K/V tensors directly.
 
 > [!TIP]
 > Always query effective runtime values using `llama_n_ctx()`, `llama_n_batch()`, and `llama_n_ubatch()` rather than assuming they match the raw CLI parameters.

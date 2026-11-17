@@ -1,46 +1,15 @@
-# Shared-KV Attention and Incomplete QLoRA Gradients
+# Shared-KV Attention Gradient Support
 
-## Summary
+## Gemma 4 Full-Context Training
 
-In models with Shared-KV attention (such as Gemma 3N and Gemma 4 prefix layers), consumer layers reuse key/value states computed by an earlier layer via the KV cache.
+Gemma 4 consumer layers reuse key/value states computed by an earlier layer. During full-context training, the graph retains each KV-producing layer's normalized and position-encoded K/V tensors and connects consumer attention directly to the source tensors.
 
-Because `GGML_OP_SET_ROWS` lacks a backward implementation, **gradients from consumer layers do not propagate back to the original K/V projection adapters**.
+This avoids writing K/V through `GGML_OP_SET_ROWS` and reading them back through the KV cache. The resulting graph contains normal tensor dependencies from every consumer to the source K/V projections, so autodiff accumulates gradients from all consumers at the source. The backend scheduler handles dependencies between tensors assigned to different devices; no host-side tensor copy or device-specific routing is needed.
 
----
+This path is enabled only when `cparams.training` is true, which requires the full sequence to fit in the training microbatch. QLoRA enforces this by requiring `-ub` to equal `-c`. Inference continues to use the existing KV-cache path.
 
-## Technical Cause: Disconnected Backward Graph
+## Remaining Limitation
 
-```text
-Producer Layer:
-  [Tokens] --> [attn_k / attn_v] --> k_cur, v_cur
-                                           |
-                                           v (Cached via GGML_OP_SET_ROWS)
-                                     [ KV Cache ]   <-- NO BACKWARD PATH
-                                           |
-Consumer Layer:                            v (Read via ggml_view_4d)
-  [Attention] <--------------------- k_view, v_view
-```
+`GGML_OP_SET_ROWS` still has no backward implementation. Shared-KV models that use the cache-backed training path therefore do not propagate consumer-layer gradients to the original K/V projection adapters. This remains the case for Gemma 3N and for Gemma 4 training where the full sequence does not fit in one microbatch.
 
-1. **Forward Path:** The producer layer computes `k_cur` and `v_cur`, which are written into the KV cache using `GGML_OP_SET_ROWS`. The consumer layer reads those states through `ggml_view_4d()`.
-2. **Backward Path:** `GGML_OP_SET_ROWS` has no backward operator. The autodiff graph terminates at the KV cache buffer.
-3. **Consequence:** Gradients from the consumer layer cannot reach the producer's `attn_k` and `attn_v` adapters. Those adapters only receive gradients from the producer layer's own self-attention.
-
-> [!NOTE]
-> Setting `-ub == -c` (full-context training) does **not** bypass this issue. Shared-KV models still allocate and route through KV cache buffers.
-
----
-
-## Current Mitigation: Runtime Warning
-
-In `src/llama-context.cpp`, the trainer inspects model architecture and active LoRA targets.
-
-If a trainable adapter targets `attn_k` or `attn_v` on a known Shared-KV model (e.g. Gemma 3N or Gemma 4):
-- The trainer logs a warning explaining that gradients will be incomplete.
-- Training is allowed to continue, but the resulting adapter weights may be sub-optimal on affected layers.
-
----
-
-## Recommendations for Contributors
-
-- **Target selection:** When fine-tuning Shared-KV models, consider excluding `attn_k` and `attn_v` from `--lora-targets` (e.g. train `attn_q,attn_output,ffn_gate,ffn_up,ffn_down`).
-- **Graph improvements:** To properly support end-to-end autodiff through Shared-KV, `GGML_OP_SET_ROWS` backward or an explicit direct tensor-routing graph (without intermediate cache mutation) must be implemented.
+The runtime warning is retained for these unsupported configurations. It is suppressed for Gemma 4 full-context training, where the direct tensor-routing path is used.

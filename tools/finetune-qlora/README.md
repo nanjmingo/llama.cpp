@@ -299,7 +299,7 @@ The output file shows token counts, target token counts, and target ranges (e.g.
 
 | Area | Limitation | Workaround / Detail |
 |---|---|---|
-| **Shared-KV Attention** | Consumer layers read KV cache via `SET_ROWS`, which lacks a backward path. Gradients do not flow back to source K/V projections. | A warning is logged on Gemma 3N / Gemma 4 prefix configurations. Avoid targeting `attn_k`/`attn_v` on affected shared layers. |
+| **Shared-KV Attention** | Gemma 4 full-context training routes shared K/V tensors directly between layers, preserving gradients to the source projections. Gemma 3N and non-full-context Gemma 4 training still use the KV cache path, which has no backward path through `SET_ROWS`. | QLoRA uses full-context microbatches (`-ub` equal to `-c`), so Gemma 4 shared K/V gradients are supported. A warning remains for unsupported shared-KV configurations. |
 | **SSM / Mamba** | `SSM_CONV` and `SSM_SCAN` do not have backward implementations. | Gradients stop at SSM layers. Upstream `ssm_in` cannot receive gradients; downstream `ssm_out` works. |
 | **GLU Variants** | Backward supports `SWIGLU` and `GEGLU` splits. Other GLU variants are not supported. | Standard models (Llama, Mistral, Qwen) use supported SwiGLU. |
 | **MTP / NextN** | Multi-Token Prediction heads are not optimized. | MTP prediction layers are skipped during training and kept frozen in output adapters. |

@@ -4205,7 +4205,10 @@ static void llama_set_param(struct ggml_tensor * tensor, llama_opt_param_filter 
     ggml_set_param(tensor);
 }
 
-static void llama_warn_shared_kv_lora_gradients(const llama_model & model, const llama_adapter_loras * loras) {
+static void llama_warn_shared_kv_lora_gradients(
+        const llama_model & model,
+        const llama_adapter_loras * loras,
+        bool full_context_training) {
     if (!loras || loras->empty()) {
         return;
     }
@@ -4214,7 +4217,8 @@ static void llama_warn_shared_kv_lora_gradients(const llama_model & model, const
     const uint32_t n_layers = std::min<uint32_t>(hparams.n_layer(), static_cast<uint32_t>(model.layers.size()));
     std::vector<uint32_t> shared_kv_consumers(n_layers, 0);
 
-    const bool has_prefix_shared_kv = model.arch == LLM_ARCH_GEMMA3N || model.arch == LLM_ARCH_GEMMA4;
+    const bool has_prefix_shared_kv = model.arch == LLM_ARCH_GEMMA3N ||
+        (model.arch == LLM_ARCH_GEMMA4 && !full_context_training);
     const int32_t n_layer_kv_from_start = hparams.n_layer_kv_from_start;
 
     for (uint32_t il = 0; il < n_layers; ++il) {
@@ -4363,7 +4367,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
         }
     }
 
-    llama_warn_shared_kv_lora_gradients(*model, loras.get());
+    llama_warn_shared_kv_lora_gradients(*model, loras.get(), cparams.training);
 }
 
 size_t llama_context::opt_state_size() const {
