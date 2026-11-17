@@ -184,7 +184,7 @@ jobs:
             'CCACHE_MAXSIZE=1G'
             "CCACHE_BASEDIR=$env:GITHUB_WORKSPACE"
             'CCACHE_COMPILERCHECK=content'
-            'CCACHE_COMPILERTYPE=msvc'
+            'CCACHE_COMPILERTYPE=clang-cl'
           ) | ForEach-Object { Add-Content -Path $env:GITHUB_ENV -Value $_ }
 
       - name: Restore ccache
@@ -201,11 +201,23 @@ jobs:
         env:
           TARGET_ARCHITECTURE: ${{ inputs.architecture }}
         run: |
-          $targetArchitecture = switch ($env:TARGET_ARCHITECTURE) {
-            'x64'   { 'amd64' }
-            'arm64' { 'arm64' }
+          $buildTarget = switch ($env:TARGET_ARCHITECTURE) {
+            'x64' {
+              [pscustomobject]@{
+                VsArchitecture = 'amd64'
+                Triple = 'x86_64-pc-windows-msvc'
+              }
+            }
+            'arm64' {
+              [pscustomobject]@{
+                VsArchitecture = 'arm64'
+                Triple = 'aarch64-pc-windows-msvc'
+              }
+            }
             default { throw "Unsupported Windows architecture: $env:TARGET_ARCHITECTURE" }
           }
+          $targetArchitecture = $buildTarget.VsArchitecture
+          $targetTriple = $buildTarget.Triple
 
           # The selected GitHub-hosted VS2026 images install Enterprise at this path.
           $vsInstallPath = Join-Path $env:ProgramFiles 'Microsoft Visual Studio/18/Enterprise'
@@ -214,15 +226,22 @@ jobs:
             throw "VsDevCmd.bat was not found: $vsDevCmd"
           }
 
-          # Ninja needs the MSVC compiler environment initialized in the same process.
+          # clang-cl uses the MSVC command-line ABI and needs the VS headers,
+          # libraries, linker, and Windows SDK environment initialized in-process.
           $buildScript = Join-Path $env:RUNNER_TEMP 'llamango-build-windows-cpu.cmd'
           @"
           @echo off
           call "$vsDevCmd" -no_logo -arch=$targetArchitecture -host_arch=amd64
           if errorlevel 1 exit /b %errorlevel%
+          where clang-cl
+          if errorlevel 1 exit /b 1
+          clang-cl --version
+          if errorlevel 1 exit /b %errorlevel%
           cmake -S . -B build -G "Ninja Multi-Config" ^
-            -DCMAKE_C_COMPILER=cl ^
-            -DCMAKE_CXX_COMPILER=cl ^
+            -DCMAKE_C_COMPILER=clang-cl ^
+            -DCMAKE_CXX_COMPILER=clang-cl ^
+            -DCMAKE_C_COMPILER_TARGET=$targetTriple ^
+            -DCMAKE_CXX_COMPILER_TARGET=$targetTriple ^
             -DCMAKE_C_COMPILER_LAUNCHER=ccache ^
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache ^
             -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded ^
@@ -236,7 +255,6 @@ jobs:
             -DLLAMA_FATAL_WARNINGS=OFF ^
             -DLLAMA_BUILD_BORINGSSL=ON ^
             -DGGML_NATIVE=OFF ^
-            -DGGML_OPENMP=OFF ^
             -DGGML_CPU=ON ^
             -DGGML_CUDA=OFF
           if errorlevel 1 exit /b %errorlevel%
@@ -285,7 +303,7 @@ jobs:
             "Backend: CPU"
             "Build scope: all default CMake targets"
             "Build type: Release"
-            "MSVC runtime: static (/MT)"
+            "C/C++ compiler: Clang (clang-cl)"
             "Executables included: $($executables.Count)"
             "Runtime DLLs included: $($runtimeDlls.Count)"
           ) | Set-Content -Path (Join-Path $stageDir "BUILD_INFO.txt") -Encoding utf8
