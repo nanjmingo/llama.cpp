@@ -10,9 +10,11 @@
 
 #include "common.h"
 #include "ggml-opt.h"
+#include "../../src/llama-context.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cinttypes>
 #include <cstdint>
 #include <cstdio>
 #include <exception>
@@ -178,6 +180,26 @@ bool train_adapter(const qlora_params & qparams,
         }
         schedule.step = resume->scheduler_step;
     }
+    uint64_t dropout_seed = params.sampling.seed;
+    uint64_t dropout_counter = 0;
+    if (resume && resume->metadata.contains("lora_dropout_seed") &&
+        resume->metadata.contains("lora_dropout_counter")) {
+        dropout_seed = resume->metadata.at("lora_dropout_seed").get<uint64_t>();
+        dropout_counter = resume->metadata.at("lora_dropout_counter").get<uint64_t>();
+    } else if (qparams.lora_dropout > 0.0f && dropout_seed == LLAMA_DEFAULT_SEED) {
+        try {
+            dropout_seed = std::random_device{}();
+        } catch (const std::exception & ex) {
+            LOG_ERR("%s: failed to generate a LoRA dropout seed: %s\n", __func__, ex.what());
+            return false;
+        }
+    }
+    ctx->set_lora_dropout(qparams.lora_dropout, dropout_seed, dropout_counter);
+    if (qparams.lora_dropout > 0.0f) {
+        LOG_INF("%s: LoRA dropout=%.6g seed=%" PRIu64 " counter=%" PRIu64 "\n",
+                __func__, qparams.lora_dropout, dropout_seed, dropout_counter);
+    }
+
     llama_opt_init(ctx, model, opt_params);
     llama_opt_set_activation_checkpointing(ctx, qparams.activation_checkpointing);
     llama_opt_set_opt_period(ctx, qparams.gradient_accumulation_steps);
