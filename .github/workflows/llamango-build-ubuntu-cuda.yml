@@ -135,3 +135,13 @@ jobs:
         with:
           path: .ccache
           key: ${{ inputs.cache_key_prefix }}-${{ github.run_id }}
+
+  cleanup-cache:
+    name: Cleanup ccache
+    needs: build
+    if: ${{ always() && !cancelled() }}
+    uses: ./.github/workflows/llamango-cleanup-cache.yml
+    with:
+      cache_key_prefix: ${{ inputs.cache_key_prefix }}
+    permissions:
+      actions: write
