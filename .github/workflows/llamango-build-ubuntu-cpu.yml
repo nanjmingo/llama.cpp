@@ -38,6 +38,7 @@ jobs:
     name: CPU
     runs-on: ${{ inputs.runner }}
     permissions:
+      actions: write
       contents: write
     steps:
       - name: Checkout
@@ -186,12 +187,8 @@ jobs:
           repository: ${{ github.repository }}
           publish-release: 'false'
 
-  cleanup-cache:
-    name: Cleanup ccache
-    needs: build
-    if: ${{ always() && !cancelled() }}
-    uses: ./.github/workflows/llamango-cleanup-ccache.yml
-    with:
-      cache_key_prefix: ${{ inputs.cache_key_prefix }}
-    permissions:
-      actions: write
+      - name: Cleanup ccache
+        if: always() && !cancelled()
+        uses: ./.github/actions/llamango-ccache-cleanup
+        with:
+          cache-key-prefix: ${{ inputs.cache_key_prefix }}
