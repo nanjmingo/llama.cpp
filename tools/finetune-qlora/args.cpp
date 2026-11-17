@@ -141,6 +141,7 @@ const std::vector<qlora_arg> & get_qlora_arg_defs() {
             "Comma-separated tensor-name components; periods are added at missing target boundaries",
             [](qlora_params & params, const std::string & value) {
                 params.lora_targets = value;
+                params.lora_targets_specified = true;
             }
         ));
         add_opt(qlora_arg(

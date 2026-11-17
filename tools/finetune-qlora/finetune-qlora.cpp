@@ -103,6 +103,49 @@ bool has_option(const std::vector<std::string> & args, std::initializer_list<con
     return false;
 }
 
+bool model_has_lora_target(const std::vector<std::pair<std::string, ggml_tensor *>> & model_tensors,
+                           const std::string & target,
+                           int32_t freeze_layers,
+                           int32_t model_n_layer) {
+    const std::vector<std::string> targets = { target };
+    return std::any_of(model_tensors.begin(), model_tensors.end(), [&](const auto & entry) {
+        const ggml_tensor * tensor = entry.second;
+        return tensor && ggml_n_dims(tensor) >= 2 && tensor->ne[3] == 1 &&
+            lora_tensor_matches_targets(entry.first, targets, freeze_layers, model_n_layer);
+    });
+}
+
+std::vector<std::string> resolve_lora_targets(
+        const qlora_params & qparams,
+        const std::vector<std::pair<std::string, ggml_tensor *>> & model_tensors,
+        int32_t model_n_layer) {
+    std::vector<std::string> targets = string_split(qparams.lora_targets, ",");
+    if (qparams.lora_targets_specified) {
+        return targets;
+    }
+
+    targets.erase(std::remove_if(targets.begin(), targets.end(), [&](const std::string & target) {
+        return !model_has_lora_target(model_tensors, target, qparams.freeze_layers, model_n_layer);
+    }), targets.end());
+
+    const bool has_linear_attn_qkv =
+        model_has_lora_target(model_tensors, "attn_qkv", qparams.freeze_layers, model_n_layer) ||
+        model_has_lora_target(model_tensors, "attn_qkv_gate", qparams.freeze_layers, model_n_layer);
+    const std::vector<std::string> optional_targets = {
+        "attn_qkv", "attn_qkv_gate", "attn_gate", "ssm_alpha", "ssm_beta", "ssm_beta_alpha", "ssm_out",
+    };
+    for (const std::string & target : optional_targets) {
+        if (target.compare(0, 4, "ssm_") == 0 && !has_linear_attn_qkv) {
+            continue;
+        }
+        if (model_has_lora_target(model_tensors, target, qparams.freeze_layers, model_n_layer) &&
+                std::find(targets.begin(), targets.end(), target) == targets.end()) {
+            targets.push_back(target);
+        }
+    }
+    return targets;
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -305,7 +348,20 @@ int main(int argc, char ** argv) {
         if (temporary_adapter_file.path.empty()) {
             return 1;
         }
-        const std::vector<std::string> targets = string_split(qparams.lora_targets, ",");
+        const std::vector<std::string> targets = resolve_lora_targets(
+            qparams, model->tensors_by_name, llama_model_n_layer(model));
+        if (targets.empty()) {
+            LOG_ERR("%s: no supported default LoRA targets are present in the model\n", __func__);
+            return 1;
+        }
+        if (!qparams.lora_targets_specified) {
+            std::ostringstream target_list;
+            for (size_t i = 0; i < targets.size(); ++i) {
+                if (i > 0) target_list << ',';
+                target_list << targets[i];
+            }
+            LOG_INF("%s: resolved default LoRA targets: %s\n", __func__, target_list.str().c_str());
+        }
         const enum ggml_type lora_type = qlora_type_from_name(qparams.lora_type);
         std::mt19937 rng(42);
         lora_tensors prepared;

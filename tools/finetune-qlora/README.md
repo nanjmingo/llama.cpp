@@ -191,7 +191,7 @@ By default, `--lora-targets` trains:
 | `ffn_up` | Feed-Forward | Up projection (dense models) |
 | `ffn_down` | Feed-Forward | Down projection (dense models) |
 
-Fused tensors such as `ffn_gate_up` must be selected explicitly with `--lora-targets ffn_gate_up`; `ffn_gate` and `ffn_up` do not match the fused component.
+The default target resolver removes unavailable standard targets and adds supported fused or linear-attention projections when the model contains them. This includes `attn_qkv`, `attn_qkv_gate`, `attn_gate`, `ssm_alpha`, `ssm_beta`, `ssm_beta_alpha`, and `ssm_out`, enabling the Qwen3.5 attention and gated-delta projections without requiring a model-specific command line. Other fused tensors such as `ffn_gate_up` must still be selected explicitly with `--lora-targets ffn_gate_up`; `ffn_gate` and `ffn_up` do not match the fused component.
 
 ### Mixture of Experts (MoE) Targets
 
@@ -300,7 +300,7 @@ The output file shows token counts, target token counts, and target ranges (e.g.
 | Area | Limitation | Workaround / Detail |
 |---|---|---|
 | **Shared-KV Attention** | Consumer layers read KV cache via `SET_ROWS`, which lacks a backward path. Gradients do not flow back to source K/V projections. | A warning is logged on Gemma 3N / Gemma 4 prefix configurations. Avoid targeting `attn_k`/`attn_v` on affected shared layers. |
-| **SSM / Mamba** | `SSM_CONV` and `SSM_SCAN` do not have backward implementations. | Gradients stop at SSM layers. Upstream `ssm_in` cannot receive gradients; downstream `ssm_out` works. |
+| **SSM / Mamba** | `SSM_CONV` has a backward implementation; `SSM_SCAN` does not. | Qwen3.5 gated-delta projections can receive gradients through the `CONCAT` and `SSM_CONV` backward paths. Models whose path includes `SSM_SCAN` still have a gradient boundary at that operator. |
 | **GLU Variants** | Backward supports `SWIGLU` and `GEGLU` splits. Other GLU variants are not supported. | Standard models (Llama, Mistral, Qwen) use supported SwiGLU. |
 | **MTP / NextN** | Multi-Token Prediction heads are not optimized. | MTP prediction layers are skipped during training and kept frozen in output adapters. |
 | **Activation Memory** | Each training window is processed as a complete graph. | Cannot split a window into smaller microbatches. If out of memory, reduce context size `-c`. |

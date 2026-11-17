@@ -7462,6 +7462,60 @@ static void ggml_compute_backward(
                 } //break;
             }
         } break;
+        case GGML_OP_CONCAT: {
+            const int32_t dim = ggml_get_op_params_i32(tensor, 0);
+            struct ggml_tensor * grad_cont = ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad);
+            if (src0_needs_grads) {
+                struct ggml_tensor * grad_src0 = ggml_view_4d(ctx, grad_cont,
+                        src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                        grad_cont->nb[1], grad_cont->nb[2], grad_cont->nb[3], 0);
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_cont(ctx, grad_src0));
+            }
+            if (src1_needs_grads) {
+                const size_t offset = src0->ne[dim] * grad_cont->nb[dim];
+                struct ggml_tensor * grad_src1 = ggml_view_4d(ctx, grad_cont,
+                        src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+                        grad_cont->nb[1], grad_cont->nb[2], grad_cont->nb[3], offset);
+                ggml_add_or_set(ctx, cgraph, isrc1, ggml_cont(ctx, grad_src1));
+            }
+        } break;
+        case GGML_OP_SSM_CONV: {
+            const int64_t kernel_size = src1->ne[0];
+            const int64_t channels    = src1->ne[1];
+            const int64_t n_tokens    = tensor->ne[1];
+            const int64_t n_seqs      = tensor->ne[2];
+            struct ggml_tensor * grad_cont = ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad);
+
+            if (src0_needs_grads) {
+                struct ggml_tensor * grad_t = ggml_cont(ctx, ggml_permute(ctx, grad_cont, 1, 0, 2, 3));
+                struct ggml_tensor * grad_src0 = NULL;
+                for (int64_t k = 0; k < kernel_size; ++k) {
+                    struct ggml_tensor * kernel = ggml_cont(ctx,
+                            ggml_view_2d(ctx, src1, 1, channels, src1->nb[1], k * src1->nb[0]));
+                    struct ggml_tensor * term = ggml_pad_ext(ctx, ggml_mul(ctx, grad_t, kernel),
+                            (int) k, (int) (kernel_size - 1 - k), 0, 0, 0, 0, 0, 0);
+                    grad_src0 = grad_src0 ? ggml_add(ctx, grad_src0, term) : term;
+                }
+                ggml_add_or_set(ctx, cgraph, isrc0, grad_src0);
+            }
+
+            if (src1_needs_grads) {
+                struct ggml_tensor * grad_4d = ggml_reshape_4d(ctx, grad_cont, 1, channels, n_tokens, n_seqs);
+                struct ggml_tensor * grad_repeated = ggml_repeat_4d(ctx, grad_4d,
+                        kernel_size, channels, n_tokens, n_seqs);
+                struct ggml_tensor * patches = ggml_im2col(ctx, src1, src0,
+                        1, 0, 0, 0, 1, 0, false, GGML_TYPE_F32);
+                patches = ggml_reshape_4d(ctx, patches, kernel_size, channels, n_tokens, n_seqs);
+
+                struct ggml_tensor * grad_src1 = ggml_mul(ctx, patches, grad_repeated);
+                grad_src1 = ggml_permute(ctx, grad_src1, 2, 3, 0, 1);
+                grad_src1 = ggml_cont(ctx, grad_src1);
+                grad_src1 = ggml_reshape_2d(ctx, grad_src1, n_tokens * n_seqs, kernel_size * channels);
+                grad_src1 = ggml_sum_rows(ctx, grad_src1);
+                grad_src1 = ggml_reshape_2d(ctx, grad_src1, kernel_size, channels);
+                ggml_add_or_set(ctx, cgraph, isrc1, grad_src1);
+            }
+        } break;
         case GGML_OP_GATED_DELTA_NET: {
             struct ggml_tensor * srcs[6] = {
                 tensor->src[0], tensor->src[1], tensor->src[2],
@@ -7684,7 +7738,6 @@ void ggml_build_backward_expand(
                 ignore_src[1] = true;
                 break;
 
-            case GGML_OP_SSM_CONV:
             case GGML_OP_SSM_SCAN:
                 ignore_src[0] = true;
                 ignore_src[1] = true;
