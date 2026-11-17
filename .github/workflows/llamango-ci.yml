@@ -1,0 +1,244 @@
+name: Llamango CI & Prerelease
+
+run-name: CI | ${{ github.event.head_commit.timestamp }} | ${{ github.ref_name }}
+
+on:
+  push:
+    branches:
+      - '**'
+
+permissions:
+  contents: read
+
+jobs:
+  prepare-prerelease:
+    name: Prepare prerelease
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    outputs:
+      release_tag: ${{ steps.metadata.outputs.release_tag }}
+      ubuntu_x64_cpu_asset_name: ${{ steps.metadata.outputs.ubuntu_x64_cpu_asset_name }}
+      ubuntu_arm64_cpu_asset_name: ${{ steps.metadata.outputs.ubuntu_arm64_cpu_asset_name }}
+      windows_x64_cpu_asset_name: ${{ steps.metadata.outputs.windows_x64_cpu_asset_name }}
+      windows_arm64_cpu_asset_name: ${{ steps.metadata.outputs.windows_arm64_cpu_asset_name }}
+      ubuntu_x64_cuda_13_0_asset_name: ${{ steps.metadata.outputs.ubuntu_x64_cuda_13_0_asset_name }}
+      ubuntu_x64_cuda_12_8_asset_name: ${{ steps.metadata.outputs.ubuntu_x64_cuda_12_8_asset_name }}
+      skip_ubuntu_x64_cpu_build: ${{ steps.metadata.outputs.skip_ubuntu_x64_cpu_build }}
+      skip_ubuntu_arm64_cpu_build: ${{ steps.metadata.outputs.skip_ubuntu_arm64_cpu_build }}
+      skip_windows_x64_cpu_build: ${{ steps.metadata.outputs.skip_windows_x64_cpu_build }}
+      skip_windows_arm64_cpu_build: ${{ steps.metadata.outputs.skip_windows_arm64_cpu_build }}
+      skip_ubuntu_x64_cuda_13_0_build: ${{ steps.metadata.outputs.skip_ubuntu_x64_cuda_13_0_build }}
+      skip_ubuntu_x64_cuda_12_8_build: ${{ steps.metadata.outputs.skip_ubuntu_x64_cuda_12_8_build }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Prepare release metadata and create draft release
+        id: metadata
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          BRANCH_SLUG="$(printf '%s' "$GITHUB_REF_NAME" | sed -E 's/[^A-Za-z0-9._-]+/-/g; s/^-+//; s/-+$//' | cut -c1-80)"
+          if [[ -z "$BRANCH_SLUG" ]]; then
+            BRANCH_SLUG="branch"
+          fi
+
+          COMMIT_DATE="$(git show -s --format=%cI "$GITHUB_SHA")"
+          COMMIT_TIMESTAMP="$(date -u --date="$COMMIT_DATE" '+%Y-%m-%d-%H%M')"
+          COMMIT_DATE_UTC="$(date -u --date="$COMMIT_DATE" '+%Y-%m-%dT%H:%M:%SZ')"
+          RELEASE_BASE="${COMMIT_TIMESTAMP}-${BRANCH_SLUG}"
+          RELEASE_TAG="$RELEASE_BASE"
+
+          UBUNTU_X64_CPU_ASSET_NAME="${RELEASE_BASE}-ubuntu-x64-cpu.tar.gz"
+          UBUNTU_ARM64_CPU_ASSET_NAME="${RELEASE_BASE}-ubuntu-arm64-cpu.tar.gz"
+          WINDOWS_X64_CPU_ASSET_NAME="${RELEASE_BASE}-windows-x64-cpu.zip"
+          WINDOWS_ARM64_CPU_ASSET_NAME="${RELEASE_BASE}-windows-arm64-cpu.zip"
+          UBUNTU_X64_CUDA_13_0_ASSET_NAME="${RELEASE_BASE}-ubuntu-x64-cuda-13.0.tar.gz"
+          UBUNTU_X64_CUDA_12_8_ASSET_NAME="${RELEASE_BASE}-ubuntu-x64-cuda-12.8.tar.gz"
+
+          RELEASE_TITLE="$RELEASE_TAG"
+
+          cat > release-notes.md <<EOF_NOTES
+          Commit: ${GITHUB_SHA}
+          Commit date: ${COMMIT_DATE_UTC}
+
+          Ubuntu x64 CPU: Pending
+          Ubuntu ARM64 CPU: Pending
+          Windows x64 CPU: Pending
+          Windows ARM64 CPU: Pending
+
+          EOF_NOTES
+
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            if ! gh release create "$RELEASE_TAG" \
+              --target "$GITHUB_SHA" \
+              --title "$RELEASE_TITLE" \
+              --notes-file release-notes.md \
+              --draft \
+              --prerelease \
+              --latest=false; then
+              if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+                echo "::error::Failed to create or find release: $RELEASE_TAG"
+                exit 1
+              fi
+            fi
+          fi
+
+          RELEASE_ASSET_NAMES="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')"
+          asset_exists() {
+            grep -Fqx -- "$1" <<< "$RELEASE_ASSET_NAMES"
+          }
+          should_skip_build() {
+            if asset_exists "$1"; then
+              printf 'true'
+            else
+              printf 'false'
+            fi
+          }
+
+          SKIP_UBUNTU_X64_CPU_BUILD="$(should_skip_build "$UBUNTU_X64_CPU_ASSET_NAME")"
+          SKIP_UBUNTU_ARM64_CPU_BUILD="$(should_skip_build "$UBUNTU_ARM64_CPU_ASSET_NAME")"
+          SKIP_WINDOWS_X64_CPU_BUILD="$(should_skip_build "$WINDOWS_X64_CPU_ASSET_NAME")"
+          SKIP_WINDOWS_ARM64_CPU_BUILD="$(should_skip_build "$WINDOWS_ARM64_CPU_ASSET_NAME")"
+          SKIP_UBUNTU_X64_CUDA_13_0_BUILD="$(should_skip_build "$UBUNTU_X64_CUDA_13_0_ASSET_NAME")"
+          SKIP_UBUNTU_X64_CUDA_12_8_BUILD="$(should_skip_build "$UBUNTU_X64_CUDA_12_8_ASSET_NAME")"
+
+          {
+            echo "release_tag=${RELEASE_TAG}"
+            echo "ubuntu_x64_cpu_asset_name=${UBUNTU_X64_CPU_ASSET_NAME}"
+            echo "ubuntu_arm64_cpu_asset_name=${UBUNTU_ARM64_CPU_ASSET_NAME}"
+            echo "windows_x64_cpu_asset_name=${WINDOWS_X64_CPU_ASSET_NAME}"
+            echo "windows_arm64_cpu_asset_name=${WINDOWS_ARM64_CPU_ASSET_NAME}"
+            echo "ubuntu_x64_cuda_13_0_asset_name=${UBUNTU_X64_CUDA_13_0_ASSET_NAME}"
+            echo "ubuntu_x64_cuda_12_8_asset_name=${UBUNTU_X64_CUDA_12_8_ASSET_NAME}"
+            echo "skip_ubuntu_x64_cpu_build=${SKIP_UBUNTU_X64_CPU_BUILD}"
+            echo "skip_ubuntu_arm64_cpu_build=${SKIP_UBUNTU_ARM64_CPU_BUILD}"
+            echo "skip_windows_x64_cpu_build=${SKIP_WINDOWS_X64_CPU_BUILD}"
+            echo "skip_windows_arm64_cpu_build=${SKIP_WINDOWS_ARM64_CPU_BUILD}"
+            echo "skip_ubuntu_x64_cuda_13_0_build=${SKIP_UBUNTU_X64_CUDA_13_0_BUILD}"
+            echo "skip_ubuntu_x64_cuda_12_8_build=${SKIP_UBUNTU_X64_CUDA_12_8_BUILD}"
+          } >> "$GITHUB_OUTPUT"
+
+  build-ubuntu-x64-cpu:
+    permissions:
+      actions: write
+      contents: write
+    name: Ubuntu / x64
+    needs: prepare-prerelease
+    uses: ./.github/workflows/llamango-build-ubuntu-cpu.yml
+    with:
+      runner: ubuntu-22.04
+      architecture: x64
+      cache_key_prefix: llamango-cache-ubuntu-cpu-22.04-x64
+      release_tag: ${{ needs.prepare-prerelease.outputs.release_tag }}
+      asset_name: ${{ needs.prepare-prerelease.outputs.ubuntu_x64_cpu_asset_name }}
+      skip_build: ${{ needs.prepare-prerelease.outputs.skip_ubuntu_x64_cpu_build == 'true' }}
+
+  build-ubuntu-arm64-cpu:
+    permissions:
+      actions: write
+      contents: write
+    name: Ubuntu / ARM64
+    needs: prepare-prerelease
+    uses: ./.github/workflows/llamango-build-ubuntu-cpu.yml
+    with:
+      runner: ubuntu-22.04-arm
+      architecture: arm64
+      cache_key_prefix: llamango-cache-ubuntu-cpu-22.04-arm64
+      release_tag: ${{ needs.prepare-prerelease.outputs.release_tag }}
+      asset_name: ${{ needs.prepare-prerelease.outputs.ubuntu_arm64_cpu_asset_name }}
+      skip_build: ${{ needs.prepare-prerelease.outputs.skip_ubuntu_arm64_cpu_build == 'true' }}
+
+  build-windows-x64-cpu:
+    permissions:
+      actions: write
+      contents: write
+    name: Windows / x64
+    needs: prepare-prerelease
+    uses: ./.github/workflows/llamango-build-windows-cpu.yml
+    with:
+      architecture: x64
+      runner: windows-2025-vs2026
+      cache_key_prefix: llamango-cache-windows-cpu-x64-4.14.2
+      release_tag: ${{ needs.prepare-prerelease.outputs.release_tag }}
+      asset_name: ${{ needs.prepare-prerelease.outputs.windows_x64_cpu_asset_name }}
+      skip_build: ${{ needs.prepare-prerelease.outputs.skip_windows_x64_cpu_build == 'true' }}
+
+  build-windows-arm64-cpu:
+    permissions:
+      actions: write
+      contents: write
+    name: Windows / ARM64
+    needs: prepare-prerelease
+    uses: ./.github/workflows/llamango-build-windows-cpu.yml
+    with:
+      architecture: arm64
+      runner: windows-11-vs2026-arm
+      cache_key_prefix: llamango-cache-windows-cpu-arm64-4.14.2
+      release_tag: ${{ needs.prepare-prerelease.outputs.release_tag }}
+      asset_name: ${{ needs.prepare-prerelease.outputs.windows_arm64_cpu_asset_name }}
+      skip_build: ${{ needs.prepare-prerelease.outputs.skip_windows_arm64_cpu_build == 'true' }}
+
+  build-ubuntu-x64-cuda-13-0:
+    permissions:
+      actions: write
+      contents: write
+    name: Ubuntu / x64 / CUDA 13.0
+    needs: prepare-prerelease
+    uses: ./.github/workflows/llamango-build-ubuntu-cuda.yml
+    with:
+      cuda_version: '13.0.3'
+      cuda_display_version: '13.0'
+      container_image: nvidia/cuda:13.0.3-devel-ubuntu22.04
+      cache_key_prefix: llamango-cache-ubuntu-cuda-13.0.3-22.04
+      asset_name: ${{ needs.prepare-prerelease.outputs.ubuntu_x64_cuda_13_0_asset_name }}
+      skip_build: ${{ needs.prepare-prerelease.outputs.skip_ubuntu_x64_cuda_13_0_build == 'true' }}
+      release_tag: ${{ needs.prepare-prerelease.outputs.release_tag }}
+
+  build-ubuntu-x64-cuda-12-8:
+    permissions:
+      actions: write
+      contents: write
+    name: Ubuntu / x64 / CUDA 12.8
+    needs: prepare-prerelease
+    uses: ./.github/workflows/llamango-build-ubuntu-cuda.yml
+    with:
+      cuda_version: '12.8.2'
+      cuda_display_version: '12.8'
+      container_image: nvidia/cuda:12.8.2-devel-ubuntu22.04
+      cache_key_prefix: llamango-cache-ubuntu-cuda-12.8.2-22.04
+      asset_name: ${{ needs.prepare-prerelease.outputs.ubuntu_x64_cuda_12_8_asset_name }}
+      skip_build: ${{ needs.prepare-prerelease.outputs.skip_ubuntu_x64_cuda_12_8_build == 'true' }}
+      release_tag: ${{ needs.prepare-prerelease.outputs.release_tag }}
+
+  test-cpu-results:
+    name: CPU test results
+    needs:
+      - prepare-prerelease
+      - build-ubuntu-x64-cpu
+      - build-ubuntu-arm64-cpu
+      - build-windows-x64-cpu
+      - build-windows-arm64-cpu
+    if: always() && needs.prepare-prerelease.result == 'success'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Aggregate CPU JUnit results and update prerelease
+        uses: ./.github/actions/llamango-update-cpu-test-results
+        with:
+          release-tag: ${{ needs.prepare-prerelease.outputs.release_tag }}
+          repository: ${{ github.repository }}
+          token: ${{ github.token }}
+          ubuntu-x64-job-result: ${{ needs.build-ubuntu-x64-cpu.result }}
+          ubuntu-arm64-job-result: ${{ needs.build-ubuntu-arm64-cpu.result }}
+          windows-x64-job-result: ${{ needs.build-windows-x64-cpu.result }}
+          windows-arm64-job-result: ${{ needs.build-windows-arm64-cpu.result }}
