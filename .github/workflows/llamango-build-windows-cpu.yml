@@ -229,6 +229,7 @@ jobs:
             -DLLAMA_BUILD_BORINGSSL=ON ^
             -DGGML_NATIVE=OFF ^
             -DGGML_OPENMP=ON ^
+            -DGGML_OPENMP_FETCH=ON ^
             -DGGML_CPU=ON ^
             -DGGML_CUDA=OFF
           if errorlevel 1 exit /b %errorlevel%
@@ -319,7 +320,9 @@ jobs:
           $ctestArgs = @(
             '--test-dir', 'build',
             '-C', 'Release',
+            '-L', 'main',
             '--output-on-failure',
+            '--timeout', '900',
             '--parallel', "$env:NUMBER_OF_PROCESSORS"
           )
           if ($ctestHelp -match '--output-junit') {
@@ -328,9 +331,8 @@ jobs:
             Write-Warning 'CTest does not support --output-junit (requires CTest 3.21 or newer); JUnit XML will not be published.'
           }
 
-          $testOutput = & ctest @ctestArgs 2>&1
+          & ctest @ctestArgs
           $testStatus = $LASTEXITCODE
-          $testOutput
           if (Test-Path -LiteralPath $junitPath -PathType Leaf) {
             "junit_file=$junitFileName" | Add-Content -Path $env:GITHUB_OUTPUT
           } else {

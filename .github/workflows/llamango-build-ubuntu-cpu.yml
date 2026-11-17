@@ -157,7 +157,9 @@ jobs:
           junit_file="$GITHUB_WORKSPACE/test-${RELEASE_TAG}-ubuntu-${ARCHITECTURE}-cpu.xml"
           ctest_args=(
             --test-dir build
+            -L main
             --output-on-failure
+            --timeout 900
             --parallel "$(nproc)"
           )
           if ctest --help 2>&1 | grep -q -- '--output-junit'; then
