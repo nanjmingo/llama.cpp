@@ -131,19 +131,6 @@ protected:
 
 using llm_graph_input_ptr = std::unique_ptr<llm_graph_input_i>;
 
-class llm_graph_input_dropout : public llm_graph_input_i {
-public:
-    llm_graph_input_dropout(ggml_tensor * tensor, float probability, uint64_t seed)
-        : tensor(tensor), probability(probability), seed(seed) {}
-
-    void set_input(const llama_ubatch * ubatch) override;
-
-private:
-    ggml_tensor * tensor;
-    float probability;
-    uint64_t seed;
-};
-
 class llm_graph_input_embd : public llm_graph_input_i {
 public:
     llm_graph_input_embd(int64_t n_embd) : n_embd(n_embd) {}
@@ -809,8 +796,6 @@ struct llm_graph_params {
 
     llm_graph_type gtype;
     bool training_graph = false;
-    float lora_dropout = 0.0f;
-    uint64_t lora_dropout_seed = 0;
 
     ggml_backend_sched_t sched;
     ggml_backend_t backend_cpu;
@@ -929,7 +914,6 @@ struct llm_graph_params {
             model == other.model &&
             gtype == other.gtype &&
             training_graph == other.training_graph &&
-            lora_dropout == other.lora_dropout &&
             cvec  == other.cvec  &&
             loras == other.loras &&
             cross == other.cross;
@@ -1055,9 +1039,6 @@ struct llm_graph_context {
     const llama_hparams & hparams;
     const llama_cparams & cparams;
     const bool training_graph;
-    const float lora_dropout;
-    const uint64_t lora_dropout_seed;
-    mutable uint64_t lora_dropout_mask_index = 0;
     const llama_ubatch  & ubatch;
 
     const int64_t n_embd;
@@ -1145,8 +1126,6 @@ struct llm_graph_context {
     ggml_tensor * build_hadamard_input(
               ggml_tensor * w,
               ggml_tensor * cur) const;
-
-    ggml_tensor * build_lora_dropout(ggml_tensor * cur, bool per_token = false) const;
 
     // do mat_mul, while optionally apply lora and per-tensor scale
     ggml_tensor * build_lora_mm(
