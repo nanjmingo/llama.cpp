@@ -7,19 +7,14 @@
 #include <string>
 #include <vector>
 
-inline constexpr char qlora_default_lora_targets[] =
-    "attn_q,attn_k,attn_v,attn_output,ffn_gate,ffn_up,ffn_down";
-
 struct qlora_params {
     int32_t     lora_rank          = 16;
     float       lora_alpha         = 0.0f;
-    float       lora_dropout       = 0.0f;
     std::string lora_type          = "f32";
     std::string optimizer_state_type = "f32";
     std::string compute_type = "f16";
     ggml_prec compute_precision = GGML_PREC_F16;
-    std::string lora_targets       = qlora_default_lora_targets;
-    bool        lora_targets_specified = false;
+    std::string lora_targets       = "attn_q,attn_k,attn_v,attn_output,ffn_gate,ffn_up,ffn_down";
     std::string output_dir;
     std::string resume_from;
     dataset_options dataset;

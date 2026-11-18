@@ -3,7 +3,6 @@
 #include "checkpoint.h"
 #include "common.h"
 #include "log.h"
-#include "../../src/llama-context.h"
 
 #include <algorithm>
 #include <cmath>
@@ -172,9 +171,6 @@ bool qlora_prepare_save_job(qlora_training_state & state,
                 metadata["architecture"] = *state.arch;
                 metadata["lora_rank"] = state.qparams->lora_rank;
                 metadata["lora_alpha"] = state.lora_alpha;
-                metadata["lora_dropout"] = state.qparams->lora_dropout;
-                metadata["lora_dropout_seed"] = state.ctx->get_lora_dropout_seed();
-                metadata["lora_dropout_counter"] = state.ctx->get_lora_dropout_counter();
                 metadata["lora_targets"] = state.qparams->lora_targets;
                 metadata["freeze_layers"] = state.qparams->freeze_layers;
                 metadata["gradient_accumulation_steps"] = state.qparams->gradient_accumulation_steps;

@@ -22,7 +22,7 @@ This note records the current implementation status and operator-level limitatio
 
 | Operator / Component | Current Status | Impact on Training |
 |---|---|---|
-| **`SSM_SCAN`** | No backward implementation. | Gradients stop at `SSM_SCAN`. `CONCAT` and `SSM_CONV` backward paths are implemented using existing ggml operations, allowing upstream projections such as Qwen3.5 `attn_qkv` to receive gradients. |
+| **`SSM_CONV` / `SSM_SCAN`** | No backward implementation. | Gradients stop at SSM layers. Upstream projections (e.g. `ssm_in`) receive no gradients. Downstream projections (`ssm_out`) work normally. |
 | **`GGML_OP_GLU`** | Backward only supports split `SWIGLU` and `GEGLU`. | Other GLU variants cannot be trained with backward autodiff. (Unary GELU / GELU-quick are supported via standard ops). |
 | **`SET_ROWS`** | No backward path from cache destination to source values. | Cache-backed Shared-KV training remains incomplete for Gemma 3N and non-full-context Gemma 4. Gemma 4 full-context QLoRA bypasses the cache and routes K/V tensors directly. |
 | **MTP / NextN Models** | Training graph optimizes main model only. | Multi-token prediction layers are ignored during training and kept frozen in adapter checkpoints. |

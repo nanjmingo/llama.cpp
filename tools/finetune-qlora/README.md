@@ -89,9 +89,6 @@ Train a LoRA adapter with context size 512:
 |---|---|---|
 | `--lora-rank` | `16` | LoRA rank $r$. |
 | `--lora-alpha` | `0` (= rank) | LoRA scaling factor $\alpha$. Effective scale is $\alpha / r$. |
-| `--lora-dropout` | `0` | Element-wise dropout probability applied to each LoRA input before the A projection during training; must be in `[0, 1)`. Disabled during evaluation and inference. |
-
-LoRA dropout uses inverted dropout masks. Non-zero values add one mask tensor per adapted projection to the training graph, increasing memory use with the number of LoRA targets and context length. Set the value to `0` to retain the original memory use and behavior.
 | `--lora-type` | `f32` | Storage type for trainable LoRA A/B tensors: `f32`, `f16`, or `bf16`. |
 | `--lora-targets` | (standard targets) | Comma-separated internal GGUF tensor-name components. Missing boundary periods are added automatically. |
 | `--freeze-layers` | `0` | Skip LoRA adapters on the first N layers (`blk.0` ... `blk.N-1`). |
@@ -194,7 +191,7 @@ By default, `--lora-targets` trains:
 | `ffn_up` | Feed-Forward | Up projection (dense models) |
 | `ffn_down` | Feed-Forward | Down projection (dense models) |
 
-The default target resolver removes unavailable standard targets and adds supported fused or linear-attention projections when the model contains them. This includes `attn_qkv`, `attn_qkv_gate`, `attn_gate`, `ssm_alpha`, `ssm_beta`, `ssm_beta_alpha`, and `ssm_out`, enabling the Qwen3.5 attention and gated-delta projections without requiring a model-specific command line. Other fused tensors such as `ffn_gate_up` must still be selected explicitly with `--lora-targets ffn_gate_up`; `ffn_gate` and `ffn_up` do not match the fused component.
+Fused tensors such as `ffn_gate_up` must be selected explicitly with `--lora-targets ffn_gate_up`; `ffn_gate` and `ffn_up` do not match the fused component.
 
 ### Mixture of Experts (MoE) Targets
 
@@ -303,7 +300,7 @@ The output file shows token counts, target token counts, and target ranges (e.g.
 | Area | Limitation | Workaround / Detail |
 |---|---|---|
 | **Shared-KV Attention** | Gemma 4 full-context training routes shared K/V tensors directly between layers, preserving gradients to the source projections. Gemma 3N and non-full-context Gemma 4 training still use the KV cache path, which has no backward path through `SET_ROWS`. | QLoRA uses full-context microbatches (`-ub` equal to `-c`), so Gemma 4 shared K/V gradients are supported. A warning remains for unsupported shared-KV configurations. |
-| **SSM / Mamba** | `SSM_CONV` has a backward implementation; `SSM_SCAN` does not. | Qwen3.5 gated-delta projections can receive gradients through the `CONCAT` and `SSM_CONV` backward paths. Models whose path includes `SSM_SCAN` still have a gradient boundary at that operator. |
+| **SSM / Mamba** | `SSM_CONV` and `SSM_SCAN` do not have backward implementations. | Gradients stop at SSM layers. Upstream `ssm_in` cannot receive gradients; downstream `ssm_out` works. |
 | **GLU Variants** | Backward supports `SWIGLU` and `GEGLU` splits. Other GLU variants are not supported. | Standard models (Llama, Mistral, Qwen) use supported SwiGLU. |
 | **MTP / NextN** | Multi-Token Prediction heads are not optimized. | MTP prediction layers are skipped during training and kept frozen in output adapters. |
 | **Activation Memory** | Each training window is processed as a complete graph. | Cannot split a window into smaller microbatches. If out of memory, reduce context size `-c`. |
