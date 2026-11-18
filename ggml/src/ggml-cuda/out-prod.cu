@@ -475,10 +475,8 @@ void ggml_cuda_out_prod_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(ids->type  == GGML_TYPE_I32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
-    const int64_t cols       = src0->ne[0];
     const int64_t n_exp_used = src0->ne[1];
     const int64_t n_tokens   = src0->ne[2];
-    const int64_t rows       = src1->ne[0];
     const int64_t n_expert   = dst->ne[2];
 
     GGML_ASSERT(ids->nb[0] == sizeof(int32_t));
