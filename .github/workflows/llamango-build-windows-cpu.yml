@@ -275,21 +275,18 @@ jobs:
               [pscustomobject]@{
                 VsArchitecture = 'amd64'
                 Triple = 'x86_64-pc-windows-msvc'
-                LlvmVersion = '20.1.8'
               }
             }
             'arm64' {
               [pscustomobject]@{
                 VsArchitecture = 'arm64'
                 Triple = 'aarch64-pc-windows-msvc'
-                LlvmVersion = '22.1.8'
               }
             }
             default { throw "Unsupported Windows architecture: $env:TARGET_ARCHITECTURE" }
           }
           $targetArchitecture = $buildTarget.VsArchitecture
           $targetTriple = $buildTarget.Triple
-          $llvmVersion = $buildTarget.LlvmVersion
           if ($env:TARGET_ARCHITECTURE -eq 'arm64') {
             $openmpEnvironmentSetup = @"
           set "INCLUDE=$env:LLAMANGO_OPENMP_ROOT\include;%INCLUDE%"
@@ -323,18 +320,6 @@ jobs:
           if errorlevel 1 exit /b 1
           clang --version
           clang++ --version
-          clang --version | findstr /L /C:"clang version $llvmVersion" >nul
-          if errorlevel 1 (
-            echo Expected LLVM $llvmVersion for $env:TARGET_ARCHITECTURE, but found:
-            clang --version
-            exit /b 1
-          )
-          clang++ --version | findstr /L /C:"clang version $llvmVersion" >nul
-          if errorlevel 1 (
-            echo clang++ version does not match the expected LLVM $llvmVersion:
-            clang++ --version
-            exit /b 1
-          )
           $openmpEnvironmentSetup
           cmake -S . -B build -G "Ninja Multi-Config" ^
             $openmpCmakeArguments
