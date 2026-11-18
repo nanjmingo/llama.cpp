@@ -188,6 +188,7 @@ bool qlora_prepare_save_job(qlora_training_state & state,
                 metadata["skip_invalid_records"] = state.qparams->dataset.skip_invalid;
                 metadata["lr_scheduler"] = state.qparams->lr_scheduler;
                 metadata["warmup_steps"] = state.qparams->warmup_steps;
+                metadata["warmup_steps_resolved"] = state.schedule->warmup_steps;
                 metadata["learning_rate"] = state.params->lr.lr0;
                 metadata["learning_rate_min"] = state.params->lr.lr_min;
                 metadata["weight_decay"] = state.params->lr.wd;

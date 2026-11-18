@@ -46,6 +46,15 @@ float parse_float(const std::string & value, const char * name) {
     return parsed;
 }
 
+double parse_double(const std::string & value, const char * name) {
+    size_t consumed = 0;
+    const double parsed = std::stod(value, &consumed);
+    if (consumed != value.size() || !std::isfinite(parsed)) {
+        throw std::invalid_argument(std::string("invalid value for ") + name + ": " + value);
+    }
+    return parsed;
+}
+
 std::vector<std::string> break_str_into_lines(const std::string & input, size_t max_chars_per_line) {
     std::vector<std::string> result;
     std::istringstream stream(input);
@@ -248,10 +257,15 @@ const std::vector<qlora_arg> & get_qlora_arg_defs() {
             }
         ));
         add_opt(qlora_arg(
-            {"--warmup-steps"}, "N",
-            "Linear LR warmup steps (default: 0)",
+            {"--warmup-steps"}, "N|RATIO",
+            "Linear LR warmup: integer steps when >= 1, fraction of total optimizer steps when < 1 (default: 0)",
             [](qlora_params & params, const std::string & value) {
-                params.warmup_steps = parse_non_negative_int(value, "--warmup-steps");
+                const double parsed = parse_double(value, "--warmup-steps");
+                if (parsed < 0.0 ||
+                    (parsed >= 1.0 && (parsed > INT32_MAX || std::floor(parsed) != parsed))) {
+                    throw std::invalid_argument("--warmup-steps must be 0, a fraction in (0, 1), or an integer from 1 to INT32_MAX");
+                }
+                params.warmup_steps = parsed;
             }
         ));
         add_opt(qlora_arg(

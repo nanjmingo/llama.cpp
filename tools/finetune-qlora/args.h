@@ -33,7 +33,7 @@ struct qlora_params {
     int32_t     val_windows        = -1;
     int32_t     freeze_layers      = 0;
     std::string lr_scheduler       = "constant";
-    int32_t     warmup_steps       = 0;
+    double      warmup_steps       = 0.0; // [0, 1): ratio of total optimizer steps; >= 1: integer step count
     bool        shuffle_dataset    = true;
 };
 

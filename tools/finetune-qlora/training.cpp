@@ -111,7 +111,7 @@ bool train_adapter(const qlora_params & qparams,
         return false;
     }
 
-    qlora_lr_schedule schedule{ &params.lr, qparams.lr_scheduler, qparams.warmup_steps, 0, 0 };
+    qlora_lr_schedule schedule{ &params.lr, qparams.lr_scheduler, 0, 0, 0 };
     llama_opt_params opt_params{
         0,
         lora_param_filter,
@@ -142,6 +142,9 @@ bool train_adapter(const qlora_params & qparams,
         LOG_ERR("%s: total training step count must be positive\n", __func__);
         return false;
     }
+    schedule.warmup_steps = qparams.warmup_steps < 1.0
+        ? static_cast<int64_t>(std::ceil(qparams.warmup_steps * static_cast<double>(schedule.total_steps)))
+        : static_cast<int64_t>(qparams.warmup_steps);
 
     if (resume) {
         if (!validate_resume_config(*resume, qparams, params, arch, lora_alpha, n_ctx, dataset_windows)) {
@@ -153,14 +156,14 @@ bool train_adapter(const qlora_params & qparams,
             return false;
         }
     }
-    if (qparams.warmup_steps > schedule.total_steps) {
-        LOG_ERR("%s: --warmup-steps %d exceeds total training steps %ld\n", __func__, qparams.warmup_steps,
-                static_cast<long>(schedule.total_steps));
+    if (schedule.warmup_steps > schedule.total_steps) {
+        LOG_ERR("%s: --warmup-steps resolves to %ld, exceeding total training steps %ld\n", __func__,
+                static_cast<long>(schedule.warmup_steps), static_cast<long>(schedule.total_steps));
         return false;
     }
     const float min_lr = std::max(0.0f, params.lr.lr_min);
     if (qparams.lr_scheduler == "linear" && min_lr > 0.0f && min_lr < params.lr.lr0 &&
-        schedule.total_steps <= static_cast<int64_t>(qparams.warmup_steps) + 1) {
+        schedule.total_steps <= schedule.warmup_steps + 1) {
         LOG_ERR("%s: linear scheduler needs at least two optimizer updates after warmup when learning-rate-min is below learning-rate\n",
                 __func__);
         return false;
@@ -273,8 +276,8 @@ bool train_adapter(const qlora_params & qparams,
     if (qparams.val_windows >= 0) {
         LOG_INF("%s: validation window limit=%d (0 disables validation)\n", __func__, qparams.val_windows);
     }
-    LOG_INF("%s: lr scheduler=%s warmup_steps=%d total_steps=%ld lr=%.3g lr_min=%.3g\n",
-            __func__, qparams.lr_scheduler.c_str(), qparams.warmup_steps,
+    LOG_INF("%s: lr scheduler=%s warmup_steps=%ld (requested=%.6g) total_steps=%ld lr=%.3g lr_min=%.3g\n",
+            __func__, qparams.lr_scheduler.c_str(), static_cast<long>(schedule.warmup_steps), qparams.warmup_steps,
             static_cast<long>(schedule.total_steps), static_cast<double>(params.lr.lr0),
             static_cast<double>(std::max(0.0f, params.lr.lr_min)));
     if (qparams.save_snapshot_limit > 0 && qparams.save_snapshot_steps > 0) {
