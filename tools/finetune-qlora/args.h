@@ -13,7 +13,6 @@ inline constexpr char qlora_default_lora_targets[] =
 struct qlora_params {
     int32_t     lora_rank          = 16;
     float       lora_alpha         = 0.0f;
-    float       lora_dropout       = 0.0f;
     std::string lora_type          = "f32";
     std::string optimizer_state_type = "f32";
     std::string compute_type = "f16";

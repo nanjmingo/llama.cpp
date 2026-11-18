@@ -118,16 +118,6 @@ const std::vector<qlora_arg> & get_qlora_arg_defs() {
             }
         ));
         add_opt(qlora_arg(
-            {"--lora-dropout"}, "F",
-            "LoRA input dropout probability in [0, 1) (default: 0)",
-            [](qlora_params & params, const std::string & value) {
-                params.lora_dropout = parse_float(value, "--lora-dropout");
-                if (params.lora_dropout < 0.0f || params.lora_dropout >= 1.0f) {
-                    throw std::invalid_argument("--lora-dropout must be in [0, 1)");
-                }
-            }
-        ));
-        add_opt(qlora_arg(
             {"--lora-type"}, "TYPE",
             "LoRA tensor type: f32, f16, or bf16",
             [](qlora_params & params, const std::string & value) {

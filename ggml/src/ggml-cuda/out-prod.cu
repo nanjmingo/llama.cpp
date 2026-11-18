@@ -251,43 +251,6 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_out_prod_lowp<float>(ctx, dst, CUDA_R_32F);
 }
 
-// The helper is called with tile_width == n_routes. Its tile_spec layout is
-// therefore one optional seam tile at index 0 plus one tail tile per expert
-// at index 1 + expert. Merge those entries into a compact per-expert range.
-static __global__ void out_prod_id_finalize_ranges_kernel(
-        const ggml_cuda_mm_id_tile_spec * tile_spec,
-        ggml_cuda_mm_id_tile_spec * expert_ranges,
-        int32_t * max_expert_tokens,
-        const int n_experts) {
-    const int expert = blockIdx.x * blockDim.x + threadIdx.x;
-    if (expert >= n_experts) {
-        return;
-    }
-
-    const ggml_cuda_mm_id_tile_spec tail = tile_spec[1 + expert];
-    const ggml_cuda_mm_id_tile_spec seam = tile_spec[0];
-    int32_t route_begin = 0x7fffffff;
-    int32_t route_end = 0;
-    bool found = false;
-    if (tail.expert == expert) {
-        route_begin = tail.col_low;
-        route_end = tail.col_high;
-        found = true;
-    }
-    if (seam.expert == expert) {
-        route_begin = found ? min(route_begin, seam.col_low) : seam.col_low;
-        route_end = found ? max(route_end, seam.col_high) : seam.col_high;
-        found = true;
-    }
-    if (!found) {
-        route_begin = 0;
-        route_end = 0;
-    }
-
-    expert_ranges[expert] = { expert, route_begin, route_end, 0 };
-    atomicMax(max_expert_tokens, route_end - route_begin);
-}
-
 template<typename src_t, typename lowp_t>
 static __global__ void out_prod_id_gather_batched_kernel(
         const src_t * src, lowp_t * dst,
@@ -541,12 +504,9 @@ void ggml_cuda_out_prod_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         static_cast<size_t>(n_expert));
     ggml_cuda_pool_alloc<int32_t> max_expert_tokens_device(ctx.pool(), 1);
     CUDA_CHECK(cudaMemsetAsync(max_expert_tokens_device.ptr, 0, sizeof(int32_t), stream));
-    constexpr int range_threads = 256;
-    const int range_blocks = (static_cast<int>(n_expert) + range_threads - 1) / range_threads;
-    out_prod_id_finalize_ranges_kernel<<<range_blocks, range_threads, 0, stream>>>(
+    ggml_cuda_finalize_mm_ids_ranges(
         tile_spec.ptr, expert_ranges.ptr, max_expert_tokens_device.ptr,
-        static_cast<int>(n_expert));
-    CUDA_CHECK(cudaGetLastError());
+        static_cast<int>(n_expert), stream);
 
     int32_t max_expert_tokens_host = 0;
     CUDA_CHECK(cudaMemcpyAsync(&max_expert_tokens_host, max_expert_tokens_device.ptr,

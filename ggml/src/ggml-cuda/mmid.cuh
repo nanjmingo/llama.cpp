@@ -15,4 +15,11 @@ void ggml_cuda_launch_mm_ids_helper(
         const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int tile_width,
         const int si1, const int sis1, const bool write_inverse, cudaStream_t stream);
 
+void ggml_cuda_finalize_mm_ids_ranges(
+        const ggml_cuda_mm_id_tile_spec * tile_spec,
+        ggml_cuda_mm_id_tile_spec * expert_ranges,
+        int32_t * max_expert_routes,
+        const int n_experts,
+        cudaStream_t stream);
+
 void ggml_cuda_mul_mat_id_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

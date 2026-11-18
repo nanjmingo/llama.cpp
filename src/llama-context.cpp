@@ -1766,13 +1766,6 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     return true;
 }
 
-void llama_context::set_lora_dropout(float probability, uint64_t seed, uint64_t counter) {
-    GGML_ASSERT(std::isfinite(probability) && probability >= 0.0f && probability < 1.0f);
-    lora_dropout = probability;
-    lora_dropout_seed = seed;
-    lora_dropout_counter = counter;
-}
-
 void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
     LLAMA_LOG_DEBUG("%s: adapters = %p\n", __func__, (void *) adapters);
 
@@ -3099,10 +3092,6 @@ llm_graph_params llama_context::graph_params(
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype,
                                   bool     training_graph) const {
-    const uint64_t dropout_seed = training_graph && lora_dropout > 0.0f
-        ? lora_dropout_seed + lora_dropout_counter++
-        : 0;
-
     return {
         /*.model       =*/ &model,
         /*.hparams     =*/ model.hparams,
@@ -3110,8 +3099,6 @@ llm_graph_params llama_context::graph_params(
         /*.ubatch      =*/ ubatch,
         /*.gtype       =*/ gtype,
          training_graph,
-        /*.lora_dropout      =*/ lora_dropout,
-        /*.lora_dropout_seed =*/ dropout_seed,
         /*.sched       =*/ sched.get(),
         /*.backend_cpu =*/ backend_cpu,
         /*.cvec        =*/ cvec.get(),
@@ -4504,7 +4491,7 @@ bool llama_context::opt_epoch_iter(
 
             auto * res = get_gf_res_prev();
 
-            const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type), train);
+            const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type), true);
 
             // the optimizer graph is allocated outside sched, so the next decode must rebuild
             gf_res_prev_active = nullptr;
