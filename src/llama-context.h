@@ -144,7 +144,7 @@ struct llama_context {
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
-    void set_lora_dropout(float probability, uint64_t seed, uint64_t counter = 0);
+    LLAMA_API void set_lora_dropout(float probability, uint64_t seed, uint64_t counter = 0);
     uint64_t get_lora_dropout_seed() const { return lora_dropout_seed; }
     uint64_t get_lora_dropout_counter() const { return lora_dropout_counter; }
 
