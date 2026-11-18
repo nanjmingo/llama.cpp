@@ -1,10 +1,11 @@
 #include "out-prod.cuh"
 #include "convert.cuh"
 #include "f16-scale.cuh"
+#include "mmid.cuh"
 
 #include <algorithm>
 #include <cstdint>
-#include <cstring>
+#include <limits>
 #include <type_traits>
 #include <vector>
 
@@ -253,8 +254,8 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
 template<typename src_t, typename lowp_t>
 static __global__ void out_prod_id_gather_kernel(
-        const src_t * src, lowp_t * dst, const int64_t * token_indices,
-        const int64_t n_cols, const int64_t n_tokens,
+        const src_t * src, lowp_t * dst, const int32_t * route_indices,
+        const int64_t n_cols, const int64_t n_expert_used,
         const int64_t stride_exp, const int64_t stride_tok,
         const int64_t n_elements, const float * scale) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -264,16 +265,18 @@ static __global__ void out_prod_id_gather_kernel(
 
     const int64_t token_i = i / n_cols;
     const int64_t col     = i % n_cols;
-    const int64_t flat    = token_indices[token_i];
-    const int64_t expert_slot = flat / n_tokens;
-    const int64_t token       = flat % n_tokens;
+    const int64_t flat    = route_indices[token_i];
+    const int64_t expert_slot = flat % n_expert_used;
+    const int64_t token       = flat / n_expert_used;
     const src_t value = src[expert_slot * stride_exp + token * stride_tok + col];
 
     if constexpr (std::is_same_v<src_t, float>) {
         if constexpr (std::is_same_v<lowp_t, half>) {
             dst[i] = __float2half_rn(value * (scale == nullptr ? 1.0f : *scale));
-        } else {
+        } else if constexpr (std::is_same_v<lowp_t, nv_bfloat16>) {
             dst[i] = __float2bfloat16(value);
+        } else {
+            dst[i] = value;
         }
     } else {
         // Convert directly when the source is already stored in a low-precision type.
@@ -285,10 +288,11 @@ template<typename src0_t, typename lowp_t>
 static void ggml_cuda_out_prod_id_lowp_impl(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
-        const std::vector<std::vector<int64_t>> & expert_tokens,
+        const int32_t * route_indices, const std::vector<int32_t> & expert_offsets,
+        const size_t max_expert_tokens,
         const cudaDataType_t data_type, const float * scale) {
     const int64_t cols     = src0->ne[0];
-    const int64_t n_tokens = src0->ne[2];
+    const int64_t n_exp_used = src0->ne[1];
     const int64_t rows     = src1->ne[0];
 
     const int64_t src0_type_size = ggml_type_size(src0->type);
@@ -298,10 +302,6 @@ static void ggml_cuda_out_prod_id_lowp_impl(
     const int64_t b_stride_tok = src1->nb[2] / sizeof(float);
     const int64_t dst_stride_e = dst->nb[2] / sizeof(float);
 
-    size_t max_expert_tokens = 0;
-    for (const auto & tokens : expert_tokens) {
-        max_expert_tokens = std::max(max_expert_tokens, tokens.size());
-    }
     if (max_expert_tokens == 0) {
         return;
     }
@@ -309,14 +309,12 @@ static void ggml_cuda_out_prod_id_lowp_impl(
     // Bound the two low-precision gather buffers and the device-side index list.
     constexpr size_t workspace_max = 64ull * 1024 * 1024;
     const size_t bytes_per_token = sizeof(lowp_t) *
-        (static_cast<size_t>(cols) + static_cast<size_t>(rows)) + sizeof(int64_t);
+        (static_cast<size_t>(cols) + static_cast<size_t>(rows));
     const size_t tile_capacity = std::max<size_t>(1,
         std::min(max_expert_tokens, workspace_max / bytes_per_token));
 
     ggml_cuda_pool_alloc<lowp_t> a_gathered(ctx.pool(), static_cast<size_t>(cols) * tile_capacity);
     ggml_cuda_pool_alloc<lowp_t> b_gathered(ctx.pool(), static_cast<size_t>(rows) * tile_capacity);
-    ggml_cuda_pool_alloc<int64_t> token_indices(ctx.pool(), tile_capacity);
-
     cudaStream_t stream = ctx.stream();
     cublasHandle_t handle = ctx.cublas_handle();
     CUBLAS_CHECK(cublasSetStream(handle, stream));
@@ -333,26 +331,24 @@ static void ggml_cuda_out_prod_id_lowp_impl(
     const float * b_base = (const float *) src1->data;
     float * d_base = (float *) dst->data;
 
-    for (size_t e = 0; e < expert_tokens.size(); ++e) {
-        const auto & tokens = expert_tokens[e];
+    for (size_t e = 0; e + 1 < expert_offsets.size(); ++e) {
+        const size_t route_begin = static_cast<size_t>(expert_offsets[e]);
+        const size_t expert_routes = static_cast<size_t>(expert_offsets[e + 1] - expert_offsets[e]);
         const int64_t dst_offset = static_cast<int64_t>(e) * dst_stride_e;
 
-        for (size_t token_begin = 0; token_begin < tokens.size(); token_begin += tile_capacity) {
+        for (size_t token_begin = 0; token_begin < expert_routes; token_begin += tile_capacity) {
             const int64_t tile_ntoks = static_cast<int64_t>(
-                std::min(tile_capacity, tokens.size() - token_begin));
+                std::min(tile_capacity, expert_routes - token_begin));
             const int64_t a_count = cols * tile_ntoks;
             const int64_t b_count = rows * tile_ntoks;
 
-            CUDA_CHECK(cudaMemcpyAsync(token_indices.ptr, tokens.data() + token_begin,
-                static_cast<size_t>(tile_ntoks) * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
-
             out_prod_id_gather_kernel<src0_t, lowp_t><<<
                 (a_count + threads - 1) / threads, threads, 0, stream>>>(
-                    a_base, a_gathered.ptr, token_indices.ptr, cols, n_tokens,
+                    a_base, a_gathered.ptr, route_indices + route_begin + token_begin, cols, n_exp_used,
                     a_stride_exp, a_stride_tok, a_count, nullptr);
             out_prod_id_gather_kernel<float, lowp_t><<<
                 (b_count + threads - 1) / threads, threads, 0, stream>>>(
-                    b_base, b_gathered.ptr, token_indices.ptr, rows, n_tokens,
+                    b_base, b_gathered.ptr, route_indices + route_begin + token_begin, rows, n_exp_used,
                     b_stride_exp, b_stride_tok, b_count, scale);
             CUDA_CHECK(cudaGetLastError());
 
@@ -374,13 +370,16 @@ template<typename lowp_t>
 static void ggml_cuda_out_prod_id_lowp(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
-        const std::vector<std::vector<int64_t>> & expert_tokens,
+        const int32_t * route_indices, const std::vector<int32_t> & expert_offsets,
+        const size_t max_expert_tokens,
         const cudaDataType_t data_type, const float * scale) {
     if (src0->type == GGML_TYPE_F16) {
-        ggml_cuda_out_prod_id_lowp_impl<half, lowp_t>(ctx, src0, src1, dst, expert_tokens, data_type, scale);
+        ggml_cuda_out_prod_id_lowp_impl<half, lowp_t>(
+            ctx, src0, src1, dst, route_indices, expert_offsets, max_expert_tokens, data_type, scale);
     } else {
         GGML_ASSERT(src0->type == GGML_TYPE_F32);
-        ggml_cuda_out_prod_id_lowp_impl<float, lowp_t>(ctx, src0, src1, dst, expert_tokens, data_type, scale);
+        ggml_cuda_out_prod_id_lowp_impl<float, lowp_t>(
+            ctx, src0, src1, dst, route_indices, expert_offsets, max_expert_tokens, data_type, scale);
     }
 }
 
@@ -400,32 +399,98 @@ void ggml_cuda_out_prod_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t rows       = src1->ne[0];
     const int64_t n_expert   = dst->ne[2];
 
+    GGML_ASSERT(ids->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(ids->nb[1] % sizeof(int32_t) == 0);
+    GGML_ASSERT(ids->ne[0] == n_exp_used && ids->ne[1] == n_tokens);
+    GGML_ASSERT(src1->ne[1] == n_exp_used && src1->ne[2] == n_tokens);
+    GGML_ASSERT(n_exp_used >= 0 && n_tokens >= 0);
+    GGML_ASSERT(n_exp_used == 0 || n_tokens <= std::numeric_limits<int64_t>::max() / n_exp_used);
+    const int64_t n_routes = n_exp_used * n_tokens;
+    GGML_ASSERT(n_routes <= std::numeric_limits<int32_t>::max());
+    GGML_ASSERT(n_expert > 0 && n_expert <= std::numeric_limits<int>::max());
+    GGML_ASSERT(n_tokens < (1 << 22) && n_exp_used < (1 << 10));
+    GGML_ASSERT(ids->nb[1] / sizeof(int32_t) <= std::numeric_limits<int>::max());
+
     cudaStream_t   stream = ctx.stream();
     cublasHandle_t handle = ctx.cublas_handle();
     CUBLAS_CHECK(cublasSetStream(handle, stream));
 
     CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
 
-    const size_t ids_nbytes = ggml_nbytes(ids);
-    std::vector<char> ids_host(ids_nbytes);
-    if (ids->buffer && !ggml_backend_buffer_is_host(ids->buffer)) {
-        CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ids_nbytes, cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-    } else {
-        memcpy(ids_host.data(), ids->data, ids_nbytes);
+    if (n_routes == 0) {
+        return;
     }
 
-    std::vector<std::vector<int64_t>> expert_tokens(n_expert);
-    for (int64_t itok = 0; itok < n_tokens; ++itok) {
-        for (int64_t iexp = 0; iexp < n_exp_used; ++iexp) {
-            const int32_t eid = *(const int32_t *)(ids_host.data()
-                + itok * ids->nb[1] + iexp * ids->nb[0]);
-            if (eid == -1) {
+    // Reuse the same GPU-side route grouping used by MUL_MAT_ID_BACK.
+    // route_indices contains flattened (expert-slot, token) pairs sorted by
+    // expert, while tile_spec describes each expert's contiguous range.
+    ggml_cuda_pool_alloc<int32_t> ids_device(ctx.pool());
+    const bool ids_on_device = ids->buffer && !ggml_backend_buffer_is_host(ids->buffer);
+    const int32_t * ids_ptr = (const int32_t *) ids->data;
+    if (!ids_on_device) {
+        ids_device.alloc(ggml_nbytes(ids) / sizeof(int32_t));
+        CUDA_CHECK(cudaMemcpyAsync(ids_device.ptr, ids->data, ggml_nbytes(ids),
+            cudaMemcpyHostToDevice, stream));
+        ids_ptr = ids_device.ptr;
+    }
+
+    ggml_cuda_pool_alloc<int32_t> route_indices(ctx.pool(), static_cast<size_t>(n_routes));
+    ggml_cuda_pool_alloc<int32_t> ids_src(ctx.pool(), static_cast<size_t>(n_routes));
+    const size_t n_tile_specs = static_cast<size_t>(n_expert + 1);
+    ggml_cuda_pool_alloc<ggml_cuda_mm_id_tile_spec> tile_spec(ctx.pool(), n_tile_specs);
+    CUDA_CHECK(cudaMemsetAsync(tile_spec.ptr, 0xFF,
+        n_tile_specs * sizeof(ggml_cuda_mm_id_tile_spec), stream));
+
+    ggml_cuda_launch_mm_ids_helper(
+        ids_ptr,
+        ids_src.ptr,
+        route_indices.ptr,
+        tile_spec.ptr,
+        static_cast<int>(n_expert),
+        static_cast<int>(n_tokens),
+        static_cast<int>(n_exp_used),
+        static_cast<int>(n_exp_used),
+        static_cast<int>(n_routes),
+        static_cast<int>(ids->nb[1] / sizeof(int32_t)),
+        static_cast<int>(n_exp_used),
+        false,
+        stream);
+    CUDA_CHECK(cudaGetLastError());
+
+    std::vector<ggml_cuda_mm_id_tile_spec> tile_spec_host(n_tile_specs);
+    CUDA_CHECK(cudaMemcpyAsync(tile_spec_host.data(), tile_spec.ptr,
+        n_tile_specs * sizeof(ggml_cuda_mm_id_tile_spec), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::vector<int32_t> expert_offsets(static_cast<size_t>(n_expert + 1));
+    size_t max_expert_tokens = 0;
+    for (int64_t expert = 0; expert < n_expert; ++expert) {
+        int32_t route_begin = std::numeric_limits<int32_t>::max();
+        int32_t route_end = 0;
+        bool found = false;
+        for (const ggml_cuda_mm_id_tile_spec & spec : tile_spec_host) {
+            if (spec.expert != expert) {
                 continue;
             }
-            GGML_ASSERT(eid >= 0 && eid < (int32_t)n_expert);
-            expert_tokens[eid].push_back(iexp * n_tokens + itok);
+            route_begin = std::min(route_begin, spec.col_low);
+            route_end = std::max(route_end, spec.col_high);
+            found = true;
         }
+        GGML_ASSERT(found);
+        GGML_ASSERT(route_begin >= 0 && route_end >= route_begin && route_end <= n_routes);
+        if (expert > 0) {
+            GGML_ASSERT(expert_offsets[static_cast<size_t>(expert)] == route_begin);
+        }
+        expert_offsets[static_cast<size_t>(expert)] = route_begin;
+        expert_offsets[static_cast<size_t>(expert + 1)] = route_end;
+        max_expert_tokens = std::max(max_expert_tokens,
+            static_cast<size_t>(route_end - route_begin));
+    }
+
+    const int64_t n_active_routes = expert_offsets.back();
+    GGML_ASSERT(n_active_routes <= n_routes);
+    if (n_active_routes == 0) {
+        return;
     }
 
     const int64_t a_stride_exp = src0->nb[1] / ggml_type_size(src0->type);
@@ -446,12 +511,14 @@ void ggml_cuda_out_prod_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         ggml_cuda_pool_alloc<unsigned int> absmax(ctx.pool(), 1);
         ggml_cuda_pool_alloc<float> scales(ctx.pool(), 2);
         ggml_cuda_f16_scale_init(src1, absmax.ptr, scales.ptr, stream);
-        ggml_cuda_out_prod_id_lowp<half>(ctx, src0, src1, dst, expert_tokens, CUDA_R_16F, scales.ptr);
+        ggml_cuda_out_prod_id_lowp<half>(ctx, src0, src1, dst,
+            route_indices.ptr, expert_offsets, max_expert_tokens, CUDA_R_16F, scales.ptr);
         ggml_cuda_f16_scale_tensor(dst, scales.ptr + 1, stream);
         return;
     }
     if (use_bf16) {
-        ggml_cuda_out_prod_id_lowp<nv_bfloat16>(ctx, src0, src1, dst, expert_tokens, CUDA_R_16BF, nullptr);
+        ggml_cuda_out_prod_id_lowp<nv_bfloat16>(ctx, src0, src1, dst,
+            route_indices.ptr, expert_offsets, max_expert_tokens, CUDA_R_16BF, nullptr);
         return;
     }
 
@@ -461,29 +528,27 @@ void ggml_cuda_out_prod_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     float       * d_base = (float       *)  dst->data;
 
     for (int64_t e = 0; e < n_expert; ++e) {
-        const auto & toks = expert_tokens[e];
-        if (toks.empty()) {
+        const int64_t route_begin = expert_offsets[static_cast<size_t>(e)];
+        const int64_t ntoks_e = expert_offsets[static_cast<size_t>(e + 1)] - route_begin;
+        if (ntoks_e == 0) {
             continue;
         }
-
-        const int64_t ntoks_e = (int64_t) toks.size();
 
         ggml_cuda_pool_alloc<float> a_gathered(ctx.pool(), cols * ntoks_e);
         ggml_cuda_pool_alloc<float> b_gathered(ctx.pool(), rows * ntoks_e);
 
-        for (int64_t ti = 0; ti < ntoks_e; ++ti) {
-            const int64_t flat = toks[ti];
-            const int64_t iexp = flat / n_tokens;
-            const int64_t itok = flat % n_tokens;
-            CUDA_CHECK(cudaMemcpyAsync(
-                a_gathered.ptr + ti * cols,
-                a_base + iexp * a_stride_exp + itok * a_stride_tok,
-                cols * sizeof(float), cudaMemcpyDeviceToDevice, stream));
-            CUDA_CHECK(cudaMemcpyAsync(
-                b_gathered.ptr + ti * rows,
-                b_base + iexp * b_stride_exp + itok * b_stride_tok,
-                rows * sizeof(float), cudaMemcpyDeviceToDevice, stream));
-        }
+        const int threads = 256;
+        const int64_t a_count = cols * ntoks_e;
+        const int64_t b_count = rows * ntoks_e;
+        out_prod_id_gather_kernel<float, float><<<
+            (a_count + threads - 1) / threads, threads, 0, stream>>>(
+                a_base, a_gathered.ptr, route_indices.ptr + route_begin, cols, n_exp_used,
+                a_stride_exp, a_stride_tok, a_count, nullptr);
+        out_prod_id_gather_kernel<float, float><<<
+            (b_count + threads - 1) / threads, threads, 0, stream>>>(
+                b_base, b_gathered.ptr, route_indices.ptr + route_begin, rows, n_exp_used,
+                b_stride_exp, b_stride_tok, b_count, nullptr);
+        CUDA_CHECK(cudaGetLastError());
 
         CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
             (int)cols, (int)rows, (int)ntoks_e,
