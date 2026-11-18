@@ -14,6 +14,7 @@
 
 #include <array>
 #include <map>
+#include <unordered_set>
 #include <vector>
 
 struct llama_model;
@@ -143,6 +144,10 @@ struct llama_context {
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
+    LLAMA_API void set_lora_dropout(float probability, uint64_t seed, uint64_t counter = 0);
+    uint64_t get_lora_dropout_seed() const { return lora_dropout_seed; }
+    uint64_t get_lora_dropout_counter() const { return lora_dropout_counter; }
+
     bool set_adapter_cvec(
             const float * data,
                  size_t   len,
@@ -218,27 +223,43 @@ struct llama_context {
     //
 
     void opt_init(struct llama_model * model, struct llama_opt_params lopt_params);
+    void opt_set_seed(uint32_t seed);
+    void opt_set_opt_period(int32_t opt_period);
+    void opt_set_activation_checkpointing(bool enabled);
+    size_t opt_state_size() const;
+    bool opt_state_export(void * data, size_t size) const;
+    bool opt_state_import(const void * data, size_t size);
+    void opt_dataset_shuffle(ggml_opt_dataset_t dataset, int64_t idata);
 
     // TODO: more flexible combinations of logical/physical batch size and context size
-    void opt_epoch(
+    bool opt_epoch(
             ggml_opt_dataset_t      dataset,
             ggml_opt_result_t       result_train,
             ggml_opt_result_t       result_eval,
+            int64_t                 idata_start,
             int64_t                 idata_split,
+            int64_t                 idata_eval_end,
             ggml_opt_epoch_callback callback_train,
-            ggml_opt_epoch_callback callback_eval);
+            ggml_opt_epoch_callback callback_eval,
+            ggml_abort_callback     abort_callback,
+            void                  * abort_callback_data);
 
-    void opt_epoch_iter(
+    bool opt_epoch_iter(
             ggml_opt_dataset_t               dataset,
             ggml_opt_result_t                result,
             const std::vector<llama_token> & tokens,
             const std::vector<llama_token> & labels_sparse,
+            const std::vector<float>       & label_weights,
             llama_batch_ext                & batch,
             ggml_opt_epoch_callback          callback,
             bool                             train,
             int64_t                          idata_in_loop,
             int64_t                          ndata_in_loop,
-            int64_t                          t_loop_start);
+            int64_t                          t_loop_start,
+            std::unordered_set<const ggml_tensor *> & lora_grad_seen,
+            int64_t & n_train_graphs,
+            ggml_abort_callback abort_callback,
+            void * abort_callback_data);
 
 private:
     //
@@ -292,7 +313,8 @@ private:
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
+                          llm_graph_type   gtype,
+                                    bool   training_graph = false) const;
 
     llm_graph_cb graph_get_cb() const;
 
@@ -340,6 +362,10 @@ private:
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
+
+    float lora_dropout = 0.0f;
+    uint64_t lora_dropout_seed = 0;
+    mutable uint64_t lora_dropout_counter = 0;
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
@@ -436,6 +462,8 @@ private:
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;
+    int32_t opt_accumulation_period = 0;
+    std::unordered_set<const ggml_tensor *> opt_lora_grad_warned;
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;

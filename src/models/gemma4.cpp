@@ -1,6 +1,8 @@
 #include "models.h"
 #include "llama-impl.h"
 
+#include <vector>
+
 void llama_model_gemma4::load_arch_hparams(llama_model_loader & ml) {
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
     ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl);
@@ -179,10 +181,31 @@ llama_model_gemma4::graph::graph(const llm_graph_params & params) :
     ggml_tensor * inp_pos = build_inp_pos();
 
     // TODO: is causal == true correct? might need some changes
-    auto * inp_attn = build_attn_inp_kv_iswa();
+    const bool use_direct_shared_kv = cparams.training && hparams.has_shared_kv();
+    auto * inp_attn_kv = use_direct_shared_kv ? nullptr : build_attn_inp_kv_iswa();
+    auto * inp_attn_no_cache = use_direct_shared_kv ? build_attn_inp_no_cache() : nullptr;
 
-    auto inp_attn_full  = *inp_attn;
-    auto inp_attn_prune = *inp_attn;
+    std::unique_ptr<llm_graph_input_attn_kv_iswa> inp_attn_kv_prune;
+    std::unique_ptr<llm_graph_input_attn_no_cache> inp_attn_no_cache_prune;
+
+    if (use_direct_shared_kv) {
+        inp_attn_no_cache_prune = std::make_unique<llm_graph_input_attn_no_cache>(*inp_attn_no_cache);
+    } else {
+        inp_attn_kv_prune = std::make_unique<llm_graph_input_attn_kv_iswa>(*inp_attn_kv);
+    }
+
+    auto build_gemma4_attn = [&](int il, ggml_tensor * q, ggml_tensor * k, ggml_tensor * v) {
+        if (use_direct_shared_kv) {
+            return build_attn(inp_attn_no_cache, model.layers[il].wo, nullptr, model.layers[il].wo_s,
+                    q, k, v, nullptr, nullptr, nullptr, hparams.f_attention_scale, il);
+        }
+
+        return build_attn(inp_attn_kv, model.layers[il].wo, nullptr, model.layers[il].wo_s,
+                q, k, v, nullptr, nullptr, nullptr, hparams.f_attention_scale, il);
+    };
+
+    std::vector<ggml_tensor *> shared_k(n_layer, nullptr);
+    std::vector<ggml_tensor *> shared_v(n_layer, nullptr);
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
@@ -216,15 +239,33 @@ llama_model_gemma4::graph::graph(const llm_graph_params & params) :
             //       is construted during set_input to contain just the pruned output cells
             //       this can be used to enable pruning with more than 1 sequence, both with unified and split KV cache
             //       ref: https://github.com/ggml-org/llama.cpp/pull/31356#discussion_r4455286628
-            inp_attn_prune.self_attn_mask.raw     = ggml_get_rows(ctx0, inp_attn_full.self_attn_mask.raw,     inp_out_ids);
-            inp_attn_prune.self_attn_mask_swa.raw = ggml_get_rows(ctx0, inp_attn_full.self_attn_mask_swa.raw, inp_out_ids);
+            if (use_direct_shared_kv) {
+                inp_attn_no_cache_prune->self_attn_mask.raw = ggml_get_rows(
+                        ctx0, inp_attn_no_cache->self_attn_mask.raw, inp_out_ids);
+                inp_attn_no_cache_prune->self_attn_mask_swa.raw = ggml_get_rows(
+                        ctx0, inp_attn_no_cache->self_attn_mask_swa.raw, inp_out_ids);
 
-            inp_attn_prune.self_attn_mask.raw     = ggml_cast(ctx0, inp_attn_prune.self_attn_mask.raw,     GGML_TYPE_F16);
-            inp_attn_prune.self_attn_mask_swa.raw = ggml_cast(ctx0, inp_attn_prune.self_attn_mask_swa.raw, GGML_TYPE_F16);
+                inp_attn_no_cache_prune->self_attn_mask.raw = ggml_cast(
+                        ctx0, inp_attn_no_cache_prune->self_attn_mask.raw, GGML_TYPE_F16);
+                inp_attn_no_cache_prune->self_attn_mask_swa.raw = ggml_cast(
+                        ctx0, inp_attn_no_cache_prune->self_attn_mask_swa.raw, GGML_TYPE_F16);
+
+                inp_attn_no_cache = inp_attn_no_cache_prune.get();
+            } else {
+                inp_attn_kv_prune->self_attn_mask.raw = ggml_get_rows(
+                        ctx0, inp_attn_kv->self_attn_mask.raw, inp_out_ids);
+                inp_attn_kv_prune->self_attn_mask_swa.raw = ggml_get_rows(
+                        ctx0, inp_attn_kv->self_attn_mask_swa.raw, inp_out_ids);
+
+                inp_attn_kv_prune->self_attn_mask.raw = ggml_cast(
+                        ctx0, inp_attn_kv_prune->self_attn_mask.raw, GGML_TYPE_F16);
+                inp_attn_kv_prune->self_attn_mask_swa.raw = ggml_cast(
+                        ctx0, inp_attn_kv_prune->self_attn_mask_swa.raw, GGML_TYPE_F16);
+
+                inp_attn_kv = inp_attn_kv_prune.get();
+            }
 
             n_rows = n_outputs;
-
-            inp_attn = &inp_attn_prune;
         }
 
         const int64_t n_embd_head = hparams.n_embd_head_k(il);
@@ -296,14 +337,23 @@ llama_model_gemma4::graph::graph(const llm_graph_params & params) :
 
             cb(Kcur, "Kcur_pos", il);
 
-            cur = build_attn(inp_attn, model.layers[il].wo,
-                    nullptr, model.layers[il].wo_s, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr,
-                    hparams.f_attention_scale, il);
+            if (use_direct_shared_kv) {
+                shared_k[il] = Kcur;
+                shared_v[il] = Vcur;
+            }
+
+            cur = build_gemma4_attn(il, Qcur, Kcur, Vcur);
         } else {
             // reuse KV cache of earlier layers
-            cur = build_attn(inp_attn,
-                    model.layers[il].wo, nullptr, model.layers[il].wo_s,
-                    Qcur, nullptr, nullptr, nullptr, nullptr, nullptr, hparams.f_attention_scale, il);
+            if (use_direct_shared_kv) {
+                const uint32_t source_layer = hparams.kv_source(il);
+                GGML_ASSERT(source_layer < (uint32_t) il);
+                GGML_ASSERT(shared_k[source_layer] != nullptr && shared_v[source_layer] != nullptr);
+
+                cur = build_gemma4_attn(il, Qcur, shared_k[source_layer], shared_v[source_layer]);
+            } else {
+                cur = build_gemma4_attn(il, Qcur, nullptr, nullptr);
+            }
         }
 
         // keep all rows when extracting unmasked nextn embeddings (MTP target needs the hidden state for every token)
