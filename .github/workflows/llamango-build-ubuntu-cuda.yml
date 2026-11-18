@@ -130,6 +130,14 @@ jobs:
           token: ${{ github.token }}
           repository: ${{ github.repository }}
 
+      - name: Evict stale ccache entries
+        if: always() && steps.build.outcome == 'success'
+        shell: bash
+        run: |
+          if ! ccache --evict-older-than 5d; then
+            echo "::warning::Failed to evict stale ccache entries; continuing without cleanup."
+          fi
+
       - name: Save ccache
         if: always() && steps.build.outcome == 'success'
         uses: actions/cache/save@v6
