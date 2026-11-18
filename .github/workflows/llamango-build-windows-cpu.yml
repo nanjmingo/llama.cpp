@@ -164,7 +164,7 @@ jobs:
             'CCACHE_MAXSIZE=1G'
             "CCACHE_BASEDIR=$env:GITHUB_WORKSPACE"
             'CCACHE_COMPILERCHECK=content'
-            'CCACHE_COMPILERTYPE=clang-cl'
+            'CCACHE_COMPILERTYPE=clang'
             'CCACHE_DEBUG=1'
             'CCACHE_DEBUGLEVEL=1'
             "CCACHE_DEBUGDIR=$debugDir"
@@ -275,18 +275,21 @@ jobs:
               [pscustomobject]@{
                 VsArchitecture = 'amd64'
                 Triple = 'x86_64-pc-windows-msvc'
+                LlvmVersion = '20.1.8'
               }
             }
             'arm64' {
               [pscustomobject]@{
                 VsArchitecture = 'arm64'
                 Triple = 'aarch64-pc-windows-msvc'
+                LlvmVersion = '22.1.8'
               }
             }
             default { throw "Unsupported Windows architecture: $env:TARGET_ARCHITECTURE" }
           }
           $targetArchitecture = $buildTarget.VsArchitecture
           $targetTriple = $buildTarget.Triple
+          $llvmVersion = $buildTarget.LlvmVersion
           if ($env:TARGET_ARCHITECTURE -eq 'arm64') {
             $openmpEnvironmentSetup = @"
           set "INCLUDE=$env:LLAMANGO_OPENMP_ROOT\include;%INCLUDE%"
@@ -314,13 +317,29 @@ jobs:
           @echo off
           call "$vsDevCmd" -no_logo -arch=$targetArchitecture -host_arch=amd64
           if errorlevel 1 exit /b %errorlevel%
-          where clang-cl >nul
+          where clang.exe
           if errorlevel 1 exit /b 1
+          where clang++.exe
+          if errorlevel 1 exit /b 1
+          clang --version
+          clang++ --version
+          clang --version | findstr /L /C:"clang version $llvmVersion" >nul
+          if errorlevel 1 (
+            echo Expected LLVM $llvmVersion for $env:TARGET_ARCHITECTURE, but found:
+            clang --version
+            exit /b 1
+          )
+          clang++ --version | findstr /L /C:"clang version $llvmVersion" >nul
+          if errorlevel 1 (
+            echo clang++ version does not match the expected LLVM $llvmVersion:
+            clang++ --version
+            exit /b 1
+          )
           $openmpEnvironmentSetup
           cmake -S . -B build -G "Ninja Multi-Config" ^
             $openmpCmakeArguments
-            -DCMAKE_C_COMPILER=clang-cl ^
-            -DCMAKE_CXX_COMPILER=clang-cl ^
+            -DCMAKE_C_COMPILER=clang ^
+            -DCMAKE_CXX_COMPILER=clang++ ^
             -DCMAKE_C_COMPILER_TARGET=$targetTriple ^
             -DCMAKE_CXX_COMPILER_TARGET=$targetTriple ^
             -DCMAKE_C_COMPILER_LAUNCHER=ccache ^
@@ -422,7 +441,7 @@ jobs:
             "Backend: CPU"
             "Build scope: all default CMake targets"
             "Build type: Release"
-            "C/C++ compiler: Clang (clang-cl)"
+            "C/C++ compiler: Clang (clang / clang++)"
             "Executables included: $($executables.Count)"
             "Runtime DLLs included: $($runtimeDlls.Count)"
           ) | Set-Content -Path (Join-Path $stageDir "BUILD_INFO.txt") -Encoding utf8
