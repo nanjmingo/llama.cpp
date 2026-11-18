@@ -402,6 +402,12 @@ jobs:
           path: .ccache
           key: ${{ inputs.cache_key_prefix }}-${{ github.run_id }}
 
+      - name: Cleanup ccache
+        if: always() && !cancelled()
+        uses: ./.github/actions/llamango-ccache-cleanup
+        with:
+          cache-key-prefix: ${{ inputs.cache_key_prefix }}
+
       - name: Run all CPU tests
         id: test
         if: always() && steps.build.outcome == 'success'
@@ -449,11 +455,6 @@ jobs:
           repository: ${{ github.repository }}
           publish-release: 'false'
 
-      - name: Cleanup ccache
-        if: always() && !cancelled()
-        uses: ./.github/actions/llamango-ccache-cleanup
-        with:
-          cache-key-prefix: ${{ inputs.cache_key_prefix }}
 
       - name: Fail job when CPU tests fail
         if: always() && steps.test.outcome == 'failure'
