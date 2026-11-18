@@ -174,6 +174,66 @@ jobs:
           restore-keys: |
             ${{ inputs.cache_key_prefix }}-
 
+      - name: Download LLVM OpenMP runtime
+        id: download_openmp
+        if: inputs.architecture == 'arm64'
+        shell: pwsh
+        run: |
+          $version = '22.1.8'
+          $installerName = "LLVM-$version-woa64.exe"
+          $installerPath = Join-Path $env:RUNNER_TEMP $installerName
+          $openmpRoot = Join-Path $env:RUNNER_TEMP "llvm-openmp-$version-arm64"
+          $extractDir = Join-Path $openmpRoot 'extract'
+          $installerUrl = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/$installerName"
+          $expectedSha256 = '76f44ef1ba6eeb5a65904e9500f042f588fade49952778ce48f0374daa934396'
+
+          Invoke-WebRequest -Uri $installerUrl -OutFile $installerPath
+          $actualSha256 = (Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne $expectedSha256) {
+            throw "LLVM installer SHA-256 mismatch: $actualSha256"
+          }
+
+          $sevenZip = (Get-Command 7z -ErrorAction Stop).Source
+          New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
+          & $sevenZip e -y "-o$extractDir" $installerPath -r libomp.lib libomp.dll omp.h
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to extract LLVM OpenMP files: $LASTEXITCODE"
+          }
+
+          $includeDir = Join-Path $openmpRoot 'include'
+          $libDir = Join-Path $openmpRoot 'lib'
+          $binDir = Join-Path $openmpRoot 'bin'
+          New-Item -ItemType Directory -Force -Path $includeDir, $libDir, $binDir | Out-Null
+          foreach ($file in @('omp.h', 'libomp.lib', 'libomp.dll')) {
+            $sourcePath = Join-Path $extractDir $file
+            if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+              throw "LLVM OpenMP file was not extracted: $sourcePath"
+            }
+          }
+          Move-Item -LiteralPath (Join-Path $extractDir 'omp.h') -Destination $includeDir
+          Move-Item -LiteralPath (Join-Path $extractDir 'libomp.lib') -Destination $libDir
+          Move-Item -LiteralPath (Join-Path $extractDir 'libomp.dll') -Destination $binDir
+
+          $licensePath = Join-Path $openmpRoot 'LICENSE.TXT'
+          $licenseUrl = "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-$version/openmp/LICENSE.TXT"
+          Invoke-WebRequest -Uri $licenseUrl -OutFile $licensePath
+          if (-not (Test-Path -LiteralPath $licensePath -PathType Leaf) -or (Get-Item -LiteralPath $licensePath).Length -eq 0) {
+            throw "LLVM OpenMP license was not downloaded: $licensePath"
+          }
+
+          $cmakeRoot = $openmpRoot.Replace('\', '/')
+          $cmakeCacheFile = Join-Path $env:RUNNER_TEMP 'llamango-openmp-arm64-initial-cache.cmake'
+          @"
+          set(OpenMP_libomp_LIBRARY "$cmakeRoot/lib/libomp.lib" CACHE FILEPATH "" FORCE)
+          set(OpenMP_C_INCLUDE_DIR "$cmakeRoot/include" CACHE PATH "" FORCE)
+          set(OpenMP_CXX_INCLUDE_DIR "$cmakeRoot/include" CACHE PATH "" FORCE)
+          "@ | Set-Content -LiteralPath $cmakeCacheFile -Encoding ascii
+
+          Remove-Item -LiteralPath $installerPath -Force
+          Remove-Item -LiteralPath $extractDir -Recurse -Force
+          "LLAMANGO_OPENMP_ROOT=$openmpRoot" | Add-Content -Path $env:GITHUB_ENV
+          "LLAMANGO_OPENMP_CMAKE_CACHE=$cmakeCacheFile" | Add-Content -Path $env:GITHUB_ENV
+
       - name: Configure and build full CPU build
         id: build
         shell: pwsh
@@ -197,6 +257,21 @@ jobs:
           }
           $targetArchitecture = $buildTarget.VsArchitecture
           $targetTriple = $buildTarget.Triple
+          if ($env:TARGET_ARCHITECTURE -eq 'arm64') {
+            $openmpEnvironmentSetup = @"
+          set "INCLUDE=$env:LLAMANGO_OPENMP_ROOT\include;%INCLUDE%"
+          set "LIB=$env:LLAMANGO_OPENMP_ROOT\lib;%LIB%"
+          "@
+            $openmpCmakeArguments = @"
+          -C "$env:LLAMANGO_OPENMP_CMAKE_CACHE" ^
+          -DGGML_OPENMP_FETCH=OFF ^
+          "@
+          } else {
+            $openmpEnvironmentSetup = ''
+            $openmpCmakeArguments = @'
+          -DGGML_OPENMP_FETCH=ON ^
+          '@
+          }
 
           $vsInstallPath = Join-Path $env:ProgramFiles 'Microsoft Visual Studio/18/Enterprise'
           $vsDevCmd = Join-Path $vsInstallPath 'Common7/Tools/VsDevCmd.bat'
@@ -211,7 +286,9 @@ jobs:
           if errorlevel 1 exit /b %errorlevel%
           where clang-cl >nul
           if errorlevel 1 exit /b 1
+          $openmpEnvironmentSetup
           cmake -S . -B build -G "Ninja Multi-Config" ^
+            $openmpCmakeArguments
             -DCMAKE_C_COMPILER=clang-cl ^
             -DCMAKE_CXX_COMPILER=clang-cl ^
             -DCMAKE_C_COMPILER_TARGET=$targetTriple ^
@@ -243,9 +320,26 @@ jobs:
             exit $buildExitCode
           }
 
+      - name: Copy LLVM OpenMP runtime to build output
+        id: openmp_runtime
+        if: always() && steps.build.outcome == 'success' && inputs.architecture == 'arm64'
+        shell: pwsh
+        run: |
+          $binDir = Join-Path $env:GITHUB_WORKSPACE 'build/bin/Release'
+          New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+          Copy-Item -LiteralPath (Join-Path $env:LLAMANGO_OPENMP_ROOT 'bin/libomp.dll') -Destination $binDir -Force
+          Copy-Item -LiteralPath (Join-Path $env:LLAMANGO_OPENMP_ROOT 'LICENSE.TXT') -Destination (Join-Path $binDir 'LICENSE-LLVM-OpenMP') -Force
+
+          foreach ($file in @('libomp.dll', 'LICENSE-LLVM-OpenMP')) {
+            $outputPath = Join-Path $binDir $file
+            if (-not (Test-Path -LiteralPath $outputPath -PathType Leaf)) {
+              throw "LLVM OpenMP runtime file was not copied to the build output: $outputPath"
+            }
+          }
+
       - name: Package Windows CPU build
         id: package
-        if: always() && steps.build.outcome == 'success'
+        if: always() && steps.build.outcome == 'success' && (inputs.architecture != 'arm64' || steps.openmp_runtime.outcome == 'success')
         shell: pwsh
         env:
           ARCH: ${{ inputs.architecture }}
@@ -259,6 +353,13 @@ jobs:
 
           $executables = @(Get-ChildItem -Path $binDir -Filter "*.exe" -File -Recurse)
           $runtimeDlls = @(Get-ChildItem -Path $binDir -Filter "*.dll" -File -Recurse)
+          if ($env:ARCH -eq 'arm64') {
+            foreach ($file in @('libomp.dll', 'LICENSE-LLVM-OpenMP')) {
+              if (-not (Test-Path -LiteralPath (Join-Path $binDir $file) -PathType Leaf)) {
+                throw "Required LLVM OpenMP package file is missing: $file"
+              }
+            }
+          }
           if ($executables.Count -eq 0) {
             throw "No executables were found in $binDir"
           }
@@ -319,6 +420,7 @@ jobs:
           $ctestArgs = @(
             '--test-dir', 'build',
             '-C', 'Release',
+            '-L', 'main',
             '--output-on-failure',
             '--timeout', '900',
             '--parallel', "$env:NUMBER_OF_PROCESSORS"
