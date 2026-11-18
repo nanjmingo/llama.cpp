@@ -63,7 +63,7 @@ Train a LoRA adapter with context size 512:
 | `-ub`, `--ubatch-size` | `-c` when omitted | Microbatch size. Must equal `-c`. |
 | `-t`, `--threads` | auto | CPU threads for training, JSONL reading, and tokenization. |
 | `-ngl`, `--n-gpu-layers` | `auto` | Number of layers to offload to GPU (`auto`, `all`, or integer). |
-| `-fa`, `--flash-attn` | `auto` | Flash Attention mode (`on`, `off`, `auto`). CPU and CUDA backward supported. |
+| `-fa`, `--flash-attn` | `off` | Flash Attention mode (`on`, `off`, `auto`). CPU and CUDA backward supported. |
 | `-ctk`, `--cache-type-k` | `f32` | KV cache K type (`f32`, `f16`, `bf16`, `q8_0`, etc.). |
 | `-ctv`, `--cache-type-v` | `f32` | KV cache V type (`f32`, `f16`, `bf16`, `q8_0`, etc.). |
 | `-lm`, `--load-mode` | `none` | Model loading mode (`auto`, `none`, `mmap`, `mlock`, `mmap+mlock`, or `dio`). |
@@ -84,6 +84,9 @@ Train a LoRA adapter with context size 512:
 | `-s`, `--seed` | `42` | Random seed for dataset shuffling. |
 
 ### LoRA Options
+
+> [!IMPORTANT]
+> **Minimum LoRA Rank:** Set `--lora-rank` to `2` or greater. llama.cpp does not support LoRA rank `1`.
 
 | Option | Default | Description |
 |---|---|---|

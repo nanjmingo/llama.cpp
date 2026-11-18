@@ -159,6 +159,7 @@ int main(int argc, char ** argv) {
     params.sampling.seed = 42;
     params.load_mode = LLAMA_LOAD_MODE_NONE;
     params.lazy_mode = LLAMA_LAZY_MODE_OFF;
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     params.cache_type_k = GGML_TYPE_F32;
     params.cache_type_v = GGML_TYPE_F32;
     params.no_extra_bufts = true; // Disable weight repacking by default.
