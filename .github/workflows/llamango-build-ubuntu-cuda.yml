@@ -3,12 +3,8 @@ name: Llamango Ubuntu CUDA Build
 on:
   workflow_call:
     inputs:
-      cuda_version:
-        description: Full CUDA Toolkit version installed in the build container.
-        required: true
-        type: string
       cuda_display_version:
-        description: Short CUDA version shown in the Actions job title and package metadata.
+        description: Short CUDA version shown in the Actions job title.
         required: true
         type: string
       container_image:
@@ -103,22 +99,8 @@ jobs:
         shell: bash
         env:
           ASSET_NAME: ${{ inputs.asset_name }}
-          CUDA_VERSION: ${{ inputs.cuda_version }}
-          CUDA_DISPLAY_VERSION: ${{ inputs.cuda_display_version }}
         run: |
           set -euo pipefail
-          cat > build/bin/BUILD_INFO.txt <<EOF_INFO
-          Repository: ${GITHUB_REPOSITORY}
-          Commit: ${GITHUB_SHA}
-          OS: Ubuntu 22.04
-          CUDA Toolkit: ${CUDA_VERSION}
-          CUDA Display Version: ${CUDA_DISPLAY_VERSION}
-          Backend: CUDA
-          Build scope: all default CMake targets
-          Build type: Release
-          C/C++ runtime: static libgcc/libstdc++
-          CUDA runtime: static cudart
-          EOF_INFO
           tar -czf "$ASSET_NAME" -C build/bin .
 
       - name: Publish Ubuntu CUDA package
@@ -134,7 +116,7 @@ jobs:
         if: always() && steps.build.outcome == 'success'
         shell: bash
         run: |
-          if ! ccache --evict-older-than 5d; then
+          if ! ccache --evict-older-than 5d >/dev/null 2>&1; then
             echo "::warning::Failed to evict stale ccache entries; continuing without cleanup."
           fi
 

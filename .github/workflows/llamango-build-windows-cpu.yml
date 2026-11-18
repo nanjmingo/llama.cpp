@@ -157,17 +157,13 @@ jobs:
         shell: pwsh
         run: |
           $cacheDir = Join-Path $env:GITHUB_WORKSPACE '.ccache'
-          $debugDir = Join-Path $env:RUNNER_TEMP 'ccache-debug'
-          New-Item -ItemType Directory -Force -Path $cacheDir, $debugDir | Out-Null
+          New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
           @(
             "CCACHE_DIR=$cacheDir"
             'CCACHE_MAXSIZE=1G'
             "CCACHE_BASEDIR=$env:GITHUB_WORKSPACE"
             'CCACHE_COMPILERCHECK=content'
             'CCACHE_COMPILERTYPE=clang'
-            'CCACHE_DEBUG=1'
-            'CCACHE_DEBUGLEVEL=1'
-            "CCACHE_DEBUGDIR=$debugDir"
           ) | ForEach-Object { Add-Content -Path $env:GITHUB_ENV -Value $_ }
 
       - name: Restore ccache
@@ -177,32 +173,6 @@ jobs:
           key: ${{ inputs.cache_key_prefix }}-${{ github.run_id }}
           restore-keys: |
             ${{ inputs.cache_key_prefix }}-
-
-      - name: Show restored ccache statistics
-        shell: pwsh
-        run: |
-          try {
-            ccache --show-stats --verbose
-            if ($LASTEXITCODE -ne 0) {
-              Write-Warning "Failed to show restored ccache statistics (exit code $LASTEXITCODE)."
-            }
-          } catch {
-            Write-Warning "Failed to show restored ccache statistics: $_"
-          }
-          $global:LASTEXITCODE = 0
-
-      - name: Reset ccache statistics before build
-        shell: pwsh
-        run: |
-          try {
-            ccache --zero-stats
-            if ($LASTEXITCODE -ne 0) {
-              Write-Warning "Failed to reset ccache statistics (exit code $LASTEXITCODE)."
-            }
-          } catch {
-            Write-Warning "Failed to reset ccache statistics: $_"
-          }
-          $global:LASTEXITCODE = 0
 
       - name: Download LLVM OpenMP runtime
         id: download_openmp
@@ -314,12 +284,10 @@ jobs:
           @echo off
           call "$vsDevCmd" -no_logo -arch=$targetArchitecture -host_arch=amd64
           if errorlevel 1 exit /b %errorlevel%
-          where clang.exe
+          where clang.exe >nul
           if errorlevel 1 exit /b 1
-          where clang++.exe
+          where clang++.exe >nul
           if errorlevel 1 exit /b 1
-          clang --version
-          clang++ --version
           $openmpEnvironmentSetup
           cmake -S . -B build -G "Ninja Multi-Config" ^
             $openmpCmakeArguments
@@ -354,20 +322,6 @@ jobs:
             exit $buildExitCode
           }
 
-      - name: Show ccache statistics after build
-        if: always() && steps.build.outcome != 'skipped'
-        shell: pwsh
-        run: |
-          try {
-            ccache --show-stats --verbose
-            if ($LASTEXITCODE -ne 0) {
-              Write-Warning "Failed to show ccache statistics after build (exit code $LASTEXITCODE)."
-            }
-          } catch {
-            Write-Warning "Failed to show ccache statistics after build: $_"
-          }
-          $global:LASTEXITCODE = 0
-
       - name: Copy LLVM OpenMP runtime to build output
         id: openmp_runtime
         if: always() && steps.build.outcome == 'success' && inputs.architecture == 'arm64'
@@ -399,8 +353,6 @@ jobs:
             throw "QLoRA executable was not found: $llamangoExe"
           }
 
-          $executables = @(Get-ChildItem -Path $binDir -Filter "*.exe" -File -Recurse)
-          $runtimeDlls = @(Get-ChildItem -Path $binDir -Filter "*.dll" -File -Recurse)
           if ($env:ARCH -eq 'arm64') {
             foreach ($file in @('libomp.dll', 'LICENSE-LLVM-OpenMP')) {
               if (-not (Test-Path -LiteralPath (Join-Path $binDir $file) -PathType Leaf)) {
@@ -408,28 +360,11 @@ jobs:
               }
             }
           }
-          if ($executables.Count -eq 0) {
-            throw "No executables were found in $binDir"
-          }
-
           $stageDir = Join-Path $env:RUNNER_TEMP "llamango-windows-$env:ARCH"
           $distDir = Join-Path $env:GITHUB_WORKSPACE "dist"
           New-Item -ItemType Directory -Force -Path $stageDir, $distDir | Out-Null
           Copy-Item -Path (Join-Path $binDir "*") -Destination $stageDir -Recurse -Force
           Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE "LICENSE") -Destination $stageDir
-
-          @(
-            "Repository: $env:GITHUB_REPOSITORY"
-            "Commit: $env:GITHUB_SHA"
-            "OS: Windows"
-            "Architecture: $env:ARCH"
-            "Backend: CPU"
-            "Build scope: all default CMake targets"
-            "Build type: Release"
-            "C/C++ compiler: Clang (clang / clang++)"
-            "Executables included: $($executables.Count)"
-            "Runtime DLLs included: $($runtimeDlls.Count)"
-          ) | Set-Content -Path (Join-Path $stageDir "BUILD_INFO.txt") -Encoding utf8
 
           $assetPath = Join-Path $distDir $env:ASSET_NAME
           Compress-Archive -Path (Join-Path $stageDir "*") -DestinationPath $assetPath -CompressionLevel Optimal -Force
@@ -451,26 +386,12 @@ jobs:
         shell: pwsh
         run: |
           try {
-            ccache --evict-older-than 5d
+            ccache --evict-older-than 5d *> $null
             if ($LASTEXITCODE -ne 0) {
               Write-Warning "ccache eviction failed with exit code $LASTEXITCODE; continuing without cleanup."
             }
           } catch {
             Write-Warning "ccache eviction failed: $_; continuing without cleanup."
-          }
-          $global:LASTEXITCODE = 0
-
-      - name: Show ccache statistics after eviction
-        if: always() && steps.build.outcome == 'success'
-        shell: pwsh
-        run: |
-          try {
-            ccache --show-stats --verbose
-            if ($LASTEXITCODE -ne 0) {
-              Write-Warning "Failed to show ccache statistics after eviction (exit code $LASTEXITCODE)."
-            }
-          } catch {
-            Write-Warning "Failed to show ccache statistics after eviction: $_"
           }
           $global:LASTEXITCODE = 0
 
@@ -514,7 +435,6 @@ jobs:
             Write-Warning "CTest did not produce JUnit XML: $junitPath"
           }
 
-
           if ($testStatus -ne 0) {
             exit $testStatus
           }
@@ -529,18 +449,13 @@ jobs:
           repository: ${{ github.repository }}
           publish-release: 'false'
 
-      - name: Upload ccache debug logs
-        if: always() && steps.build.outcome != 'skipped'
-        uses: actions/upload-artifact@v6
-        with:
-          name: ccache-debug-windows-${{ inputs.architecture }}-${{ github.run_id }}
-          path: ${{ runner.temp }}/ccache-debug
-          if-no-files-found: warn
-          compression-level: 1
-          retention-days: 7
-
       - name: Cleanup ccache
         if: always() && !cancelled()
         uses: ./.github/actions/llamango-ccache-cleanup
         with:
           cache-key-prefix: ${{ inputs.cache_key_prefix }}
+
+      - name: Fail job when CPU tests fail
+        if: always() && steps.test.outcome == 'failure'
+        shell: pwsh
+        run: exit 1

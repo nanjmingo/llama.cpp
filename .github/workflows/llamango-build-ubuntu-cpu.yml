@@ -113,19 +113,8 @@ jobs:
         if: always() && steps.build.outcome == 'success'
         env:
           ASSET_NAME: ${{ inputs.asset_name }}
-          ARCHITECTURE: ${{ inputs.architecture }}
         run: |
           set -euo pipefail
-          cat > build/bin/BUILD_INFO.txt <<EOF_INFO
-          Repository: ${GITHUB_REPOSITORY}
-          Commit: ${GITHUB_SHA}
-          OS: Ubuntu 22.04
-          Architecture: ${ARCHITECTURE}
-          Backend: CPU
-          Build scope: all default CMake targets
-          Build type: Release
-          C/C++ runtime: static libgcc/libstdc++
-          EOF_INFO
           tar -czf "$ASSET_NAME" -C build/bin .
 
       - name: Publish Ubuntu CPU package
@@ -141,7 +130,7 @@ jobs:
         if: always() && steps.build.outcome == 'success'
         shell: bash
         run: |
-          if ! ccache --evict-older-than 5d; then
+          if ! ccache --evict-older-than 5d >/dev/null 2>&1; then
             echo "::warning::Failed to evict stale ccache entries; continuing without cleanup."
           fi
 
@@ -201,3 +190,8 @@ jobs:
         uses: ./.github/actions/llamango-ccache-cleanup
         with:
           cache-key-prefix: ${{ inputs.cache_key_prefix }}
+
+      - name: Fail job when CPU tests fail
+        if: always() && steps.test.outcome == 'failure'
+        shell: bash
+        run: exit 1

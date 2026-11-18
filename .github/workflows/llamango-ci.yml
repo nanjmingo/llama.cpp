@@ -192,7 +192,6 @@ jobs:
     needs: prepare-prerelease
     uses: ./.github/workflows/llamango-build-ubuntu-cuda.yml
     with:
-      cuda_version: '13.0.3'
       cuda_display_version: '13.0'
       container_image: nvidia/cuda:13.0.3-devel-ubuntu22.04
       cache_key_prefix: llamango-cache-ubuntu-cuda-13.0.3-22.04
@@ -208,7 +207,6 @@ jobs:
     needs: prepare-prerelease
     uses: ./.github/workflows/llamango-build-ubuntu-cuda.yml
     with:
-      cuda_version: '12.8.2'
       cuda_display_version: '12.8'
       container_image: nvidia/cuda:12.8.2-devel-ubuntu22.04
       cache_key_prefix: llamango-cache-ubuntu-cuda-12.8.2-22.04
