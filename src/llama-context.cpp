@@ -4226,6 +4226,10 @@ static void llama_warn_shared_kv_lora_gradients(
         return;
     }
 
+    if (model.arch == LLM_ARCH_GEMMA4 && full_context_training) {
+        return;
+    }
+
     const llama_hparams & hparams = model.hparams;
     const uint32_t n_layers = std::min<uint32_t>(hparams.n_layer(), static_cast<uint32_t>(model.layers.size()));
     std::vector<uint32_t> shared_kv_consumers(n_layers, 0);
