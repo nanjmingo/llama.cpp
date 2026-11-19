@@ -15,6 +15,10 @@ on:
         description: Stable prefix for the ccache key and concurrency group.
         required: true
         type: string
+      cache_key_prefix2:
+        description: Stable prefix for the ccache key and concurrency group.
+        required: true
+        type: string
       release_tag:
         description: Prerelease tag created by the orchestrator.
         required: true
@@ -400,7 +404,7 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: .ccache
-          key: ${{ inputs.cache_key_prefix }}-${{ github.run_id }}
+          key: ${{ inputs.cache_key_prefix2 }}-${{ github.run_id }}
 
       - name: Cleanup ccache
         if: always() && !cancelled()
