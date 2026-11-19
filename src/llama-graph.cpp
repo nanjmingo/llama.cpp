@@ -1814,12 +1814,8 @@ ggml_tensor * llm_graph_context::build_rope_indexer(ggml_tensor * cur, ggml_tens
     return rp.n_rot > 0 && rp.n_offs > 0 ? ggml_rope_set_offset(res, rp.n_offs) : res;
 }
 
-static void llama_prec_policy_apply_matmul(const llama_prec_policy * prec_policy, ggml_tensor * res) {
-    if (!prec_policy) {
-        return;
-    }
-
-    const bool has_src1_prec_policy = prec_policy->apply(res);
+static void llama_prec_policy_apply_matmul(const llama_prec_policy & prec_policy, ggml_tensor * res) {
+    const bool has_src1_prec_policy = prec_policy.apply(res);
     if (has_src1_prec_policy && ggml_prec_get_src(res, 1) == GGML_PREC_F16) {
         GGML_ASSERT(ggml_prec_set_acc(res, GGML_PREC_F32));
     }
