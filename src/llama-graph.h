@@ -810,6 +810,7 @@ struct llm_graph_params {
     llama_ubatch ubatch; // note: intentionally make a copy
 
     llm_graph_type gtype;
+    bool training_graph = false;
 
     ggml_backend_sched_t sched;
     ggml_backend_t backend_cpu;
@@ -927,6 +928,7 @@ struct llm_graph_params {
             h_nextn_src   == other.h_nextn_src   &&
             model == other.model &&
             gtype == other.gtype &&
+            training_graph == other.training_graph &&
             cvec  == other.cvec  &&
             loras == other.loras &&
             cross == other.cross;
@@ -1054,6 +1056,7 @@ struct llm_graph_context {
 
     const llama_hparams & hparams;
     const llama_cparams & cparams;
+    const bool training_graph;
     const llama_ubatch  & ubatch;
 
     const int64_t n_embd;
