@@ -386,7 +386,7 @@ jobs:
         shell: pwsh
         run: |
           try {
-            ccache --evict-older-than 4d *> $null
+            ccache --evict-older-than 3d *> $null
             if ($LASTEXITCODE -ne 0) {
               Write-Warning "ccache eviction failed with exit code $LASTEXITCODE; continuing without cleanup."
             }

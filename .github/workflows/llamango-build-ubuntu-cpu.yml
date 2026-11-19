@@ -130,7 +130,7 @@ jobs:
         if: always() && steps.build.outcome == 'success'
         shell: bash
         run: |
-          if ! ccache --evict-older-than 4d >/dev/null 2>&1; then
+          if ! ccache --evict-older-than 3d >/dev/null 2>&1; then
             echo "::warning::Failed to evict stale ccache entries; continuing without cleanup."
           fi
 
