@@ -292,7 +292,10 @@ static void mul_mat_id_back_gather_lowp(
     CUDA_CHECK(cudaGetLastError());
 }
 
-static __global__ void mul_mat_id_back_scatter_kernel(
+// Every valid (token, slot) entry in ids is emitted exactly once by
+// mm_ids_helper. Since the destination address includes that slot, route
+// tiles write disjoint elements and a plain store is sufficient.
+static __global__ void mul_mat_id_back_scatter_store_kernel(
         const float * __restrict__ input_gradient,
         const int32_t * __restrict__ pairs,
         float * __restrict__ dst,
@@ -312,7 +315,7 @@ static __global__ void mul_mat_id_back_scatter_kernel(
 
     for (int64_t col = blockIdx.x * blockDim.x + threadIdx.x;
          col < input_dim; col += gridDim.x * blockDim.x) {
-        atomicAdd(dst_route + col, src_route[col] * (scale == nullptr ? 1.0f : *scale));
+        dst_route[col] = src_route[col] * (scale == nullptr ? 1.0f : *scale);
     }
 }
 
@@ -373,60 +376,6 @@ void ggml_cuda_mul_mat_id_back(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         return;
     }
 
-    ggml_cuda_pool_alloc<int32_t> pairs(ctx.pool(), static_cast<size_t>(n_routes));
-    ggml_cuda_pool_alloc<ggml_cuda_mm_id_tile_spec> tile_spec(ctx.pool(), static_cast<size_t>(n_experts + 1));
-    ggml_cuda_pool_alloc<int32_t> ids_src(ctx.pool(), static_cast<size_t>(n_routes));
-
-    const int si1 = static_cast<int>(ids->nb[1] / sizeof(int32_t));
-    const size_t n_tile_specs = static_cast<size_t>(n_experts + 1);
-    CUDA_CHECK(cudaMemsetAsync(tile_spec.ptr, 0xFF,
-        n_tile_specs * sizeof(ggml_cuda_mm_id_tile_spec), stream));
-    ggml_cuda_launch_mm_ids_helper(
-        ids_ptr,
-        ids_src.ptr,
-        pairs.ptr,
-        tile_spec.ptr,
-        static_cast<int>(n_experts),
-        static_cast<int>(n_tokens),
-        static_cast<int>(n_used),
-        static_cast<int>(n_used),
-        static_cast<int>(n_routes),
-        si1,
-        static_cast<int>(n_used),
-         false,
-        stream);
-    CUDA_CHECK(cudaGetLastError());
-
-    std::vector<ggml_cuda_mm_id_tile_spec> tile_spec_host(n_tile_specs);
-    CUDA_CHECK(cudaMemcpyAsync(tile_spec_host.data(), tile_spec.ptr,
-        tile_spec_host.size() * sizeof(ggml_cuda_mm_id_tile_spec), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    std::vector<int32_t> offsets_host(static_cast<size_t>(n_experts + 1));
-    for (int64_t expert = 0; expert < n_experts; ++expert) {
-        int32_t col_low  = std::numeric_limits<int32_t>::max();
-        int32_t col_high = 0;
-        bool found = false;
-        for (const ggml_cuda_mm_id_tile_spec & spec : tile_spec_host) {
-            if (spec.expert != expert) {
-                continue;
-            }
-            col_low  = std::min(col_low, spec.col_low);
-            col_high = std::max(col_high, spec.col_high);
-            found = true;
-        }
-        GGML_ASSERT(found);
-        offsets_host[expert]     = col_low;
-        offsets_host[expert + 1] = col_high;
-    }
-
-    const int64_t n_active_routes = offsets_host.back();
-    if (n_active_routes == 0) {
-        return;
-    }
-
-    const float * grad_ptr = (const float *) grad->data;
-    float * dst_ptr = (float *) dst->data;
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     const ggml_prec compute_type = ggml_prec_get_src(dst, 1);
     const bool use_fp16 = compute_type == GGML_PREC_F16
@@ -438,6 +387,116 @@ void ggml_cuda_mul_mat_id_back(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         : compute_type == GGML_PREC_UNDEFINED && as->type == GGML_TYPE_BF16 &&
             fast_bf16_hardware_available(cc);
     const bool use_fp32 = !use_fp16 && !use_bf16;
+
+    constexpr int64_t max_route_batch_capacity = 256;
+    constexpr size_t max_weight_temp_bytes = 64u * 1024u * 1024u;
+    constexpr size_t max_route_temp_bytes = 32u * 1024u * 1024u;
+
+    size_t free_memory = 0;
+    size_t total_memory = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free_memory, &total_memory));
+    const size_t weight_temp_budget = std::min(max_weight_temp_bytes, free_memory / 16);
+    const size_t compute_type_size = use_fp16 || use_bf16 ? sizeof(half) : sizeof(float);
+    const size_t bytes_per_output = static_cast<size_t>(input_dim) * compute_type_size;
+    const int64_t memory_limited_chunk = bytes_per_output == 0 ? output_dim :
+        static_cast<int64_t>(weight_temp_budget / bytes_per_output);
+    const int64_t weight_chunk_capacity = std::min(output_dim,
+        std::max<int64_t>(1, memory_limited_chunk));
+
+    // Select a route tile width from the temporary-memory budget. The actual
+    // per-expert route counts are not known until mm_ids_helper runs, so n_tokens
+    // (at most one route per expert and token) is the upper bound here.
+    const size_t route_temp_budget = std::min(max_route_temp_bytes, free_memory / 32);
+    const size_t gathered_dim_per_route = static_cast<size_t>(use_fp32 ? output_dim : weight_chunk_capacity);
+    const size_t gathered_bytes_per_route = gathered_dim_per_route * compute_type_size;
+    const size_t gradient_bytes_per_route = static_cast<size_t>(input_dim) * sizeof(float);
+    const size_t bytes_per_route = gathered_bytes_per_route + gradient_bytes_per_route;
+    const int64_t budget_routes = static_cast<int64_t>(std::max<size_t>(
+        1, route_temp_budget / std::max<size_t>(1, bytes_per_route)));
+    const int64_t max_batch_routes = std::min(n_tokens,
+        std::min(max_route_batch_capacity, budget_routes));
+    GGML_ASSERT(max_batch_routes > 0 && max_batch_routes <= std::numeric_limits<int>::max());
+
+    ggml_cuda_pool_alloc<int32_t> pairs(ctx.pool(), static_cast<size_t>(n_routes));
+    ggml_cuda_pool_alloc<int32_t> ids_src(ctx.pool(), static_cast<size_t>(n_routes));
+    const size_t n_tile_specs = static_cast<size_t>(
+        (n_routes + max_batch_routes - 1) / max_batch_routes + n_experts);
+    ggml_cuda_pool_alloc<ggml_cuda_mm_id_tile_spec> tile_spec(ctx.pool(), n_tile_specs);
+
+    const int si1 = static_cast<int>(ids->nb[1] / sizeof(int32_t));
+    CUDA_CHECK(cudaMemsetAsync(tile_spec.ptr, 0xFF,
+        n_tile_specs * sizeof(ggml_cuda_mm_id_tile_spec), stream));
+    ggml_cuda_launch_mm_ids_helper(
+        ids_ptr,
+        ids_src.ptr,
+        pairs.ptr,
+        tile_spec.ptr,
+        static_cast<int>(n_experts),
+        static_cast<int>(n_tokens),
+        static_cast<int>(n_used),
+        static_cast<int>(n_used),
+        static_cast<int>(max_batch_routes),
+        si1,
+        static_cast<int>(n_used),
+        false,
+        stream);
+    CUDA_CHECK(cudaGetLastError());
+
+    // mm_ids_helper produces actual expert/route tiles. This is the same
+    // variable-occupancy tile representation consumed by mmq/mmf: every
+    // non-empty spec contains only real routes, with no zero-padded GEMM rows.
+    std::vector<ggml_cuda_mm_id_tile_spec> tile_spec_host(n_tile_specs);
+    CUDA_CHECK(cudaMemcpyAsync(tile_spec_host.data(), tile_spec.ptr,
+        tile_spec_host.size() * sizeof(ggml_cuda_mm_id_tile_spec), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::vector<std::vector<ggml_cuda_mm_id_tile_spec>> expert_tiles(static_cast<size_t>(n_experts));
+    std::vector<int32_t> expert_begin(static_cast<size_t>(n_experts), std::numeric_limits<int32_t>::max());
+    std::vector<int32_t> expert_end(static_cast<size_t>(n_experts), 0);
+    for (const ggml_cuda_mm_id_tile_spec & spec : tile_spec_host) {
+        if (spec.expert < 0) {
+            continue;
+        }
+        GGML_ASSERT(spec.expert < n_experts);
+        const size_t expert = static_cast<size_t>(spec.expert);
+        expert_begin[expert] = std::min(expert_begin[expert], spec.col_low);
+        expert_end[expert] = std::max(expert_end[expert], spec.col_high);
+        if (spec.col_high > spec.col_low) {
+            expert_tiles[expert].push_back(spec);
+        }
+    }
+
+    std::vector<int32_t> offsets_host(static_cast<size_t>(n_experts + 1), 0);
+    for (int64_t expert = 0; expert < n_experts; ++expert) {
+        const size_t e = static_cast<size_t>(expert);
+        const int32_t begin = expert_begin[e] == std::numeric_limits<int32_t>::max()
+            ? offsets_host[e] : expert_begin[e];
+        const int32_t end = expert_begin[e] == std::numeric_limits<int32_t>::max()
+            ? begin : expert_end[e];
+        GGML_ASSERT(begin == offsets_host[e]);
+        offsets_host[e + 1] = end;
+
+        auto & tiles = expert_tiles[e];
+        std::sort(tiles.begin(), tiles.end(), [](const auto & a, const auto & b) {
+            return a.col_low < b.col_low;
+        });
+        int32_t next_route = begin;
+        for (const ggml_cuda_mm_id_tile_spec & tile : tiles) {
+            GGML_ASSERT(tile.col_low == next_route);
+            GGML_ASSERT(tile.col_high > tile.col_low);
+            GGML_ASSERT(tile.col_high - tile.col_low <= max_batch_routes);
+            next_route = tile.col_high;
+        }
+        GGML_ASSERT(next_route == end);
+    }
+
+    const int64_t n_active_routes = offsets_host.back();
+    if (n_active_routes == 0) {
+        return;
+    }
+
+    const float * grad_ptr = (const float *) grad->data;
+    float * dst_ptr = (float *) dst->data;
     const to_fp16_cuda_t to_fp16 = use_fp16 && as->type != GGML_TYPE_F16
         ? ggml_get_to_fp16_cuda(as->type) : nullptr;
     const to_bf16_cuda_t to_bf16 = use_bf16 && as->type != GGML_TYPE_BF16
@@ -450,6 +509,7 @@ void ggml_cuda_mul_mat_id_back(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     GGML_ASSERT(!use_fp16 || as->type == GGML_TYPE_F16 || to_fp16 != nullptr || to_fp32 != nullptr);
     GGML_ASSERT(!use_bf16 || as->type == GGML_TYPE_BF16 || to_bf16 != nullptr || to_fp32 != nullptr);
     GGML_ASSERT(!use_fp32 || as->type == GGML_TYPE_F32 || to_fp32 != nullptr);
+
     ggml_cuda_pool_alloc<unsigned int> grad_absmax(ctx.pool());
     ggml_cuda_pool_alloc<float> grad_scales(ctx.pool());
     if (use_fp16) {
@@ -457,22 +517,6 @@ void ggml_cuda_mul_mat_id_back(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         grad_scales.alloc(2);
         ggml_cuda_f16_scale_init(grad, grad_absmax.ptr, grad_scales.ptr, stream);
     }
-    constexpr int64_t min_weight_chunk_dim = 1024;
-    constexpr int64_t max_weight_chunk_dim = 8192;
-    constexpr int64_t max_batch_routes = 64;
-    constexpr size_t max_weight_temp_bytes = 64u * 1024u * 1024u;
-
-    size_t free_memory = 0;
-    size_t total_memory = 0;
-    CUDA_CHECK(cudaMemGetInfo(&free_memory, &total_memory));
-    const size_t weight_temp_budget = std::min(max_weight_temp_bytes, free_memory / 16);
-    const size_t compute_type_size = use_fp16 || use_bf16 ? sizeof(half) : sizeof(float);
-    const size_t bytes_per_output = static_cast<size_t>(input_dim) * compute_type_size;
-    const int64_t memory_limited_chunk = bytes_per_output == 0 ? min_weight_chunk_dim :
-        static_cast<int64_t>(weight_temp_budget / bytes_per_output);
-    const int64_t max_chunk_dim = std::max(min_weight_chunk_dim,
-        std::min(max_weight_chunk_dim, memory_limited_chunk));
-    const int64_t weight_chunk_capacity = std::min(output_dim, max_chunk_dim);
 
     ggml_cuda_pool_alloc<float> weights_f32(ctx.pool());
     ggml_cuda_pool_alloc<half> weights_f16(ctx.pool());
@@ -524,7 +568,7 @@ void ggml_cuda_mul_mat_id_back(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 
         const ggml_type compute_weight_type = use_fp16 ? GGML_TYPE_F16 :
             use_bf16 ? GGML_TYPE_BF16 : GGML_TYPE_F32;
-        const bool cache_full_weights = expert_routes > max_batch_routes &&
+        const bool cache_full_weights = expert_tiles[static_cast<size_t>(expert)].size() > 1 &&
             weight_chunk_capacity == output_dim && ggml_is_contiguous(as) &&
             as->type != compute_weight_type;
         const half * cached_weights_f16 = nullptr;
@@ -562,10 +606,10 @@ void ggml_cuda_mul_mat_id_back(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             }
         }
 
-        const int32_t * expert_pairs = pairs.ptr + route_begin;
-        for (int64_t route_offset = 0; route_offset < expert_routes; route_offset += max_batch_routes) {
-            const int64_t route_count = std::min(max_batch_routes, expert_routes - route_offset);
-            const int32_t * route_pairs = expert_pairs + route_offset;
+        for (const ggml_cuda_mm_id_tile_spec & route_tile : expert_tiles[static_cast<size_t>(expert)]) {
+            const int64_t tile_route_begin = route_tile.col_low;
+            const int64_t route_count = route_tile.col_high - route_tile.col_low;
+            const int32_t * route_pairs = pairs.ptr + tile_route_begin;
             if (use_fp32) {
                 const dim3 gather_grid((output_dim + 255) / 256, route_count, 1);
                 mul_mat_id_back_gather_kernel<<<gather_grid, 256, 0, stream>>>(
@@ -674,7 +718,7 @@ void ggml_cuda_mul_mat_id_back(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             }
 
             const dim3 scatter_grid((input_dim + 255) / 256, route_count, 1);
-            mul_mat_id_back_scatter_kernel<<<scatter_grid, 256, 0, stream>>>(
+            mul_mat_id_back_scatter_store_kernel<<<scatter_grid, 256, 0, stream>>>(
                 input_gradient.ptr, route_pairs, dst_ptr, input_dim, n_used, n_slots,
                 dst_nb1, dst_nb2, use_fp16 ? grad_scales.ptr + 1 : nullptr);
             CUDA_CHECK(cudaGetLastError());
