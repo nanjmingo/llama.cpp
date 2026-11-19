@@ -1,0 +1,134 @@
+name: Llamango Ubuntu CUDA Build
+
+on:
+  workflow_call:
+    inputs:
+      cuda_display_version:
+        description: Short CUDA version shown in the Actions job title.
+        required: true
+        type: string
+      container_image:
+        description: CUDA development container image.
+        required: true
+        type: string
+      cache_key_prefix:
+        description: Stable prefix for the ccache key.
+        required: true
+        type: string
+      asset_name:
+        description: Package asset filename.
+        required: true
+        type: string
+      skip_build:
+        description: Skip this build when its release asset already exists.
+        required: false
+        default: false
+        type: boolean
+      release_tag:
+        description: Prerelease tag created by the orchestrator.
+        required: true
+        type: string
+
+jobs:
+  build:
+    if: ${{ !inputs.skip_build }}
+    concurrency:
+      group: ${{ inputs.cache_key_prefix }}-${{ github.ref }}
+      queue: max
+    name: CUDA ${{ inputs.cuda_display_version }}
+    runs-on: ubuntu-22.04
+    container: ${{ inputs.container_image }}
+    permissions:
+      actions: write
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential ccache cmake ninja-build git gcc-12 g++-12 libgomp1 libssl-dev jq python3 python3-venv python3-pip tar
+
+      - name: Setup ccache
+        uses: ./.github/actions/llamango-ccache-linux
+        with:
+          cache-key-prefix: ${{ inputs.cache_key_prefix }}
+
+      - name: Configure full CUDA build
+        shell: bash
+        env:
+          CC: gcc-12
+          CXX: g++-12
+        run: |
+          cmake_args=(
+            -S .
+            -B build
+            -G Ninja
+            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_RPATH_USE_ORIGIN=ON
+            -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-12
+            -DCMAKE_CUDA_RUNTIME_LIBRARY=Static
+            "-DCMAKE_EXE_LINKER_FLAGS=-static-libgcc -static-libstdc++ -Wl,--allow-shlib-undefined"
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+            -DLLAMA_BUILD_COMMON=ON
+            -DLLAMA_BUILD_TOOLS=ON
+            -DLLAMA_BUILD_TESTS=ON
+            -DLLAMA_BUILD_EXAMPLES=ON
+            -DLLAMA_BUILD_SERVER=ON
+            -DLLAMA_BUILD_APP=ON
+            -DLLAMA_FATAL_WARNINGS=ON
+            -DGGML_NATIVE=OFF
+            -DGGML_CPU=ON
+            -DGGML_CUDA=ON
+          )
+          cmake "${cmake_args[@]}"
+
+      - name: Build all targets
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --build build --parallel "$(nproc)"
+
+      - name: Package Ubuntu CUDA build
+        id: package
+        if: always() && steps.build.outcome == 'success'
+        shell: bash
+        env:
+          ASSET_NAME: ${{ inputs.asset_name }}
+        run: |
+          set -euo pipefail
+          tar -czf "$ASSET_NAME" -C build/bin .
+
+      - name: Publish Ubuntu CUDA package
+        if: always() && steps.package.outcome == 'success'
+        uses: ./.github/actions/llamango-upload-release-asset
+        with:
+          release-tag: ${{ inputs.release_tag }}
+          asset-path: ${{ inputs.asset_name }}
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+
+      - name: Evict stale ccache entries
+        if: always() && steps.build.outcome == 'success'
+        shell: bash
+        run: |
+          if ! ccache --evict-older-than 4d >/dev/null 2>&1; then
+            echo "::warning::Failed to evict stale ccache entries; continuing without cleanup."
+          fi
+
+      - name: Save ccache
+        if: always() && steps.build.outcome == 'success'
+        uses: actions/cache/save@v6
+        with:
+          path: .ccache
+          key: ${{ inputs.cache_key_prefix }}-${{ github.run_id }}
+
+      - name: Cleanup ccache
+        if: always() && !cancelled()
+        uses: ./.github/actions/llamango-ccache-cleanup
+        with:
+          cache-key-prefix: ${{ inputs.cache_key_prefix }}
