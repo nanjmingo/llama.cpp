@@ -1399,15 +1399,17 @@ struct llama_model::impl {
     std::vector<float> tensor_split_owned;
 };
 
-static ggml_prec llama_prec_policy_resolve(ggml_prec requested, ggml_type weight_type) {
-    if (requested != GGML_PREC_Q8 || ggml_is_quantized(weight_type)) {
-        return requested;
+static ggml_prec llama_prec_policy_resolve(
+    ggml_prec requested,
+    ggml_type weight_type) {
+    if (requested == GGML_PREC_Q8 && !ggml_is_quantized(weight_type)) {
+        // Q8 activations are supported by quantized-weight kernels. For floating-point
+        // weights, use F16 instead; the CUDA cuBLAS path falls back to F32 when F16
+        // computation is not supported by the device.
+        return GGML_PREC_F16;
     }
 
-    // Q8 activations are supported by quantized-weight kernels. For floating-point
-    // weights, use F16 instead; the CUDA cuBLAS path falls back to F32 when F16
-    // computation is not supported by the device.
-    return GGML_PREC_F16;
+    return requested;
 }
 
 bool llama_prec_policy::apply(ggml_tensor * res) const {
