@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <limits>
 #include <type_traits>
+#include <vector>
 
 static __global__ void out_prod_absmax_src1(
         const char * src1, const int64_t n_rows, const int64_t n_cols,
@@ -253,39 +254,37 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
 // The helper is called with tile_width == n_routes. Its tile_spec layout is
 // therefore one optional seam tile at index 0 plus one tail tile per expert
-// at index 1 + expert. Merge those entries into a compact per-expert range.
-static __global__ void out_prod_id_finalize_ranges_kernel(
-        const ggml_cuda_mm_id_tile_spec * tile_spec,
-        ggml_cuda_mm_id_tile_spec * expert_ranges,
-        int32_t * max_expert_tokens,
-        const int n_experts) {
-    const int expert = blockIdx.x * blockDim.x + threadIdx.x;
-    if (expert >= n_experts) {
+// at index 1 + expert. The host combines these small metadata records once;
+// route indices themselves remain on the GPU.
+template<typename src_t, typename lowp_t>
+static __global__ void out_prod_id_gather_kernel(
+        const src_t * src, lowp_t * dst, const int32_t * route_indices,
+        const int64_t n_cols, const int64_t n_expert_used,
+        const int64_t stride_exp, const int64_t stride_tok,
+        const int64_t n_elements, const float * scale) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_elements) {
         return;
     }
 
-    const ggml_cuda_mm_id_tile_spec tail = tile_spec[1 + expert];
-    const ggml_cuda_mm_id_tile_spec seam = tile_spec[0];
-    int32_t route_begin = 0x7fffffff;
-    int32_t route_end = 0;
-    bool found = false;
-    if (tail.expert == expert) {
-        route_begin = tail.col_low;
-        route_end = tail.col_high;
-        found = true;
-    }
-    if (seam.expert == expert) {
-        route_begin = found ? min(route_begin, seam.col_low) : seam.col_low;
-        route_end = found ? max(route_end, seam.col_high) : seam.col_high;
-        found = true;
-    }
-    if (!found) {
-        route_begin = 0;
-        route_end = 0;
-    }
+    const int64_t token_i = i / n_cols;
+    const int64_t col = i - token_i * n_cols;
+    const int64_t flat = route_indices[token_i];
+    const int64_t expert_slot = flat % n_expert_used;
+    const int64_t token = flat / n_expert_used;
+    const src_t value = src[expert_slot * stride_exp + token * stride_tok + col];
 
-    expert_ranges[expert] = { expert, route_begin, route_end, 0 };
-    atomicMax(max_expert_tokens, route_end - route_begin);
+    if constexpr (std::is_same_v<src_t, float>) {
+        if constexpr (std::is_same_v<lowp_t, half>) {
+            dst[i] = __float2half_rn(value * (scale == nullptr ? 1.0f : *scale));
+        } else if constexpr (std::is_same_v<lowp_t, nv_bfloat16>) {
+            dst[i] = __float2bfloat16(value);
+        } else {
+            dst[i] = value;
+        }
+    } else {
+        dst[i] = (lowp_t) value;
+    }
 }
 
 template<typename src_t, typename lowp_t>
@@ -296,17 +295,18 @@ static __global__ void out_prod_id_gather_batched_kernel(
         const int64_t n_cols, const int64_t n_expert_used,
         const int64_t stride_exp, const int64_t stride_tok,
         const int64_t tile_capacity, const int64_t token_begin,
-        const int64_t n_elements, const float * scale) {
+        const int expert_begin, const int64_t n_elements, const float * scale) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_elements) {
         return;
     }
 
     const int64_t expert_stride = n_cols * tile_capacity;
-    const int64_t expert = i / expert_stride;
-    const int64_t local_i = i - expert * expert_stride;
+    const int64_t expert_in_group = i / expert_stride;
+    const int64_t expert = expert_begin + expert_in_group;
+    const int64_t local_i = i - expert_in_group * expert_stride;
     const int64_t token_i = local_i / n_cols;
-    const int64_t col = local_i % n_cols;
+    const int64_t col = local_i - token_i * n_cols;
 
     const ggml_cuda_mm_id_tile_spec spec = expert_ranges[expert];
     const int64_t expert_tokens = spec.col_high - spec.col_low;
@@ -339,13 +339,17 @@ static __global__ void out_prod_id_gather_batched_kernel(
     }
 }
 
+// Group experts into contiguous batches. Each batch has its own maximum route
+// count, so padding is limited to experts within that batch rather than all
+// experts in the model.
 template<typename src0_t, typename lowp_t>
 static void ggml_cuda_out_prod_id_grouped_impl(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
         const int32_t * route_indices,
         const ggml_cuda_mm_id_tile_spec * expert_ranges,
-        const size_t max_expert_tokens, const int n_experts,
+        const std::vector<ggml_cuda_mm_id_tile_spec> & expert_ranges_host,
+        const size_t max_expert_tokens, const int group_size,
         const cudaDataType_t data_type, const float * scale) {
     const int64_t cols = src0->ne[0];
     const int64_t n_expert_used = src0->ne[1];
@@ -362,27 +366,23 @@ static void ggml_cuda_out_prod_id_grouped_impl(
         return;
     }
 
-    GGML_ASSERT(cols > 0 && rows > 0 && n_experts > 0);
+    GGML_ASSERT(cols > 0 && rows > 0 && group_size > 1);
     GGML_ASSERT(cols <= std::numeric_limits<int>::max());
     GGML_ASSERT(rows <= std::numeric_limits<int>::max());
 
-    // All experts are gathered into equally-sized K tiles. Shorter experts
-    // are zero-padded, which lets cuBLAS execute the expert group in one
-    // strided-batched GEMM instead of issuing one GEMM per expert.
     constexpr size_t workspace_max = 64ull * 1024 * 1024;
     const size_t bytes_per_expert_token = sizeof(lowp_t) *
         (static_cast<size_t>(cols) + static_cast<size_t>(rows));
-    const size_t bytes_per_token = bytes_per_expert_token * static_cast<size_t>(n_experts);
-    const size_t tile_capacity = std::max<size_t>(1,
-        std::min(max_expert_tokens, workspace_max / bytes_per_token));
-    GGML_ASSERT(tile_capacity <= static_cast<size_t>(std::numeric_limits<int>::max()));
+    const size_t group_bytes_per_token = bytes_per_expert_token * static_cast<size_t>(group_size);
+    GGML_ASSERT(group_bytes_per_token <= workspace_max);
+    const size_t max_tile_capacity = std::max<size_t>(1,
+        std::min(max_expert_tokens, workspace_max / group_bytes_per_token));
+    GGML_ASSERT(max_tile_capacity <= static_cast<size_t>(std::numeric_limits<int>::max()));
 
-    const size_t a_batch_stride = static_cast<size_t>(cols) * tile_capacity;
-    const size_t b_batch_stride = static_cast<size_t>(rows) * tile_capacity;
-    const size_t a_elements = a_batch_stride * static_cast<size_t>(n_experts);
-    const size_t b_elements = b_batch_stride * static_cast<size_t>(n_experts);
-    ggml_cuda_pool_alloc<lowp_t> a_gathered(ctx.pool(), a_elements);
-    ggml_cuda_pool_alloc<lowp_t> b_gathered(ctx.pool(), b_elements);
+    const size_t a_max_elements = static_cast<size_t>(cols) * max_tile_capacity * group_size;
+    const size_t b_max_elements = static_cast<size_t>(rows) * max_tile_capacity * group_size;
+    ggml_cuda_pool_alloc<lowp_t> a_gathered(ctx.pool(), a_max_elements);
+    ggml_cuda_pool_alloc<lowp_t> b_gathered(ctx.pool(), b_max_elements);
 
     cudaStream_t stream = ctx.stream();
     cublasHandle_t handle = ctx.cublas_handle();
@@ -400,43 +400,62 @@ static void ggml_cuda_out_prod_id_grouped_impl(
     const src0_t * a_base = (const src0_t *) src0->data;
     const float * b_base = (const float *) src1->data;
     float * d_base = (float *) dst->data;
-    const int64_t a_count = static_cast<int64_t>(a_batch_stride) * n_experts;
-    const int64_t b_count = static_cast<int64_t>(b_batch_stride) * n_experts;
 
-    for (size_t token_begin = 0; token_begin < max_expert_tokens; token_begin += tile_capacity) {
+    for (int expert_begin = 0; expert_begin < static_cast<int>(expert_ranges_host.size());
+         expert_begin += group_size) {
+        const int group_count = std::min(group_size,
+            static_cast<int>(expert_ranges_host.size()) - expert_begin);
+        size_t group_max_routes = 0;
+        for (int i = 0; i < group_count; ++i) {
+            const ggml_cuda_mm_id_tile_spec & range =
+                expert_ranges_host[static_cast<size_t>(expert_begin + i)];
+            group_max_routes = std::max(group_max_routes,
+                static_cast<size_t>(range.col_high - range.col_low));
+        }
+        if (group_max_routes == 0) {
+            continue;
+        }
+
+        const size_t tile_capacity = std::min(group_max_routes, max_tile_capacity);
+        const size_t a_batch_stride = static_cast<size_t>(cols) * tile_capacity;
+        const size_t b_batch_stride = static_cast<size_t>(rows) * tile_capacity;
+        const int64_t a_count = static_cast<int64_t>(a_batch_stride) * group_count;
+        const int64_t b_count = static_cast<int64_t>(b_batch_stride) * group_count;
         const int a_blocks = static_cast<int>((a_count + threads - 1) / threads);
         const int b_blocks = static_cast<int>((b_count + threads - 1) / threads);
-        out_prod_id_gather_batched_kernel<src0_t, lowp_t><<<a_blocks, threads, 0, stream>>>(
-            a_base, a_gathered.ptr, route_indices, expert_ranges, cols, n_expert_used,
-            a_stride_exp, a_stride_tok, static_cast<int64_t>(tile_capacity),
-            static_cast<int64_t>(token_begin), a_count, nullptr);
-        out_prod_id_gather_batched_kernel<float, lowp_t><<<b_blocks, threads, 0, stream>>>(
-            b_base, b_gathered.ptr, route_indices, expert_ranges, rows, n_expert_used,
-            b_stride_exp, b_stride_tok, static_cast<int64_t>(tile_capacity),
-            static_cast<int64_t>(token_begin), b_count, scale);
-        CUDA_CHECK(cudaGetLastError());
 
-        // The final tile is zero-padded to tile_capacity by the gather kernel.
-        if constexpr (std::is_same_v<lowp_t, float>) {
-            CUBLAS_CHECK(cublasSgemmStridedBatched(handle, CUBLAS_OP_N, CUBLAS_OP_T,
-                static_cast<int>(cols), static_cast<int>(rows), static_cast<int>(tile_capacity),
-                &alpha, (const float *) a_gathered.ptr, static_cast<int>(cols),
-                        static_cast<long long>(a_batch_stride),
-                        (const float *) b_gathered.ptr, static_cast<int>(rows),
-                        static_cast<long long>(b_batch_stride),
-                &beta, d_base, static_cast<int>(cols),
-                        static_cast<long long>(dst_stride_e),
-                n_experts));
-        } else {
-            CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_N, CUBLAS_OP_T,
-                static_cast<int>(cols), static_cast<int>(rows), static_cast<int>(tile_capacity),
-                &alpha, a_gathered.ptr, data_type, static_cast<int>(cols),
-                        static_cast<long long>(a_batch_stride),
-                        b_gathered.ptr, data_type, static_cast<int>(rows),
-                        static_cast<long long>(b_batch_stride),
-                &beta, d_base, CUDA_R_32F, static_cast<int>(cols),
-                        static_cast<long long>(dst_stride_e),
-                n_experts, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        for (size_t token_begin = 0; token_begin < group_max_routes; token_begin += tile_capacity) {
+            out_prod_id_gather_batched_kernel<src0_t, lowp_t><<<a_blocks, threads, 0, stream>>>(
+                a_base, a_gathered.ptr, route_indices, expert_ranges, cols, n_expert_used,
+                a_stride_exp, a_stride_tok, static_cast<int64_t>(tile_capacity),
+                static_cast<int64_t>(token_begin), expert_begin, a_count, nullptr);
+            out_prod_id_gather_batched_kernel<float, lowp_t><<<b_blocks, threads, 0, stream>>>(
+                b_base, b_gathered.ptr, route_indices, expert_ranges, rows, n_expert_used,
+                b_stride_exp, b_stride_tok, static_cast<int64_t>(tile_capacity),
+                static_cast<int64_t>(token_begin), expert_begin, b_count, scale);
+            CUDA_CHECK(cudaGetLastError());
+
+            if constexpr (std::is_same_v<lowp_t, float>) {
+                CUBLAS_CHECK(cublasSgemmStridedBatched(handle, CUBLAS_OP_N, CUBLAS_OP_T,
+                    static_cast<int>(cols), static_cast<int>(rows), static_cast<int>(tile_capacity),
+                    &alpha, (const float *) a_gathered.ptr, static_cast<int>(cols),
+                            static_cast<long long>(a_batch_stride),
+                            (const float *) b_gathered.ptr, static_cast<int>(rows),
+                            static_cast<long long>(b_batch_stride),
+                    &beta, d_base + static_cast<int64_t>(expert_begin) * dst_stride_e,
+                            static_cast<int>(cols), static_cast<long long>(dst_stride_e),
+                    group_count));
+            } else {
+                CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_N, CUBLAS_OP_T,
+                    static_cast<int>(cols), static_cast<int>(rows), static_cast<int>(tile_capacity),
+                    &alpha, a_gathered.ptr, data_type, static_cast<int>(cols),
+                            static_cast<long long>(a_batch_stride),
+                            b_gathered.ptr, data_type, static_cast<int>(rows),
+                            static_cast<long long>(b_batch_stride),
+                    &beta, d_base + static_cast<int64_t>(expert_begin) * dst_stride_e,
+                            CUDA_R_32F, static_cast<int>(cols), static_cast<long long>(dst_stride_e),
+                    group_count, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            }
         }
     }
 
@@ -451,17 +470,139 @@ static void ggml_cuda_out_prod_id_grouped(
         const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
         const int32_t * route_indices,
         const ggml_cuda_mm_id_tile_spec * expert_ranges,
-        const size_t max_expert_tokens, const int n_experts,
+        const std::vector<ggml_cuda_mm_id_tile_spec> & expert_ranges_host,
+        const size_t max_expert_tokens, const int group_size,
         const cudaDataType_t data_type, const float * scale) {
     if (src0->type == GGML_TYPE_F16) {
         ggml_cuda_out_prod_id_grouped_impl<half, lowp_t>(
-            ctx, src0, src1, dst, route_indices, expert_ranges, max_expert_tokens,
-            n_experts, data_type, scale);
+            ctx, src0, src1, dst, route_indices, expert_ranges, expert_ranges_host,
+            max_expert_tokens, group_size, data_type, scale);
     } else {
         GGML_ASSERT(src0->type == GGML_TYPE_F32);
         ggml_cuda_out_prod_id_grouped_impl<float, lowp_t>(
-            ctx, src0, src1, dst, route_indices, expert_ranges, max_expert_tokens,
-            n_experts, data_type, scale);
+            ctx, src0, src1, dst, route_indices, expert_ranges, expert_ranges_host,
+            max_expert_tokens, group_size, data_type, scale);
+    }
+}
+
+// Fallback for unbalanced routing and small workloads. Reuse one pair of
+// gather buffers and process only experts which actually received routes.
+template<typename src0_t, typename lowp_t>
+static void ggml_cuda_out_prod_id_per_expert_impl(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+        const int32_t * route_indices,
+        const std::vector<ggml_cuda_mm_id_tile_spec> & expert_ranges,
+        const size_t max_expert_tokens,
+        const cudaDataType_t data_type, const float * scale) {
+    const int64_t cols = src0->ne[0];
+    const int64_t n_expert_used = src0->ne[1];
+    const int64_t rows = src1->ne[0];
+
+    const int64_t src0_type_size = ggml_type_size(src0->type);
+    const int64_t a_stride_exp = src0->nb[1] / src0_type_size;
+    const int64_t a_stride_tok = src0->nb[2] / src0_type_size;
+    const int64_t b_stride_exp = src1->nb[1] / sizeof(float);
+    const int64_t b_stride_tok = src1->nb[2] / sizeof(float);
+    const int64_t dst_stride_e = dst->nb[2] / sizeof(float);
+
+    if (max_expert_tokens == 0) {
+        return;
+    }
+
+    GGML_ASSERT(cols > 0 && rows > 0);
+    GGML_ASSERT(cols <= std::numeric_limits<int>::max());
+    GGML_ASSERT(rows <= std::numeric_limits<int>::max());
+
+    constexpr size_t workspace_max = 64ull * 1024 * 1024;
+    const size_t bytes_per_token = sizeof(lowp_t) *
+        (static_cast<size_t>(cols) + static_cast<size_t>(rows));
+    GGML_ASSERT(bytes_per_token > 0);
+    const size_t tile_capacity = std::max<size_t>(1,
+        std::min(max_expert_tokens, workspace_max / bytes_per_token));
+    ggml_cuda_pool_alloc<lowp_t> a_gathered(ctx.pool(), static_cast<size_t>(cols) * tile_capacity);
+    ggml_cuda_pool_alloc<lowp_t> b_gathered(ctx.pool(), static_cast<size_t>(rows) * tile_capacity);
+
+    cudaStream_t stream = ctx.stream();
+    cublasHandle_t handle = ctx.cublas_handle();
+    CUBLAS_CHECK(cublasSetStream(handle, stream));
+
+    const float alpha = 1.0f;
+    const float beta = 1.0f;
+    const int threads = 256;
+    cublasPointerMode_t pointer_mode = CUBLAS_POINTER_MODE_HOST;
+    CUBLAS_CHECK(cublasGetPointerMode(handle, &pointer_mode));
+    if (pointer_mode != CUBLAS_POINTER_MODE_HOST) {
+        CUBLAS_CHECK(cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_HOST));
+    }
+
+    const src0_t * a_base = (const src0_t *) src0->data;
+    const float * b_base = (const float *) src1->data;
+    float * d_base = (float *) dst->data;
+
+    for (size_t expert = 0; expert < expert_ranges.size(); ++expert) {
+        const ggml_cuda_mm_id_tile_spec & range = expert_ranges[expert];
+        const size_t expert_routes = static_cast<size_t>(range.col_high - range.col_low);
+        if (expert_routes == 0) {
+            continue;
+        }
+        const int64_t dst_offset = static_cast<int64_t>(expert) * dst_stride_e;
+
+        for (size_t token_begin = 0; token_begin < expert_routes; token_begin += tile_capacity) {
+            const int64_t tile_routes = static_cast<int64_t>(
+                std::min(tile_capacity, expert_routes - token_begin));
+            const int64_t a_count = cols * tile_routes;
+            const int64_t b_count = rows * tile_routes;
+
+            out_prod_id_gather_kernel<src0_t, lowp_t><<<
+                static_cast<int>((a_count + threads - 1) / threads), threads, 0, stream>>>(
+                    a_base, a_gathered.ptr,
+                    route_indices + range.col_low + token_begin, cols, n_expert_used,
+                    a_stride_exp, a_stride_tok, a_count, nullptr);
+            out_prod_id_gather_kernel<float, lowp_t><<<
+                static_cast<int>((b_count + threads - 1) / threads), threads, 0, stream>>>(
+                    b_base, b_gathered.ptr,
+                    route_indices + range.col_low + token_begin, rows, n_expert_used,
+                    b_stride_exp, b_stride_tok, b_count, scale);
+            CUDA_CHECK(cudaGetLastError());
+
+            if constexpr (std::is_same_v<lowp_t, float>) {
+                CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
+                    static_cast<int>(cols), static_cast<int>(rows), static_cast<int>(tile_routes),
+                    &alpha, (const float *) a_gathered.ptr, static_cast<int>(cols),
+                            (const float *) b_gathered.ptr, static_cast<int>(rows),
+                    &beta, d_base + dst_offset, static_cast<int>(cols)));
+            } else {
+                CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_T,
+                    static_cast<int>(cols), static_cast<int>(rows), static_cast<int>(tile_routes),
+                    &alpha, a_gathered.ptr, data_type, static_cast<int>(cols),
+                            b_gathered.ptr, data_type, static_cast<int>(rows),
+                    &beta, d_base + dst_offset, CUDA_R_32F, static_cast<int>(cols),
+                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            }
+        }
+    }
+
+    if (pointer_mode != CUBLAS_POINTER_MODE_HOST) {
+        CUBLAS_CHECK(cublasSetPointerMode(handle, pointer_mode));
+    }
+}
+
+template<typename lowp_t>
+static void ggml_cuda_out_prod_id_per_expert(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+        const int32_t * route_indices,
+        const std::vector<ggml_cuda_mm_id_tile_spec> & expert_ranges,
+        const size_t max_expert_tokens,
+        const cudaDataType_t data_type, const float * scale) {
+    if (src0->type == GGML_TYPE_F16) {
+        ggml_cuda_out_prod_id_per_expert_impl<half, lowp_t>(
+            ctx, src0, src1, dst, route_indices, expert_ranges, max_expert_tokens, data_type, scale);
+    } else {
+        GGML_ASSERT(src0->type == GGML_TYPE_F32);
+        ggml_cuda_out_prod_id_per_expert_impl<float, lowp_t>(
+            ctx, src0, src1, dst, route_indices, expert_ranges, max_expert_tokens, data_type, scale);
     }
 }
 
@@ -537,23 +678,52 @@ void ggml_cuda_out_prod_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         stream);
     CUDA_CHECK(cudaGetLastError());
 
-    ggml_cuda_pool_alloc<ggml_cuda_mm_id_tile_spec> expert_ranges(ctx.pool(),
-        static_cast<size_t>(n_expert));
-    ggml_cuda_pool_alloc<int32_t> max_expert_tokens_device(ctx.pool(), 1);
-    CUDA_CHECK(cudaMemsetAsync(max_expert_tokens_device.ptr, 0, sizeof(int32_t), stream));
-    constexpr int range_threads = 256;
-    const int range_blocks = (static_cast<int>(n_expert) + range_threads - 1) / range_threads;
-    out_prod_id_finalize_ranges_kernel<<<range_blocks, range_threads, 0, stream>>>(
-        tile_spec.ptr, expert_ranges.ptr, max_expert_tokens_device.ptr,
-        static_cast<int>(n_expert));
-    CUDA_CHECK(cudaGetLastError());
-
-    int32_t max_expert_tokens_host = 0;
-    CUDA_CHECK(cudaMemcpyAsync(&max_expert_tokens_host, max_expert_tokens_device.ptr,
-        sizeof(max_expert_tokens_host), cudaMemcpyDeviceToHost, stream));
+    // A single D2H transfer of the small tile-spec array lets the host build
+    // exact expert ranges and estimate the padding cost before choosing a GEMM path.
+    std::vector<ggml_cuda_mm_id_tile_spec> tile_spec_host(n_tile_specs);
+    CUDA_CHECK(cudaMemcpyAsync(tile_spec_host.data(), tile_spec.ptr,
+        n_tile_specs * sizeof(ggml_cuda_mm_id_tile_spec), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    GGML_ASSERT(max_expert_tokens_host >= 0 && max_expert_tokens_host <= n_routes);
-    if (max_expert_tokens_host == 0) {
+
+    std::vector<ggml_cuda_mm_id_tile_spec> expert_ranges_host(static_cast<size_t>(n_expert));
+    size_t max_expert_tokens = 0;
+    size_t total_active_routes = 0;
+    size_t active_experts = 0;
+    for (int64_t expert = 0; expert < n_expert; ++expert) {
+        int32_t route_begin = std::numeric_limits<int32_t>::max();
+        int32_t route_end = 0;
+        bool found = false;
+
+        const ggml_cuda_mm_id_tile_spec tail = tile_spec_host[static_cast<size_t>(1 + expert)];
+        const ggml_cuda_mm_id_tile_spec seam = tile_spec_host[0];
+        if (tail.expert == expert) {
+            route_begin = tail.col_low;
+            route_end = tail.col_high;
+            found = true;
+        }
+        if (seam.expert == expert) {
+            route_begin = found ? std::min(route_begin, seam.col_low) : seam.col_low;
+            route_end = found ? std::max(route_end, seam.col_high) : seam.col_high;
+            found = true;
+        }
+
+        GGML_ASSERT(found);
+        GGML_ASSERT(route_begin >= 0 && route_end >= route_begin && route_end <= n_routes);
+        if (expert > 0) {
+            GGML_ASSERT(expert_ranges_host[static_cast<size_t>(expert - 1)].col_high == route_begin);
+        }
+        expert_ranges_host[static_cast<size_t>(expert)] = {
+            static_cast<int32_t>(expert), route_begin, route_end, 0
+        };
+
+        const size_t expert_routes = static_cast<size_t>(route_end - route_begin);
+        max_expert_tokens = std::max(max_expert_tokens, expert_routes);
+        total_active_routes += expert_routes;
+        active_experts += expert_routes != 0;
+    }
+
+    GGML_ASSERT(total_active_routes <= static_cast<size_t>(n_routes));
+    if (total_active_routes == 0) {
         return;
     }
 
@@ -563,24 +733,107 @@ void ggml_cuda_out_prod_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         fast_fp16_hardware_available(cc);
     const bool use_bf16 = precision == GGML_PREC_BF16 && fast_bf16_hardware_available(cc);
 
+    // Estimate grouped GEMM padding for contiguous expert batches. Smaller
+    // batches reduce route-count imbalance; larger batches reduce launch count.
+    const size_t workspace_max = 64ull * 1024 * 1024;
+    const size_t lowp_size = use_fp16 || use_bf16 ? sizeof(uint16_t) : sizeof(float);
+    const size_t bytes_per_route = lowp_size *
+        (static_cast<size_t>(src0->ne[0]) + static_cast<size_t>(src1->ne[0]));
+    GGML_ASSERT(bytes_per_route > 0);
+
+    // Prefer the largest contiguous batch size whose predicted GEMM work is
+    // at most 20% above useful work. Cap a batch at 32 experts rather than
+    // issuing one padded GEMM for the complete expert set.
+    constexpr size_t min_grouped_routes = 4096;
+    constexpr size_t min_grouped_experts = 32;
+    constexpr long double max_grouped_padding_ratio = 1.20L;
+    const int group_size_candidates[] = { 32, 16, 8, 4 };
+    int grouped_expert_batch = 0;
+
+    if (active_experts >= min_grouped_experts && total_active_routes >= min_grouped_routes) {
+        for (const int candidate : group_size_candidates) {
+            const size_t group_bytes_per_route = bytes_per_route * static_cast<size_t>(candidate);
+            if (group_bytes_per_route > workspace_max) {
+                continue;
+            }
+            const size_t max_tile_capacity = std::max<size_t>(1,
+                std::min(max_expert_tokens, workspace_max / group_bytes_per_route));
+            long double padded_route_slots = 0.0L;
+
+            for (int expert_begin = 0; expert_begin < n_expert; expert_begin += candidate) {
+                const int group_count = std::min(candidate, static_cast<int>(n_expert) - expert_begin);
+                size_t group_max_routes = 0;
+                for (int i = 0; i < group_count; ++i) {
+                    const ggml_cuda_mm_id_tile_spec & range =
+                        expert_ranges_host[static_cast<size_t>(expert_begin + i)];
+                    group_max_routes = std::max(group_max_routes,
+                        static_cast<size_t>(range.col_high - range.col_low));
+                }
+                if (group_max_routes == 0) {
+                    continue;
+                }
+
+                const size_t tile_capacity = std::min(group_max_routes, max_tile_capacity);
+                const size_t tile_count = (group_max_routes + tile_capacity - 1) / tile_capacity;
+                padded_route_slots += static_cast<long double>(group_count) *
+                    static_cast<long double>(tile_count) * static_cast<long double>(tile_capacity);
+            }
+
+            const long double padding_ratio = padded_route_slots /
+                static_cast<long double>(total_active_routes);
+            if (padding_ratio <= max_grouped_padding_ratio) {
+                grouped_expert_batch = candidate;
+                break;
+            }
+        }
+    }
+    const bool use_grouped = grouped_expert_batch > 1;
+
+    if (use_grouped) {
+        ggml_cuda_pool_alloc<ggml_cuda_mm_id_tile_spec> expert_ranges(ctx.pool(),
+            static_cast<size_t>(n_expert));
+        CUDA_CHECK(cudaMemcpyAsync(expert_ranges.ptr, expert_ranges_host.data(),
+            static_cast<size_t>(n_expert) * sizeof(ggml_cuda_mm_id_tile_spec),
+            cudaMemcpyHostToDevice, stream));
+
+        if (use_fp16) {
+            ggml_cuda_pool_alloc<unsigned int> absmax(ctx.pool(), 1);
+            ggml_cuda_pool_alloc<float> scales(ctx.pool(), 2);
+            ggml_cuda_f16_scale_init(src1, absmax.ptr, scales.ptr, stream);
+            ggml_cuda_out_prod_id_grouped<half>(ctx, src0, src1, dst,
+                route_indices.ptr, expert_ranges.ptr, expert_ranges_host, max_expert_tokens,
+                grouped_expert_batch, CUDA_R_16F, scales.ptr);
+            ggml_cuda_f16_scale_tensor(dst, scales.ptr + 1, stream);
+            return;
+        }
+        if (use_bf16) {
+            ggml_cuda_out_prod_id_grouped<nv_bfloat16>(ctx, src0, src1, dst,
+                route_indices.ptr, expert_ranges.ptr, expert_ranges_host, max_expert_tokens,
+                grouped_expert_batch, CUDA_R_16BF, nullptr);
+            return;
+        }
+
+        ggml_cuda_out_prod_id_grouped<float>(ctx, src0, src1, dst,
+            route_indices.ptr, expert_ranges.ptr, expert_ranges_host, max_expert_tokens,
+            grouped_expert_batch, CUDA_R_32F, nullptr);
+        return;
+    }
+
     if (use_fp16) {
         ggml_cuda_pool_alloc<unsigned int> absmax(ctx.pool(), 1);
         ggml_cuda_pool_alloc<float> scales(ctx.pool(), 2);
         ggml_cuda_f16_scale_init(src1, absmax.ptr, scales.ptr, stream);
-        ggml_cuda_out_prod_id_grouped<half>(ctx, src0, src1, dst,
-            route_indices.ptr, expert_ranges.ptr, static_cast<size_t>(max_expert_tokens_host),
-            static_cast<int>(n_expert), CUDA_R_16F, scales.ptr);
+        ggml_cuda_out_prod_id_per_expert<half>(ctx, src0, src1, dst,
+            route_indices.ptr, expert_ranges_host, max_expert_tokens, CUDA_R_16F, scales.ptr);
         ggml_cuda_f16_scale_tensor(dst, scales.ptr + 1, stream);
         return;
     }
     if (use_bf16) {
-        ggml_cuda_out_prod_id_grouped<nv_bfloat16>(ctx, src0, src1, dst,
-            route_indices.ptr, expert_ranges.ptr, static_cast<size_t>(max_expert_tokens_host),
-            static_cast<int>(n_expert), CUDA_R_16BF, nullptr);
+        ggml_cuda_out_prod_id_per_expert<nv_bfloat16>(ctx, src0, src1, dst,
+            route_indices.ptr, expert_ranges_host, max_expert_tokens, CUDA_R_16BF, nullptr);
         return;
     }
 
-    ggml_cuda_out_prod_id_grouped<float>(ctx, src0, src1, dst,
-        route_indices.ptr, expert_ranges.ptr, static_cast<size_t>(max_expert_tokens_host),
-        static_cast<int>(n_expert), CUDA_R_32F, nullptr);
+    ggml_cuda_out_prod_id_per_expert<float>(ctx, src0, src1, dst,
+        route_indices.ptr, expert_ranges_host, max_expert_tokens, CUDA_R_32F, nullptr);
 }
