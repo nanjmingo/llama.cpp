@@ -4,6 +4,7 @@
 
 #include "ggml-cpp.h"
 
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -71,6 +72,11 @@ struct llama_adapter_lora {
 
     float alpha;
 
+    // Dropout is applied to the LoRA input during training only.
+    float lora_dropout = 0.0f;
+    uint64_t dropout_seed = 0;
+    uint64_t dropout_counter = 0;
+
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
 
@@ -79,6 +85,14 @@ struct llama_adapter_lora {
 
     explicit llama_adapter_lora(llama_model * model) : model(model) {}
     ~llama_adapter_lora() = default;
+
+    uint32_t next_dropout_seed() {
+        uint64_t x = dropout_seed + (++dropout_counter) * 0x9e3779b97f4a7c15ull;
+        x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+        x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+        x ^= x >> 31;
+        return static_cast<uint32_t>(x ^ (x >> 32));
+    }
 
     llama_adapter_lora_weight * get_weight(ggml_tensor * w);
 

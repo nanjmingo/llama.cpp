@@ -92,6 +92,7 @@ Train a LoRA adapter with context size 512:
 |---|---|---|
 | `--lora-rank` | `16` | LoRA rank $r$. |
 | `--lora-alpha` | `0` (= rank) | LoRA scaling factor $\alpha$. Effective scale is $\alpha / r$. |
+| `--lora-dropout` | `0` | Dropout probability applied to LoRA inputs during training only. The mask is generated on the CUDA device when CUDA is used. With activation checkpointing, the mask is regenerated from its saved seed during recomputation instead of retaining the mask tensor. Range: `0` to `1`. |
 | `--lora-type` | `f32` | Storage type for trainable LoRA A/B tensors: `f32`, `f16`, or `bf16`. |
 | `--lora-targets` | (standard targets) | Comma-separated internal GGUF tensor-name components. Missing boundary periods are added automatically. |
 | `--freeze-layers` | `0` | Skip LoRA adapters on the first N layers (`blk.0` ... `blk.N-1`). |
@@ -171,7 +172,7 @@ To resume from the latest checkpoint in `./output`:
 ```
 
 > [!NOTE]
-> When resuming, model architecture, base model path, dataset files, LoRA rank/alpha/targets, context size, and optimizer type must match the checkpoint. You can safely change learning rate, scheduler, epochs, or snapshot limits.
+> When resuming, model architecture, base model path, dataset files, LoRA rank/alpha/dropout/targets, context size, and optimizer type must match the checkpoint. You can safely change learning rate, scheduler, epochs, or snapshot limits.
 
 ---
 

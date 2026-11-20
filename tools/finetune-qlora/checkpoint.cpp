@@ -641,6 +641,15 @@ bool validate_resume_config(const qlora_checkpoint & checkpoint,
         if (state.at("architecture").get<std::string>() != arch) return fail("architecture");
         if (state.at("lora_rank").get<int32_t>() != qparams.lora_rank) return fail("lora_rank");
         if (std::fabs(state.at("lora_alpha").get<double>() - lora_alpha) > 1e-6) return fail("lora_alpha");
+        if (state.contains("lora_dropout")) {
+            if (std::fabs(state.at("lora_dropout").get<double>() - qparams.lora_dropout) > 1e-6) return fail("lora_dropout");
+        } else if (qparams.lora_dropout != 0.0f) {
+            return fail("lora_dropout");
+        }
+        if (qparams.lora_dropout > 0.0f &&
+                (!state.contains("lora_dropout_seed") || !state.contains("lora_dropout_counter"))) {
+            return fail("lora_dropout_rng");
+        }
         if (state.at("lora_targets").get<std::string>() != qparams.lora_targets) return fail("lora_targets");
         if (state.at("freeze_layers").get<int32_t>() != qparams.freeze_layers) return fail("freeze_layers");
         if (state.at("gradient_accumulation_steps").get<int32_t>() != qparams.gradient_accumulation_steps) return fail("gradient_accumulation_steps");

@@ -10413,6 +10413,58 @@ void ggml_compute_forward_win_unpart(
 
 //ggml_compute_forward_unary
 
+static uint32_t ggml_dropout_hash(uint32_t seed, uint64_t index) {
+    uint32_t x = seed + static_cast<uint32_t>(index) * 0x9e3779b9u;
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+static float ggml_dropout_mask_value(uint32_t seed, int64_t index, float p) {
+    if (p >= 1.0f) {
+        return 0.0f;
+    }
+    const float random = static_cast<float>(ggml_dropout_hash(seed, static_cast<uint64_t>(index)) >> 8) * (1.0f / 16777216.0f);
+    return random < p ? 0.0f : 1.0f / (1.0f - p);
+}
+
+static void ggml_compute_forward_dropout_mask(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const float p = ggml_get_op_params_f32(dst, 1);
+    const uint32_t seed = static_cast<uint32_t>(ggml_get_op_params_i32(dst, 2));
+    const int64_t n = ggml_nelements(dst);
+
+    GGML_ASSERT(p >= 0.0f && p <= 1.0f);
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    switch (dst->type) {
+        case GGML_TYPE_F32: {
+            float * dst_data = static_cast<float *>(dst->data);
+            for (int64_t i = params->ith; i < n; i += params->nth) {
+                dst_data[i] = ggml_dropout_mask_value(seed, i, p);
+            }
+        } break;
+        case GGML_TYPE_F16: {
+            ggml_fp16_t * dst_data = static_cast<ggml_fp16_t *>(dst->data);
+            for (int64_t i = params->ith; i < n; i += params->nth) {
+                dst_data[i] = ggml_fp32_to_fp16(ggml_dropout_mask_value(seed, i, p));
+            }
+        } break;
+        case GGML_TYPE_BF16: {
+            ggml_bf16_t * dst_data = static_cast<ggml_bf16_t *>(dst->data);
+            for (int64_t i = params->ith; i < n; i += params->nth) {
+                dst_data[i] = GGML_FP32_TO_BF16(ggml_dropout_mask_value(seed, i, p));
+            }
+        } break;
+        default:
+            GGML_ABORT("unsupported type for dropout mask");
+    }
+}
+
 void ggml_compute_forward_unary(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -10435,6 +10487,10 @@ void ggml_compute_forward_unary(
         case GGML_UNARY_OP_STEP:
             {
                 ggml_compute_forward_step(params, dst);
+            } break;
+        case GGML_UNARY_OP_DROPOUT_MASK:
+            {
+                ggml_compute_forward_dropout_mask(params, dst);
             } break;
         case GGML_UNARY_OP_TANH:
             {

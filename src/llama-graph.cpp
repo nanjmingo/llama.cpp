@@ -1852,6 +1852,24 @@ static void llama_prec_policy_apply_matmul(const llama_prec_policy & prec_policy
     }
 }
 
+static ggml_tensor * llama_lora_apply_dropout(
+        ggml_context * ctx,
+        ggml_tensor * cur,
+        llama_adapter_lora * adapter,
+        bool training_graph) {
+    if (!training_graph || adapter->lora_dropout <= 0.0f) {
+        return cur;
+    }
+
+    ggml_tensor * mask = ggml_unary(ctx, cur, GGML_UNARY_OP_DROPOUT_MASK);
+    const float dropout = adapter->lora_dropout;
+    const int32_t seed = static_cast<int32_t>(adapter->next_dropout_seed());
+    memcpy(mask->op_params + sizeof(int32_t), &dropout, sizeof(dropout));
+    memcpy(mask->op_params + 2 * sizeof(int32_t), &seed, sizeof(seed));
+
+    return ggml_mul(ctx, cur, mask);
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
@@ -1879,7 +1897,8 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         const float adapter_scale = lora.second;
         const float scale = lw->get_scale(lora.first->alpha, adapter_scale);
 
-        ggml_tensor * lora_a_cur = ggml_mul_mat(ctx0, lw->a, cur);
+        ggml_tensor * lora_input = llama_lora_apply_dropout(ctx0, cur, lora.first, training_graph);
+        ggml_tensor * lora_a_cur = ggml_mul_mat(ctx0, lw->a, lora_input);
         llama_prec_policy_apply_matmul(prec_policy, lora_a_cur);
         ggml_tensor * ab_cur = ggml_mul_mat(ctx0, lw->b, lora_a_cur);
         llama_prec_policy_apply_matmul(prec_policy, ab_cur);
@@ -1965,7 +1984,8 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         const float rank  = (float) lw->b->ne[0];
         const float scale = alpha ? lora.second * alpha / rank : lora.second;
 
-        ggml_tensor * lora_a_cur = ggml_mul_mat_id(ctx0, lw->a, cur, ids);
+        ggml_tensor * lora_input = llama_lora_apply_dropout(ctx0, cur, lora.first, training_graph);
+        ggml_tensor * lora_a_cur = ggml_mul_mat_id(ctx0, lw->a, lora_input, ids);
         llama_prec_policy_apply_matmul(prec_policy, lora_a_cur);
         ggml_tensor * ab_cur = ggml_mul_mat_id(ctx0, lw->b, lora_a_cur, ids);
         llama_prec_policy_apply_matmul(prec_policy, ab_cur);

@@ -1260,9 +1260,10 @@ static const char * GGML_UNARY_OP_NAME[GGML_UNARY_OP_COUNT] = {
     "CEIL",
     "ROUND",
     "TRUNC",
+    "DROPOUT_MASK",
 };
 
-static_assert(GGML_UNARY_OP_COUNT == 22, "GGML_UNARY_OP_COUNT != 22");
+static_assert(GGML_UNARY_OP_COUNT == 23, "GGML_UNARY_OP_COUNT != 23");
 
 static const char * GGML_GLU_OP_NAME[GGML_GLU_OP_COUNT] = {
     "REGLU",
@@ -7328,6 +7329,9 @@ static void ggml_compute_backward(
                 case GGML_UNARY_OP_STEP: {
                     // noop
                 } break;
+                case GGML_UNARY_OP_DROPOUT_MASK: {
+                    // The mask is constant for the duration of the forward/backward pass.
+                } break;
                 case GGML_UNARY_OP_TANH: {
                     if (src0_needs_grads) {
                         struct ggml_tensor * dtanh = ggml_scale_bias(ctx, ggml_sqr(ctx, tensor), -1.0f, 1.0f);
@@ -7709,8 +7713,10 @@ void ggml_build_backward_expand(
                 break;
             case GGML_OP_UNARY: {
                 const enum ggml_unary_op uop = ggml_get_unary_op(node);
-                // SGN and STEP unary ops are piecewise constant
-                if (uop == GGML_UNARY_OP_SGN || uop == GGML_UNARY_OP_STEP) {
+                // SGN and STEP unary ops are piecewise constant. The dropout mask
+                // is generated independently of its input and is not differentiable.
+                if (uop == GGML_UNARY_OP_SGN || uop == GGML_UNARY_OP_STEP ||
+                        uop == GGML_UNARY_OP_DROPOUT_MASK) {
                     ignore_src[0] = true;
                 }
             } break;

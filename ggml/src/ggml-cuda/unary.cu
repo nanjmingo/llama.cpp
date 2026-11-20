@@ -134,6 +134,59 @@ static void unary_cuda(const T * x, T * dst, const int k, cudaStream_t stream) {
     ggml_cuda_kernel_launch(unary_op_kernel<op, T>, launch_params, x, dst, k);
 }
 
+template <typename T>
+static __global__ void dropout_mask_kernel(T * dst, const int64_t n, const uint32_t seed, const float p) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = static_cast<int64_t>(blockDim.x) * blockIdx.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+
+    uint32_t x = seed + static_cast<uint32_t>(i) * 0x9e3779b9u;
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+
+    const float random = static_cast<float>(x >> 8) * (1.0f / 16777216.0f);
+    const float mask = p >= 1.0f ? 0.0f : (random < p ? 0.0f : 1.0f / (1.0f - p));
+
+    ggml_cuda_pdl_sync();
+    dst[i] = ggml_cuda_cast<T>(mask);
+}
+
+template <typename T>
+static void dropout_mask_cuda(T * dst, const int64_t n, const uint32_t seed, const float p, cudaStream_t stream) {
+    constexpr int block_size = 256;
+    const int64_t num_blocks = (n + block_size - 1) / block_size;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, block_size, 0, stream);
+    ggml_cuda_kernel_launch(dropout_mask_kernel<T>, launch_params, dst, n, seed, p);
+}
+
+void ggml_cuda_op_dropout_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const float p = ggml_get_op_params_f32(dst, 1);
+    const uint32_t seed = static_cast<uint32_t>(ggml_get_op_params_i32(dst, 2));
+    const int64_t n = ggml_nelements(dst);
+
+    GGML_ASSERT(p >= 0.0f && p <= 1.0f);
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    switch (dst->type) {
+        case GGML_TYPE_F32:
+            dropout_mask_cuda(static_cast<float *>(dst->data), n, seed, p, ctx.stream());
+            break;
+        case GGML_TYPE_F16:
+            dropout_mask_cuda(static_cast<half *>(dst->data), n, seed, p, ctx.stream());
+            break;
+        case GGML_TYPE_BF16:
+            dropout_mask_cuda(static_cast<nv_bfloat16 *>(dst->data), n, seed, p, ctx.stream());
+            break;
+        default:
+            GGML_ABORT("unsupported type for CUDA dropout mask");
+    }
+}
+
 template <float (*op)(float), typename T>
 static __global__ void unary_op_kernel_strided(const T * x, T * dst, const int k,const int64_t ne00,const int64_t ne01,const int64_t ne02,const size_t nb00,const size_t nb01,const size_t nb02,const size_t nb03) {
     ggml_cuda_pdl_lc();

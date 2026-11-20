@@ -404,6 +404,25 @@ int main(int argc, char ** argv) {
             LOG_ERR("%s: prepared adapter was not loaded into the model\n", __func__);
             return 1;
         }
+        loaded->lora_dropout = qparams.lora_dropout;
+        if (resume && resume_checkpoint.metadata.contains("lora_dropout_seed") &&
+                resume_checkpoint.metadata.contains("lora_dropout_counter")) {
+            loaded->dropout_seed = resume_checkpoint.metadata.at("lora_dropout_seed").get<uint64_t>();
+            loaded->dropout_counter = resume_checkpoint.metadata.at("lora_dropout_counter").get<uint64_t>();
+        } else {
+            if (params.sampling.seed == LLAMA_DEFAULT_SEED) {
+                try {
+                    std::random_device random;
+                    loaded->dropout_seed = (static_cast<uint64_t>(random()) << 32) | random();
+                } catch (const std::exception & ex) {
+                    LOG_ERR("%s: failed to generate a LoRA dropout seed: %s\n", __func__, ex.what());
+                    return 1;
+                }
+            } else {
+                loaded->dropout_seed = params.sampling.seed;
+            }
+            loaded->dropout_counter = 0;
+        }
         for (auto & kv : loaded->ab_map) {
             output_refs[kv.first] = { kv.second.a, kv.second.b };
             if (lora_tensor_matches_targets(

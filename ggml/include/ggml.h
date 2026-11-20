@@ -459,6 +459,7 @@ extern "C" {
         GGML_UNARY_OP_CEIL,
         GGML_UNARY_OP_ROUND,
         GGML_UNARY_OP_TRUNC,
+        GGML_UNARY_OP_DROPOUT_MASK,
 
         GGML_UNARY_OP_COUNT,
     };

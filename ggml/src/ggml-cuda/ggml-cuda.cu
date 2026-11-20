@@ -3046,6 +3046,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 case GGML_UNARY_OP_STEP:
                     ggml_cuda_op_step(ctx, dst);
                     break;
+                case GGML_UNARY_OP_DROPOUT_MASK:
+                    ggml_cuda_op_dropout_mask(ctx, dst);
+                    break;
                 case GGML_UNARY_OP_GELU:
                     ggml_cuda_op_gelu(ctx, dst);
                     break;
@@ -6549,6 +6552,9 @@ static bool ggml_backend_cuda_device_supports_op_impl(ggml_backend_dev_t dev, co
                 case GGML_UNARY_OP_CEIL:
                 case GGML_UNARY_OP_ROUND:
                 case GGML_UNARY_OP_TRUNC:
+#if !defined(GGML_USE_HIP)
+                case GGML_UNARY_OP_DROPOUT_MASK:
+#endif
                     if (op->src[0]->type == GGML_TYPE_BF16 && ggml_get_unary_op(op) == GGML_UNARY_OP_XIELU) {
                         return false;
                     }

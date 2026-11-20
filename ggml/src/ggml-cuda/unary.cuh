@@ -27,6 +27,8 @@ void ggml_cuda_op_neg(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_step(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+void ggml_cuda_op_dropout_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
 void ggml_cuda_op_gelu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_silu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
