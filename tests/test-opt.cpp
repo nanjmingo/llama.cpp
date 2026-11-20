@@ -883,6 +883,18 @@ static float test_dynamic_activation_checkpointing_run(
         ggml_opt_prepare_alloc(opt_ctx, ctx_compute, gf, inputs, outputs);
         ggml_opt_alloc(opt_ctx, /*backward =*/ true);
 
+        // A single microbatch must use its graph gradient directly instead of
+        // allocating a second persistent F32 accumulator for every parameter.
+        // Multiple microbatches still require that accumulator.
+        const bool has_grad_acc = ggml_opt_grad_acc(opt_ctx, weights) != nullptr;
+        if (has_grad_acc != (opt_period > 1)) {
+            fprintf(stderr, "  unexpected gradient accumulator for opt_period=%d\n", opt_period);
+            ggml_opt_free(opt_ctx);
+            ggml_backend_buffer_free(model_buf);
+            ggml_free(ctx_model);
+            return NAN;
+        }
+
         const float input_value = 10.0f;
         ggml_backend_tensor_set(inputs, &input_value, 0, sizeof(input_value));
         ggml_opt_eval(opt_ctx, /*result =*/ nullptr);

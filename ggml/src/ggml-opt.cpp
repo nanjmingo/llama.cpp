@@ -275,13 +275,17 @@ namespace {
         ggml_tensor * clone = ggml_dup_tensor(ctx, tensor);
         clones.emplace(tensor, clone);
 
-        // This graph is used only to query scheduler placement. Keep the
-        // original buffer metadata so pre-allocated weights are assigned to
-        // the same backend, but copy every tensor object and edge because
-        // ggml_backend_sched_split_graph rewrites src[] when it inserts copies.
-        clone->buffer = tensor->buffer;
-        clone->data   = tensor->data;
-        clone->extra  = tensor->extra;
+        // This graph is used only to query scheduler placement. Preserve the
+        // storage/backend metadata of preallocated leaves (weights and explicit
+        // inputs), but not of computed nodes: copying an old output buffer would
+        // make the probe treat a recomputable activation as already placed and
+        // can bias the assignment toward a stale device.
+        const bool preallocated_leaf = tensor->op == GGML_OP_NONE && tensor->buffer;
+        if (preallocated_leaf) {
+            clone->buffer = tensor->buffer;
+            clone->data   = tensor->data;
+            clone->extra  = tensor->extra;
+        }
         clone->op     = tensor->op;
         clone->flags  = tensor->flags;
         clone->view_offs = tensor->view_offs;
@@ -343,7 +347,13 @@ namespace {
         backends.reserve(opt_ctx->recompute_backend_affinities.size());
         for (const auto & affinity : opt_ctx->recompute_backend_affinities) {
             GGML_ASSERT(affinity.first >= 0 && affinity.first < opt_ctx->gf->n_nodes);
-            ggml_tensor * probe_node = probe_tensors.at(opt_ctx->gf->nodes[affinity.first]);
+            ggml_tensor * source_node = opt_ctx->gf->nodes[affinity.first];
+            // Pin every recomputed node, including weight-backed operations, to
+            // the backend selected for its original forward node. The scheduler
+            // does not always infer weight placement through VIEW sources, so
+            // leaving those nodes unassigned lets the appended recompute graph
+            // inherit one neighboring GPU and creates a large memory skew.
+            ggml_tensor * probe_node = probe_tensors.at(source_node);
             ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(opt_ctx->backend_sched, probe_node);
             if (backend) {
                 backends.emplace_back(affinity.second, backend);
@@ -719,8 +729,12 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
 
     const enum ggml_opt_optimizer_type optimizer = opt_ctx->optimizer;
 
+    // Parameter gradients only need a persistent accumulator when more than
+    // one microbatch contributes to an optimizer step. In dynamic mode the
+    // old condition kept a separate F32 GPU buffer even for opt_period == 1,
+    // although the optimizer consumes that gradient only once.
     const bool accumulate = opt_ctx->build_type_alloc >= GGML_OPT_BUILD_TYPE_GRAD &&
-        !(opt_ctx->static_graphs && opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT && opt_ctx->opt_period == 1);
+        opt_ctx->opt_period > 1;
 
     const bool need_momenta = opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT &&
         opt_ctx->optimizer == GGML_OPT_OPTIMIZER_TYPE_ADAMW;
@@ -952,11 +966,20 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
 
     GGML_ASSERT(opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT);
 
-    // For static graphs, keep the combined forward/backward/optimizer graph.
-    // Dynamic graphs (used by QLoRA) run the optimizer separately so optimizer
-    // temporaries do not overlap with the activation/backward graph allocation.
+    // Static graphs keep a duplicated graph with the optimizer update.
+    // Dynamic graphs with accumulation run the update in a separate graph that
+    // consumes the persistent gradient accumulators. With opt_period == 1, the
+    // update is appended directly to gb_grad below, so it can consume the
+    // computed gradients without another accumulator or a second backward pass.
     if (opt_ctx->static_graphs) {
         opt_ctx->gb_opt = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gb_grad, /*force_grads =*/ true);
+    } else if (opt_ctx->opt_period == 1) {
+        // With one microbatch the optimizer can consume the freshly computed
+        // parameter gradients directly. Append the update to the backward graph
+        // so it runs in the same scheduler allocation; a separate graph would
+        // pull the gradient-producing subgraph in again (or require a duplicate
+        // persistent gradient buffer).
+        opt_ctx->gb_opt = nullptr;
     } else {
         const int graph_size = std::max(16, 2 * opt_ctx->gf->n_nodes + 16);
         opt_ctx->gb_opt = ggml_new_graph_custom(opt_ctx->ctx_compute, graph_size, /*grads =*/ false);
@@ -968,13 +991,17 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     ggml_set_input(adamw_params);
     const char * optimizer_name = ggml_opt_optimizer_name(opt_ctx->optimizer);
     ggml_format_name(adamw_params, "%s_params", optimizer_name);
+    ggml_cgraph * optimizer_graph = opt_ctx->static_graphs || opt_ctx->opt_period > 1
+        ? opt_ctx->gb_opt : opt_ctx->gb_grad;
     for (int i = opt_ctx->gf->n_nodes - 1; i >= 0; --i) {
         struct ggml_tensor * node = opt_ctx->static_graphs
             ? opt_ctx->gb_opt->nodes[i]
             : opt_ctx->gb_grad->nodes[i];
         struct ggml_tensor * grad = opt_ctx->static_graphs
             ? ggml_graph_get_grad(opt_ctx->gb_opt, node)
-            : ggml_graph_get_grad_acc(opt_ctx->gb_grad, node);
+            : (opt_ctx->opt_period > 1
+                ? ggml_graph_get_grad_acc(opt_ctx->gb_grad, node)
+                : ggml_graph_get_grad(opt_ctx->gb_grad, node));
 
         if (grad && (node->flags & GGML_TENSOR_FLAG_PARAM)) {
             if (opt_ctx->loss_normalizer > 0.0f) {
@@ -1003,7 +1030,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
                     GGML_ABORT("fatal error");
             }
             ggml_format_name(opt_step, "%s step for %s", optimizer_name, node->name);
-            ggml_build_forward_expand(opt_ctx->gb_opt, opt_step);
+            ggml_build_forward_expand(optimizer_graph, opt_step);
         }
     }
 
@@ -1011,7 +1038,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         opt_ctx->buf_static = ggml_backend_alloc_ctx_tensors(
             opt_ctx->ctx_static, ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0));
         // In dynamic mode the persistent parameter gradient accumulators belong
-        // to gb_grad; gb_opt is now an update-only graph without gradient state.
+        // to gb_grad; for opt_period == 1, optimizer updates are also part of gb_grad.
         ggml_graph_reset(opt_ctx->static_graphs ? opt_ctx->gb_opt : opt_ctx->gb_grad);
     }
 
@@ -1789,7 +1816,7 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     const bool optimizer_step = opt_ctx->static_graphs
         ? opt_ctx->allocated_graph == opt_ctx->gb_opt
         : opt_ctx->build_type == GGML_OPT_BUILD_TYPE_OPT;
-    const bool separate_optimizer_graph = optimizer_step && !opt_ctx->static_graphs;
+    const bool separate_optimizer_graph = optimizer_step && !opt_ctx->static_graphs && opt_ctx->opt_period > 1;
 
     if (optimizer_step) {
         const ggml_opt_optimizer_params & opt_pars = opt_ctx->get_opt_pars(opt_ctx->get_opt_pars_ud);
@@ -1831,8 +1858,9 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
         }
     }
 
-    // The forward/backward graph owns temporary activations. Copy metrics while
-    // those tensors are still allocated, then release its scheduler allocation.
+    // The selected graph may include the optimizer update (opt_period == 1),
+    // or only forward/backward work when using a separate accumulated update.
+    // Copy metrics before the scheduler allocation is reused for that update.
     ggml_backend_sched_graph_compute(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
     ggml_opt_result_add(opt_ctx, result);
 
