@@ -1112,10 +1112,17 @@ struct llm_graph_context {
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
 
+    // K/V tensors retained for direct Shared-KV dependencies during training.
+    mutable std::vector<ggml_tensor *> shared_kv_k;
+    mutable std::vector<ggml_tensor *> shared_kv_v;
+
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
 
     void cb(ggml_tensor * cur, const char * name, int il) const;
+
+    bool use_shared_kv_direct() const;
+    void resolve_shared_kv(uint32_t il, ggml_tensor * & k, ggml_tensor * & v) const;
 
     // true when the last layer must be narrowed to the output rows before the nextn hidden state is captured
     bool crop_before_nextn(const ggml_tensor * inp_out_ids) const {

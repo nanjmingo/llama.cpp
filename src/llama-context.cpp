@@ -4223,24 +4223,16 @@ static void llama_warn_shared_kv_lora_gradients(
         return;
     }
 
-    if (model.arch == LLM_ARCH_GEMMA4 && full_context_training) {
+    const llama_hparams & hparams = model.hparams;
+    if (full_context_training && hparams.has_shared_kv()) {
         return;
     }
 
-    const llama_hparams & hparams = model.hparams;
     const uint32_t n_layers = std::min<uint32_t>(hparams.n_layer(), static_cast<uint32_t>(model.layers.size()));
     std::vector<uint32_t> shared_kv_consumers(n_layers, 0);
 
-    const bool has_prefix_shared_kv = model.arch == LLM_ARCH_GEMMA3N ||
-        (model.arch == LLM_ARCH_GEMMA4 && !full_context_training);
-    const int32_t n_layer_kv_from_start = hparams.n_layer_kv_from_start;
-
     for (uint32_t il = 0; il < n_layers; ++il) {
-        uint32_t kv_source = hparams.kv_source(il);
-        if (has_prefix_shared_kv && n_layer_kv_from_start >= 2 &&
-            il >= static_cast<uint32_t>(n_layer_kv_from_start)) {
-            kv_source = static_cast<uint32_t>(n_layer_kv_from_start) - (hparams.is_swa(il) ? 2u : 1u);
-        }
+        const uint32_t kv_source = hparams.kv_source(il);
         if (kv_source < n_layers && kv_source != il) {
             ++shared_kv_consumers[kv_source];
         }
@@ -4284,6 +4276,10 @@ static void llama_warn_shared_kv_lora_gradients(
         const llama_layer & layer = model.layers[il];
         warn_if_trainable(layer.wk, n_consumers);
         warn_if_trainable(layer.wv, n_consumers);
+        warn_if_trainable(layer.wqkv, n_consumers);
+        warn_if_trainable(layer.wkv, n_consumers);
+        warn_if_trainable(layer.wkv_a_mqa, n_consumers);
+        warn_if_trainable(layer.wkv_b, n_consumers);
     }
 }
 

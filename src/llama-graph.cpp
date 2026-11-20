@@ -1735,9 +1735,40 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
-    gf               (res->get_gf()) {
+    gf               (res->get_gf()),
+    shared_kv_k      (hparams.n_layer_all, nullptr),
+    shared_kv_v      (hparams.n_layer_all, nullptr) {
         res->set_params(params);
     }
+
+bool llm_graph_context::use_shared_kv_direct() const {
+    return cparams.training && hparams.has_shared_kv();
+}
+
+void llm_graph_context::resolve_shared_kv(uint32_t il, ggml_tensor * & k, ggml_tensor * & v) const {
+    if (!use_shared_kv_direct()) {
+        return;
+    }
+
+    GGML_ASSERT(il < shared_kv_k.size());
+
+    if (hparams.has_kv(il)) {
+        GGML_ASSERT(k != nullptr);
+        shared_kv_k[il] = k;
+        shared_kv_v[il] = v;
+        return;
+    }
+
+    const uint32_t source = hparams.kv_source(il);
+    GGML_ASSERT(source < il);
+    GGML_ASSERT(source < shared_kv_k.size());
+    GGML_ASSERT(shared_kv_k[source] != nullptr);
+
+    k = shared_kv_k[source];
+    if (shared_kv_v[source]) {
+        v = shared_kv_v[source];
+    }
+}
 
 void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
     if (cb_func) {
@@ -3378,6 +3409,8 @@ ggml_tensor * llm_graph_context::build_attn(
             int       il) const {
     GGML_UNUSED(n_tokens);
 
+    resolve_shared_kv(il, k_cur, v_cur);
+
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
     ggml_build_forward_expand(gf, q_cur);
@@ -3513,21 +3546,26 @@ ggml_tensor * llm_graph_context::build_attn(
             float     kq_scale,
             int       il) const {
     const llm_arch arch = model.arch;
+    const bool use_direct_shared_kv = use_shared_kv_direct();
 
     GGML_ASSERT(v_mla == nullptr);
 
-    if (inp->self_k_rot[il]) {
+    resolve_shared_kv(il, k_cur, v_cur);
+
+    if (!use_direct_shared_kv && inp->self_k_rot[il]) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot[il]);
         k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot[il]);
     }
 
-    if (inp->self_v_rot[il]) {
+    if (!use_direct_shared_kv && inp->self_v_rot[il]) {
         v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot[il]);
     }
 
     const auto * mctx_cur = inp->mctx;
 
-    build_attn_scale_kv_inputs(ctx0, mctx_cur, q_cur, k_cur, v_cur, il);
+    if (!use_direct_shared_kv) {
+        build_attn_scale_kv_inputs(ctx0, mctx_cur, q_cur, k_cur, v_cur, il);
+    }
 
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
@@ -3560,10 +3598,12 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kv_rows = inp->self_attn_mask.rows;
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
-    cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
+    if (!use_direct_shared_kv) {
+        cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
+    }
     cb(cur, "kqv_out", il);
 
-    if (inp->self_v_rot[il]) {
+    if (!use_direct_shared_kv && inp->self_v_rot[il]) {
         cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot[il]);
     }
 
@@ -3629,6 +3669,9 @@ ggml_tensor * llm_graph_context::build_attn(
             float     kq_scale,
             int       il) const {
     const llm_arch arch = model.arch;
+    const bool use_direct_shared_kv = use_shared_kv_direct();
+
+    resolve_shared_kv(il, k_cur, v_cur);
 
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
@@ -3639,8 +3682,8 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_cur = inp->mctx;
 
-    // store to KV cache
-    {
+    // store to KV cache unless training reads the source tensors directly
+    if (!use_direct_shared_kv) {
         const auto & k_idxs = inp->get_k_idxs();
 
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
@@ -3650,7 +3693,7 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kv_rows = inp->self_attn_mask.rows;
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * k = use_direct_shared_kv ? k_cur : mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
@@ -3737,6 +3780,9 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * top_k,
             float     kq_scale,
             int       il) const {
+    const bool use_direct_shared_kv = use_shared_kv_direct();
+    resolve_shared_kv(il, k_cur, v_cur);
+
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
     // expand k later to enable rope fusion which directly writes into k-v cache
@@ -3754,7 +3800,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // store to KV cache
     // note: k_cur is null for layers that reuse the KV cache of another layer
-    if (k_cur) {
+    if (k_cur && !use_direct_shared_kv) {
         const auto & k_idxs = inp->get_k_idxs_mla();
 
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
@@ -3770,7 +3816,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * kq_mask_top_k = build_top_k_mask(kq_mask, top_k, il);
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * k = use_direct_shared_kv ? k_cur : mctx_cur->get_k(ctx0, il);
 
     // MLA: V is a view of the first n_embd_v elements of K
     const int64_t n_embd_v = v_cur ? v_cur->ne[0] : v_mla->ne[0];
@@ -3805,17 +3851,20 @@ ggml_tensor * llm_graph_context::build_attn(
             int       il,
         ggml_tensor * kq_mask) const {
     const bool is_swa = hparams.is_swa(il);
+    const bool use_direct_shared_kv = use_shared_kv_direct();
+
+    resolve_shared_kv(il, k_cur, v_cur);
 
     auto * k_rot = is_swa ? inp->self_k_rot_swa[il] : inp->self_k_rot[il];
     auto * v_rot = is_swa ? inp->self_v_rot_swa[il] : inp->self_v_rot[il];
 
-    if (k_rot) {
+    if (!use_direct_shared_kv && k_rot) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, k_rot);
         if (k_cur) {
             k_cur = llama_mul_mat_hadamard(ctx0, k_cur, k_rot);
         }
     }
-    if (v_rot) {
+    if (!use_direct_shared_kv && v_rot) {
         if (v_cur) {
             v_cur = llama_mul_mat_hadamard(ctx0, v_cur, v_rot);
         }
@@ -3824,7 +3873,9 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * mctx_iswa = inp->mctx;
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
 
-    build_attn_scale_kv_inputs(ctx0, mctx_cur, q_cur, k_cur, v_cur, il);
+    if (!use_direct_shared_kv) {
+        build_attn_scale_kv_inputs(ctx0, mctx_cur, q_cur, k_cur, v_cur, il);
+    }
 
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
@@ -3841,7 +3892,7 @@ ggml_tensor * llm_graph_context::build_attn(
     // whole seq fits into batch in training mode
     const bool use_kv_cur = cparams.training && k_cur && v_cur;
 
-    const bool store_kv = !use_kv_cur || hparams.has_shared_kv();
+    const bool store_kv = !use_kv_cur;
 
     // optionally store to KV cache
     if (store_kv && k_cur) {
@@ -3866,10 +3917,12 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
-    cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
+    if (!use_direct_shared_kv) {
+        cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
+    }
     cb(cur, "kqv_out", il);
 
-    if (v_rot) {
+    if (!use_direct_shared_kv && v_rot) {
         cur = llama_mul_mat_hadamard(ctx0, cur, v_rot);
     }
 
@@ -3902,10 +3955,13 @@ ggml_tensor * llm_graph_context::build_attn(
             float     kq_scale,
             int       il) const {
     const bool is_swa = hparams.is_swa(il);
+    const bool use_direct_shared_kv = use_shared_kv_direct();
+
+    resolve_shared_kv(il, k_cur, v_cur);
 
     auto * k_rot = is_swa ? inp->self_k_rot_swa[il] : inp->self_k_rot[il];
 
-    if (k_rot) {
+    if (!use_direct_shared_kv && k_rot) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, k_rot);
         if (k_cur) {
             k_cur = llama_mul_mat_hadamard(ctx0, k_cur, k_rot);
@@ -3924,7 +3980,7 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
 
     // optionally store to KV cache
-    if (k_cur) {
+    if (k_cur && !use_direct_shared_kv) {
         const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
 
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
@@ -3935,13 +3991,13 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // MLA-style attention: the cached K is used as V
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * k = use_direct_shared_kv ? k_cur : mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
-    if (k_rot) {
+    if (!use_direct_shared_kv && k_rot) {
         cur = llama_mul_mat_hadamard(ctx0, cur, k_rot);
     }
 
