@@ -90,11 +90,27 @@ Train a LoRA adapter with context size 512:
 
 | Option | Default | Description |
 |---|---|---|
-| `--lora-rank` | `16` | LoRA rank $r$. |
+| `--lora` | disabled | Existing LoRA adapter(s); repeat the option or provide a comma-separated list. |
+| `--lora-scaled` | disabled | Existing adapter path(s) with individual scales (`path:scale,...`). |
+| `--lora-rank` | `16` | Output LoRA rank $r$; must fit the summed input rank for each tensor. |
 | `--lora-alpha` | `0` (= rank) | LoRA scaling factor $\alpha$. Effective scale is $\alpha / r$. |
 | `--lora-type` | `f32` | Storage type for trainable LoRA A/B tensors: `f32`, `f16`, or `bf16`. |
 | `--lora-targets` | (standard targets) | Comma-separated internal GGUF tensor-name components. Missing boundary periods are added automatically. |
 | `--freeze-layers` | `0` | Skip LoRA adapters on the first N layers (`blk.0` ... `blk.N-1`). |
+
+An existing adapter can be used as the starting point with the common `--lora` option. Multiple adapters are merged by concatenating their low-rank factors, preserving the sum of their weight updates:
+
+```bash
+./build/bin/llama-finetune-qlora \
+  --model /path/to/base-model.gguf \
+  --train-file /path/to/train.jsonl \
+  --output-dir ./output \
+  --lora ./adapter-rank2.gguf,./adapter-rank4.gguf \
+  --lora-rank 6 \
+  -c 512
+```
+
+`--lora` may be repeated or given a comma-separated list. Use `--lora-scaled path:scale,...` to apply an individual scale to each input adapter. For each model tensor, the required rank is the sum of the ranks of the input adapters that contain that tensor. `--lora-rank` must be at least that sum; otherwise training exits with an error instead of truncating an adapter. A tensor is initialized as a new LoRA target only when none of the input adapters contains it. `--resume-from` cannot be combined with input `--lora` adapters.
 
 ### Training & Optimizer Options
 

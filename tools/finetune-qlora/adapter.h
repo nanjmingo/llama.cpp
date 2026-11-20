@@ -11,6 +11,11 @@
 
 using lora_tensor_refs = std::unordered_map<std::string, std::pair<ggml_tensor *, ggml_tensor *>>;
 
+struct lora_adapter_input {
+    std::string path;
+    float scale = 1.0f;
+};
+
 struct lora_tensor_snapshot {
     std::string name;
     enum ggml_type type_a = GGML_TYPE_F32;
@@ -44,19 +49,18 @@ lora_tensors alloc_lora_tensors(const std::vector<std::pair<std::string, ggml_te
                                 int32_t freeze_layers = 0,
                                 enum ggml_type lora_type = GGML_TYPE_F32);
 
-lora_tensors transform_lora_tensors(const std::string & input_path,
+lora_tensors transform_lora_tensors(const std::vector<lora_adapter_input> & input_adapters,
                                     const std::string & expected_arch,
                                     const std::vector<std::pair<std::string, ggml_tensor *>> & model_tensors,
                                     const std::vector<std::string> & targets,
                                     int32_t rank,
                                     float alpha,
-                                    float input_scale,
                                     std::mt19937 & rng,
                                     int32_t model_n_layer,
                                     int32_t freeze_layers,
                                     enum ggml_type lora_type = GGML_TYPE_F32);
 
-bool validate_lora_adapter_rank(const std::string & input_path,
+bool validate_lora_adapter_rank(const std::vector<lora_adapter_input> & input_adapters,
                                 const std::string & expected_arch,
                                 int32_t requested_rank);
 

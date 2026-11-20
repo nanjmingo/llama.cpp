@@ -102,7 +102,7 @@ const std::vector<qlora_arg> & get_qlora_arg_defs() {
         ));
         add_opt(qlora_arg(
             {"--lora-rank"}, "N",
-            "LoRA rank (default: 16; existing adapters are converted to this rank; rank reduction is rejected)",
+            "LoRA rank (default: 16; input adapter ranks are concatenated; insufficient rank is rejected)",
             [](qlora_params & params, const std::string & value) {
                 params.lora_rank = parse_positive_int(value, "--lora-rank");
             }
@@ -391,7 +391,7 @@ void qlora_print_usage(int , char ** ) {
     for (const qlora_arg & option : get_qlora_arg_defs()) {
         std::printf("%s", option.to_string().c_str());
     }
-    std::printf("\nQLoRA accepts one input --lora adapter. Existing adapters are converted to --lora-rank/--lora-alpha; rank reduction is rejected.\n");
+    std::printf("\nQLoRA accepts multiple comma-separated or repeated --lora/--lora-scaled inputs. They are merged by concatenating ranks; --lora-rank must fit the summed rank for every tensor.\n");
     std::printf("Tensors matching --lora-targets are trained, missing targets are added, and other existing tensors are retained frozen.\n");
     std::printf("MoE expert LoRA is opt-in via ffn_gate_exps, ffn_up_exps, ffn_down_exps, or ffn_gate_up_exps.\n");
     std::printf("Checkpoints store adapter weights, AdamW state, dataset order and training progress.\n");
