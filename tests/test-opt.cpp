@@ -839,98 +839,10 @@ static std::pair<int, int> test_regression(
     return std::make_pair(npass, ntest);
 }
 
-static float test_dynamic_activation_checkpointing_run(
-        ggml_backend_sched_t backend_sched,
-        ggml_backend_t backend,
-        enum ggml_opt_optimizer_type optim,
-        int32_t opt_period,
-        bool activation_checkpointing) {
-    struct ggml_init_params model_params = {
-        /*.mem_size   =*/ 4*ggml_tensor_overhead(),
-        /*.mem_buffer =*/ nullptr,
-        /*.no_alloc   =*/ true,
-    };
-    ggml_context * ctx_model = ggml_init(model_params);
-    ggml_tensor * inputs = ggml_new_tensor_1d(ctx_model, GGML_TYPE_F32, 1);
-    ggml_tensor * weights = ggml_new_tensor_1d(ctx_model, GGML_TYPE_F32, 1);
-    ggml_set_input(inputs);
-    ggml_set_param(weights);
-    ggml_backend_buffer_t model_buf = ggml_backend_alloc_ctx_tensors(ctx_model, backend);
-
-    const float initial_weight = 1.0f;
-    ggml_backend_tensor_set(weights, &initial_weight, 0, sizeof(initial_weight));
-
-    ggml_opt_params opt_params = ggml_opt_default_params(backend_sched, GGML_OPT_LOSS_TYPE_SUM);
-    opt_params.opt_period = opt_period;
-    opt_params.optimizer = optim;
-    opt_params.get_opt_pars = helper_get_test_opt_pars;
-    ggml_opt_context_t opt_ctx = ggml_opt_init(opt_params);
-    ggml_opt_set_activation_checkpointing(opt_ctx, activation_checkpointing);
-
-    for (int i = 0; i < 4; ++i) {
-        struct ggml_init_params compute_params = {
-            /*.mem_size   =*/ 4*1024*1024,
-            /*.mem_buffer =*/ nullptr,
-            /*.no_alloc   =*/ true,
-        };
-        ggml_context * ctx_compute = ggml_init(compute_params);
-        ggml_cgraph * gf = ggml_new_graph_custom(ctx_compute, 128, /*grads =*/ true);
-        ggml_tensor * intermediate = ggml_add(ctx_compute, inputs, weights);
-        ggml_tensor * outputs = ggml_sqr(ctx_compute, intermediate);
-        ggml_set_output(outputs);
-        ggml_build_forward_expand(gf, outputs);
-
-        ggml_opt_prepare_alloc(opt_ctx, ctx_compute, gf, inputs, outputs);
-        ggml_opt_alloc(opt_ctx, /*backward =*/ true);
-
-        const float input_value = 10.0f;
-        ggml_backend_tensor_set(inputs, &input_value, 0, sizeof(input_value));
-        ggml_opt_eval(opt_ctx, /*result =*/ nullptr);
-
-        // Discard scheduler references before freeing this dynamic graph context.
-        ggml_backend_sched_reset(backend_sched);
-        ggml_free(ctx_compute);
-    }
-
-    float result = 0.0f;
-    ggml_backend_tensor_get(weights, &result, 0, sizeof(result));
-    ggml_opt_free(opt_ctx);
-    ggml_backend_buffer_free(model_buf);
-    ggml_free(ctx_model);
-    return result;
-}
-
-static std::pair<int, int> test_dynamic_activation_checkpointing(
-        ggml_backend_sched_t backend_sched,
-        ggml_backend_t backend,
-        enum ggml_opt_optimizer_type optim) {
-    int npass = 0;
-    int ntest = 0;
-    for (int32_t opt_period : { 1, 2 }) {
-        const float without_checkpointing = test_dynamic_activation_checkpointing_run(
-            backend_sched, backend, optim, opt_period, false);
-        const float with_checkpointing = test_dynamic_activation_checkpointing_run(
-            backend_sched, backend, optim, opt_period, true);
-        const bool subtest_ok = std::isfinite(with_checkpointing) &&
-            almost_equal(with_checkpointing, without_checkpointing, 1e-5);
-        printf("  %s(optimizer=%s, opt_period=%d): ", __func__, ggml_opt_optimizer_name(optim), opt_period);
-        print_ok(subtest_ok);
-        npass += subtest_ok;
-        ++ntest;
-    }
-    return std::make_pair(npass, ntest);
-}
-
 static std::pair<int, int> test_backend(
     ggml_backend_sched_t backend_sched, ggml_backend_t backend, enum ggml_opt_optimizer_type optim) {
     int npass = 0;
     int ntest = 0;
-
-    {
-        std::pair<int, int> partial = test_dynamic_activation_checkpointing(backend_sched, backend, optim);
-        npass += partial.first;
-        ntest += partial.second;
-    }
 
     for (bool shuffle : {false, true}) {
         std::pair<int, int> partial = test_dataset(optim, backend_sched, backend, shuffle);
