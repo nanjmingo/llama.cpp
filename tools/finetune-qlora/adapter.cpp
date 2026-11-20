@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <random>
 #include <string>
@@ -303,6 +304,13 @@ struct source_lora_pair {
     std::vector<float> b;
 };
 
+struct source_lora_fragment {
+    int64_t rank = 0;
+    float scale = 1.0f;
+    std::vector<float> a;
+    std::vector<float> b;
+};
+
 struct output_lora_pair {
     std::string name;
     bool embedding = false;
@@ -313,10 +321,7 @@ struct output_lora_pair {
     int64_t b_ne1 = 0;
     int64_t b_ne2 = 1;
     int64_t source_rank = 0;
-    float source_scale = 1.0f;
-    bool has_source = false;
-    std::vector<float> source_a;
-    std::vector<float> source_b;
+    std::vector<source_lora_fragment> sources;
 };
 
 static bool name_ends_with(const std::string & name, const char * suffix) {
@@ -468,37 +473,66 @@ static bool load_source_lora(const std::string & path,
 
 }
 
-bool validate_lora_adapter_rank(const std::string & input_path,
+bool validate_lora_adapter_rank(const std::vector<lora_adapter_input> & input_adapters,
                                 const std::string & expected_arch,
                                 int32_t requested_rank) {
+    if (input_adapters.empty()) {
+        LOG_ERR("%s: at least one input LoRA adapter is required\n", __func__);
+        return false;
+    }
     if (requested_rank <= 0) {
         LOG_ERR("%s: requested LoRA rank must be positive\n", __func__);
         return false;
     }
-    std::map<std::string, source_lora_pair> pairs;
-    float source_alpha = 0.0f;
-    if (!load_source_lora(input_path, expected_arch, pairs, source_alpha, false)) {
-        return false;
+
+    // Rank is counted per weight tensor: adapters that do not contain a tensor
+    // do not consume rank for that tensor in the merged representation.
+    std::map<std::string, int64_t> required_ranks;
+    for (const lora_adapter_input & input : input_adapters) {
+        if (input.path.empty() || !std::isfinite(input.scale)) {
+            LOG_ERR("%s: input adapter path must not be empty and its scale must be finite\n", __func__);
+            return false;
+        }
+        std::map<std::string, source_lora_pair> pairs;
+        float source_alpha = 0.0f;
+        if (!load_source_lora(input.path, expected_arch, pairs, source_alpha, false)) {
+            return false;
+        }
+        for (const auto & kv : pairs) {
+            const source_lora_pair & pair = kv.second;
+            const int64_t source_rank = name_ends_with(kv.first, "token_embd.weight") ? pair.a_ne0 : pair.a_ne1;
+            int64_t & combined_rank = required_ranks[kv.first];
+            if (source_rank <= 0 || combined_rank > std::numeric_limits<int64_t>::max() - source_rank) {
+                LOG_ERR("%s: invalid or overflowing combined rank for '%s'\n", __func__, kv.first.c_str());
+                return false;
+            }
+            combined_rank += source_rank;
+        }
     }
-    for (const auto & kv : pairs) {
-        const source_lora_pair & pair = kv.second;
-        const int64_t source_rank = name_ends_with(kv.first, "token_embd.weight") ? pair.a_ne0 : pair.a_ne1;
-        if (source_rank > requested_rank) {
-            LOG_ERR("%s: cannot reduce rank of '%s' from %ld to %d\n",
-                    __func__, kv.first.c_str(), static_cast<long>(source_rank), requested_rank);
+
+    for (const auto & kv : required_ranks) {
+        if (kv.second > requested_rank) {
+            LOG_ERR("%s: combined input rank for '%s' is %ld, but --lora-rank is %d; increase --lora-rank\n",
+                    __func__, kv.first.c_str(), static_cast<long>(kv.second), requested_rank);
             return false;
         }
     }
+
+    int64_t max_required_rank = 0;
+    for (const auto & kv : required_ranks) {
+        max_required_rank = std::max(max_required_rank, kv.second);
+    }
+    LOG_INF("%s: combined input adapters fit in rank %d (maximum required rank: %ld)\n",
+            __func__, requested_rank, static_cast<long>(max_required_rank));
     return true;
 }
 
-lora_tensors transform_lora_tensors(const std::string & input_path,
+lora_tensors transform_lora_tensors(const std::vector<lora_adapter_input> & input_adapters,
                                     const std::string & expected_arch,
                                     const std::vector<std::pair<std::string, ggml_tensor *>> & model_tensors,
                                     const std::vector<std::string> & targets,
                                     int32_t rank,
                                     float alpha,
-                                    float input_scale,
                                     std::mt19937 & rng,
                                     int32_t model_n_layer,
                                     int32_t freeze_layers,
@@ -507,17 +541,11 @@ lora_tensors transform_lora_tensors(const std::string & input_path,
     if (!qlora_adapter_detail::lora_type_is_supported(lora_type, "requested storage type")) {
         return result;
     }
-    if (rank <= 0 || alpha <= 0.0f || !std::isfinite(alpha) || !std::isfinite(input_scale)) {
-        LOG_ERR("%s: rank and alpha must be positive and adapter scale must be finite\n", __func__);
+    if (input_adapters.empty() || rank <= 0 || alpha <= 0.0f || !std::isfinite(alpha)) {
+        LOG_ERR("%s: at least one input adapter, a positive rank/alpha, and finite scales are required\n", __func__);
         return result;
     }
     if (!validate_lora_targets(model_tensors, targets, model_n_layer, freeze_layers)) {
-        return result;
-    }
-
-    std::map<std::string, source_lora_pair> source_pairs;
-    float source_alpha = 0.0f;
-    if (!load_source_lora(input_path, expected_arch, source_pairs, source_alpha)) {
         return result;
     }
 
@@ -527,65 +555,99 @@ lora_tensors transform_lora_tensors(const std::string & input_path,
         model_by_name.emplace(entry.first, entry.second);
     }
 
-    std::vector<output_lora_pair> output_pairs;
-    output_pairs.reserve(source_pairs.size() + model_tensors.size());
-    std::unordered_map<std::string, bool> found_targets;
-    for (auto & kv : source_pairs) {
-        const std::string & name = kv.first;
-        source_lora_pair & source = kv.second;
-        const auto model_it = model_by_name.find(name);
-        if (model_it == model_by_name.end() || !model_it->second) {
-            LOG_ERR("%s: input adapter tensor '%s' does not exist in the base model\n",
-                    __func__, name.c_str());
-            return {};
-        }
-        ggml_tensor * model_tensor = model_it->second;
-        const bool embedding = name_ends_with(name, "token_embd.weight");
-        const int64_t old_rank = embedding ? source.a_ne0 : source.a_ne1;
-        const bool rank_shapes_match = embedding
-            ? source.a_ne0 == source.b_ne0
-            : source.a_ne1 == source.b_ne0 && source.a_ne2 == source.b_ne2;
-        const bool model_shapes_match = embedding
-            ? model_tensor->ne[0] == source.b_ne1 && model_tensor->ne[1] == source.a_ne1 &&
-              source.a_ne2 == 1 && source.b_ne2 == 1
-            : model_tensor->ne[0] == source.a_ne0 && model_tensor->ne[1] == source.b_ne1 &&
-              model_tensor->ne[2] == source.a_ne2 && model_tensor->ne[2] == source.b_ne2 &&
-              model_tensor->ne[3] == 1;
-        if (!rank_shapes_match || !model_shapes_match || old_rank <= 0) {
-            LOG_ERR("%s: LoRA tensor shape mismatch for '%s'\n", __func__, name.c_str());
-            return {};
-        }
-        if (old_rank > rank) {
-            LOG_ERR("%s: cannot reduce rank of '%s' from %ld to %d\n",
-                    __func__, name.c_str(), static_cast<long>(old_rank), rank);
+    std::map<std::string, output_lora_pair> output_by_name;
+    const float new_scale = alpha / static_cast<float>(rank);
+    for (const lora_adapter_input & input : input_adapters) {
+        if (input.path.empty() || !std::isfinite(input.scale)) {
+            LOG_ERR("%s: input adapter path must not be empty and its scale must be finite\n", __func__);
             return {};
         }
 
-        const float old_scale = source_alpha != 0.0f
-            ? input_scale * source_alpha / static_cast<float>(old_rank)
-            : input_scale;
-        const float new_scale = alpha / static_cast<float>(rank);
-        const float scale_ratio = old_scale / new_scale;
-        if (!std::isfinite(scale_ratio)) {
-            LOG_ERR("%s: scaling conversion for '%s' is not finite\n", __func__, name.c_str());
+        std::map<std::string, source_lora_pair> source_pairs;
+        float source_alpha = 0.0f;
+        if (!load_source_lora(input.path, expected_arch, source_pairs, source_alpha)) {
             return {};
         }
-        output_lora_pair output;
-        output.name = name;
-        output.embedding = embedding;
-        output.a_ne0 = embedding ? rank : model_tensor->ne[0];
-        output.a_ne1 = embedding ? model_tensor->ne[1] : rank;
-        output.a_ne2 = embedding ? 1 : model_tensor->ne[2];
-        output.b_ne0 = rank;
-        output.b_ne1 = embedding ? model_tensor->ne[0] : model_tensor->ne[1];
-        output.b_ne2 = embedding ? 1 : model_tensor->ne[2];
-        output.source_rank = old_rank;
-        output.source_scale = scale_ratio;
-        output.has_source = true;
-        output.source_a = std::move(source.a);
-        output.source_b = std::move(source.b);
-        output_pairs.push_back(std::move(output));
-        found_targets.emplace(name, true);
+
+        for (auto & kv : source_pairs) {
+            const std::string & name = kv.first;
+            source_lora_pair & source = kv.second;
+            const auto model_it = model_by_name.find(name);
+            if (model_it == model_by_name.end() || !model_it->second) {
+                LOG_ERR("%s: input adapter tensor '%s' does not exist in the base model\n",
+                        __func__, name.c_str());
+                return {};
+            }
+
+            ggml_tensor * model_tensor = model_it->second;
+            const bool embedding = name_ends_with(name, "token_embd.weight");
+            const int64_t source_rank = embedding ? source.a_ne0 : source.a_ne1;
+            const bool rank_shapes_match = embedding
+                ? source.a_ne0 == source.b_ne0
+                : source.a_ne1 == source.b_ne0 && source.a_ne2 == source.b_ne2;
+            const bool model_shapes_match = embedding
+                ? model_tensor->ne[0] == source.b_ne1 && model_tensor->ne[1] == source.a_ne1 &&
+                  source.a_ne2 == 1 && source.b_ne2 == 1
+                : model_tensor->ne[0] == source.a_ne0 && model_tensor->ne[1] == source.b_ne1 &&
+                  model_tensor->ne[2] == source.a_ne2 && model_tensor->ne[2] == source.b_ne2 &&
+                  model_tensor->ne[3] == 1;
+            if (!rank_shapes_match || !model_shapes_match || source_rank <= 0) {
+                LOG_ERR("%s: LoRA tensor shape mismatch for '%s' in '%s'\n",
+                        __func__, name.c_str(), input.path.c_str());
+                return {};
+            }
+
+            // Preserve this adapter's effective multiplier when its rank slice
+            // is placed in the output adapter, whose multiplier is alpha / rank.
+            const float old_scale = source_alpha != 0.0f
+                ? input.scale * source_alpha / static_cast<float>(source_rank)
+                : input.scale;
+            const float scale_ratio = old_scale / new_scale;
+            if (!std::isfinite(scale_ratio)) {
+                LOG_ERR("%s: scaling conversion for '%s' in '%s' is not finite\n",
+                        __func__, name.c_str(), input.path.c_str());
+                return {};
+            }
+
+            auto it = output_by_name.find(name);
+            if (it == output_by_name.end()) {
+                output_lora_pair output;
+                output.name = name;
+                output.embedding = embedding;
+                output.a_ne0 = embedding ? rank : model_tensor->ne[0];
+                output.a_ne1 = embedding ? model_tensor->ne[1] : rank;
+                output.a_ne2 = embedding ? 1 : model_tensor->ne[2];
+                output.b_ne0 = rank;
+                output.b_ne1 = embedding ? model_tensor->ne[0] : model_tensor->ne[1];
+                output.b_ne2 = embedding ? 1 : model_tensor->ne[2];
+                it = output_by_name.emplace(name, std::move(output)).first;
+            }
+
+            output_lora_pair & output = it->second;
+            if (output.embedding != embedding || output.source_rank > rank - source_rank) {
+                LOG_ERR("%s: combined input rank for '%s' exceeds --lora-rank %d\n",
+                        __func__, name.c_str(), rank);
+                return {};
+            }
+            output.source_rank += source_rank;
+            source_lora_fragment fragment;
+            fragment.rank = source_rank;
+            fragment.scale = scale_ratio;
+            fragment.a = std::move(source.a);
+            fragment.b = std::move(source.b);
+            output.sources.push_back(std::move(fragment));
+        }
+    }
+
+    std::vector<output_lora_pair> output_pairs;
+    output_pairs.reserve(output_by_name.size() + model_tensors.size());
+    for (auto & kv : output_by_name) {
+        output_pairs.push_back(std::move(kv.second));
+    }
+
+    std::unordered_map<std::string, bool> found_targets;
+    for (const output_lora_pair & pair : output_pairs) {
+        found_targets.emplace(pair.name, true);
     }
 
     for (const auto & entry : model_tensors) {
@@ -611,10 +673,7 @@ lora_tensors transform_lora_tensors(const std::string & input_path,
         output.b_ne0 = rank;
         output.b_ne1 = output.embedding ? tensor->ne[0] : tensor->ne[1];
         output.b_ne2 = output.embedding ? 1 : tensor->ne[2];
-        output.source_rank = 0;
-        output.has_source = false;
         output_pairs.push_back(std::move(output));
-        found_targets.emplace(name, true);
     }
 
     if (output_pairs.empty()) {
@@ -656,61 +715,67 @@ lora_tensors transform_lora_tensors(const std::string & input_path,
         std::vector<float> dst_b(static_cast<size_t>(ggml_nelements(b)));
         initialize_lora_weight_values(dst_a, dst_b, a->ne[0], pair.embedding, rng);
 
-        if (!pair.has_source) {
-            if (!tensor_write_f32_values(a, dst_a) || !tensor_write_f32_values(b, dst_b)) {
-                LOG_ERR("%s: failed to initialize LoRA tensors for '%s' as %s\n",
-                        __func__, pair.name.c_str(), ggml_type_name(lora_type));
-                return {};
-            }
-            continue;
-        }
-
-        if (!pair.embedding) {
-            const int64_t input_dim = a->ne[0];
-            const int64_t n_expert = a->ne[2];
-            for (int64_t e = 0; e < n_expert; ++e) {
-                for (int64_t r = 0; r < pair.source_rank; ++r) {
-                    const size_t src_offset = static_cast<size_t>(input_dim * (r + pair.source_rank * e));
-                    const size_t dst_offset = static_cast<size_t>(input_dim * (r + rank * e));
-                    std::copy_n(pair.source_a.data() + src_offset, input_dim, dst_a.data() + dst_offset);
+        // Concatenating A rank slices and their corresponding B rank slices
+        // makes the output update equal to the sum of the input updates.
+        // Unused output rank slots retain the zero-effect initialization above.
+        int64_t rank_offset = 0;
+        for (const source_lora_fragment & source : pair.sources) {
+            if (!pair.embedding) {
+                const int64_t input_dim = a->ne[0];
+                const int64_t n_expert = a->ne[2];
+                for (int64_t e = 0; e < n_expert; ++e) {
+                    for (int64_t r = 0; r < source.rank; ++r) {
+                        const size_t src_offset = static_cast<size_t>(input_dim * (r + source.rank * e));
+                        const size_t dst_offset = static_cast<size_t>(input_dim * (rank_offset + r + rank * e));
+                        std::copy_n(source.a.data() + src_offset, input_dim, dst_a.data() + dst_offset);
+                    }
                 }
-            }
-            const int64_t output_dim = b->ne[1];
-            for (int64_t e = 0; e < n_expert; ++e) {
-                for (int64_t j = 0; j < output_dim; ++j) {
-                    for (int64_t r = 0; r < pair.source_rank; ++r) {
-                        const size_t src_offset = static_cast<size_t>(r + pair.source_rank * (j + output_dim * e));
-                        const size_t dst_offset = static_cast<size_t>(r + rank * (j + output_dim * e));
-                        dst_b[dst_offset] = pair.source_b[src_offset] * pair.source_scale;
+                const int64_t output_dim = b->ne[1];
+                for (int64_t e = 0; e < n_expert; ++e) {
+                    for (int64_t j = 0; j < output_dim; ++j) {
+                        for (int64_t r = 0; r < source.rank; ++r) {
+                            const size_t src_offset = static_cast<size_t>(r + source.rank * (j + output_dim * e));
+                            const size_t dst_offset = static_cast<size_t>(rank_offset + r + rank * (j + output_dim * e));
+                            dst_b[dst_offset] = source.b[src_offset] * source.scale;
+                        }
+                    }
+                }
+            } else {
+                const int64_t embedding_dim = a->ne[1];
+                for (int64_t j = 0; j < embedding_dim; ++j) {
+                    for (int64_t r = 0; r < source.rank; ++r) {
+                        dst_a[rank_offset + r + rank * j] = source.a[r + source.rank * j];
+                    }
+                }
+                const int64_t vocab_size = b->ne[1];
+                for (int64_t j = 0; j < vocab_size; ++j) {
+                    for (int64_t r = 0; r < source.rank; ++r) {
+                        dst_b[rank_offset + r + rank * j] = source.b[r + source.rank * j] * source.scale;
                     }
                 }
             }
-        } else {
-            const int64_t embedding_dim = a->ne[1];
-            for (int64_t j = 0; j < embedding_dim; ++j) {
-                for (int64_t r = 0; r < pair.source_rank; ++r) {
-                    dst_a[r + rank * j] = pair.source_a[r + pair.source_rank * j];
-                }
-            }
-            const int64_t vocab_size = b->ne[1];
-            for (int64_t j = 0; j < vocab_size; ++j) {
-                for (int64_t r = 0; r < pair.source_rank; ++r) {
-                    dst_b[r + rank * j] = pair.source_b[r + pair.source_rank * j] * pair.source_scale;
-                }
-            }
+            rank_offset += source.rank;
+        }
+        if (rank_offset != pair.source_rank) {
+            LOG_ERR("%s: internal rank accounting mismatch for '%s'\n", __func__, pair.name.c_str());
+            return {};
         }
         if (!tensor_write_f32_values(a, dst_a) || !tensor_write_f32_values(b, dst_b)) {
-            LOG_ERR("%s: failed to encode LoRA tensors for '%s' as %s\n",
+            LOG_ERR("%s: failed to encode merged LoRA tensors for '%s' as %s\n",
                     __func__, pair.name.c_str(), ggml_type_name(lora_type));
             return {};
         }
     }
 
-    LOG_INF("%s: prepared %zu LoRA tensor pairs at rank %d and alpha %.4g\n",
-            __func__, result.refs.size(), rank, alpha);
+    int64_t max_required_rank = 0;
+    for (const output_lora_pair & pair : output_pairs) {
+        max_required_rank = std::max(max_required_rank, pair.source_rank);
+    }
+    LOG_INF("%s: prepared %zu LoRA tensor pairs from %zu input adapter(s) at rank %d (maximum input rank sum: %ld) and alpha %.4g\n",
+            __func__, result.refs.size(), input_adapters.size(), rank,
+            static_cast<long>(max_required_rank), alpha);
     return result;
 }
-
 
 bool lora_param_filter(const struct ggml_tensor * t, void * ) {
     const char * n   = t->name;

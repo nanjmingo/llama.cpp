@@ -202,11 +202,6 @@ int main(int argc, char ** argv) {
         ? static_cast<size_t>(params.cpuparams.n_threads)
         : 0;
 
-    if (params.lora_adapters.size() > 1) {
-        LOG_ERR("%s: QLoRA accepts only one input adapter; comma-separated and repeated --lora inputs are unsupported\n", __func__);
-        return 1;
-    }
-
     std::error_code output_ec;
     std::filesystem::create_directories(qparams.output_dir, output_ec);
     if (output_ec || !std::filesystem::is_directory(qparams.output_dir, output_ec) || output_ec) {
@@ -232,10 +227,15 @@ int main(int argc, char ** argv) {
         resume = &resume_checkpoint;
     }
     const bool adapter_supplied = input_adapter_cli || resume != nullptr;
-    const std::string input_adapter_path = resume
-        ? (resume_checkpoint.directory / "adapter.gguf").string()
-        : (input_adapter_cli ? params.lora_adapters.front().path : std::string());
-    const float input_adapter_scale = input_adapter_cli ? params.lora_adapters.front().scale : 1.0f;
+    std::vector<lora_adapter_input> input_adapters;
+    if (resume) {
+        input_adapters.push_back({ (resume_checkpoint.directory / "adapter.gguf").string(), 1.0f });
+    } else {
+        input_adapters.reserve(params.lora_adapters.size());
+        for (const common_adapter_lora_info & adapter : params.lora_adapters) {
+            input_adapters.push_back({ adapter.path, adapter.scale });
+        }
+    }
     params.lora_adapters.clear();
 
     if (qparams.dataset.input_paths.empty()) {
@@ -299,14 +299,9 @@ int main(int argc, char ** argv) {
         }
     }
 
-    if (adapter_supplied) {
-        if (!std::isfinite(input_adapter_scale)) {
-            LOG_ERR("%s: input adapter scale must be finite\n", __func__);
-            return 1;
-        }
-        if (!arch.empty() && !validate_lora_adapter_rank(input_adapter_path, arch, qparams.lora_rank)) {
-            return 1;
-        }
+    if (adapter_supplied && !arch.empty() &&
+            !validate_lora_adapter_rank(input_adapters, arch, qparams.lora_rank)) {
+        return 1;
     }
 
     lora_tensor_refs output_refs;
@@ -314,10 +309,14 @@ int main(int argc, char ** argv) {
 
     if (resume) {
         LOG_INF("%s: preparing LoRA adapter from checkpoint: %s\n",
-                __func__, input_adapter_path.c_str());
+                __func__, input_adapters.front().path.c_str());
     } else if (input_adapter_cli) {
-        LOG_INF("%s: preparing existing LoRA adapter: %s (optimizer state starts fresh)\n",
-                __func__, input_adapter_path.c_str());
+        LOG_INF("%s: preparing %zu existing LoRA adapter(s) (optimizer state starts fresh)\n",
+                __func__, input_adapters.size());
+        for (size_t i = 0; i < input_adapters.size(); ++i) {
+            LOG_INF("%s: input adapter %zu: %s (scale %.6g)\n",
+                    __func__, i + 1, input_adapters[i].path.c_str(), input_adapters[i].scale);
+        }
     }
 
     common_init();
@@ -368,8 +367,8 @@ int main(int argc, char ** argv) {
         lora_tensors prepared;
         if (adapter_supplied) {
             prepared = transform_lora_tensors(
-                input_adapter_path, arch, model->tensors_by_name, targets, qparams.lora_rank,
-                lora_alpha, input_adapter_scale, rng, llama_model_n_layer(model), qparams.freeze_layers, lora_type);
+                input_adapters, arch, model->tensors_by_name, targets, qparams.lora_rank,
+                lora_alpha, rng, llama_model_n_layer(model), qparams.freeze_layers, lora_type);
         } else {
             prepared = alloc_lora_tensors(
                 model->tensors_by_name, targets, qparams.lora_rank, rng,
