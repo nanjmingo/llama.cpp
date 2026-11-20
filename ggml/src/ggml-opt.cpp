@@ -68,6 +68,8 @@ struct ggml_opt_context {
     std::vector<struct ggml_tensor *> grad_accs;
     std::vector<struct ggml_tensor *> grad_m;
     std::vector<struct ggml_tensor *> grad_v;
+    std::vector<ggml_backend_buffer_t> bufs_grad_accs;
+    std::vector<struct ggml_context *> ctxs_grad_accs;
     std::vector<ggml_backend_buffer_t> bufs_momenta;
     std::vector<struct ggml_context *> ctxs_momenta;
 
@@ -600,28 +602,22 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     ggml_set_input(opt_ctx->inputs);
     ggml_set_output(opt_ctx->outputs);
 
-    int n_param = 0;
     for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
         const struct ggml_tensor * node = opt_ctx->gf->nodes[i];
-        if (node->flags & GGML_TENSOR_FLAG_PARAM) {
-            n_param++;
-        }
         GGML_ASSERT(!(node->flags & GGML_TENSOR_FLAG_LOSS) && "support for extra loss terms not implemented");
     }
 
     if (!opt_ctx->ctx_static) {
         // The static context is used for:
-        //   - gradients (1 per loss, 1 tensor per param if using gradient accumulation)
-        //   - optimizer momenta (2 tensors per param)
+        //   - the loss gradient accumulator
         //   - labels (if using static graphs)
         //   - loss (if using static graphs, up to 5 tensors)
         //   - pred (if using static graphs)
         //   - ncorrect (if using static graphs, 2 tensors).
         constexpr size_t n_loss = 1;
-        const size_t tensors_per_param = (accumulate ? 1 : 0) + (need_momenta ? 2 : 0);
         const size_t tensors_const = opt_ctx->static_graphs ?
             9 + (opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY ? 11 : 0) : 0;
-        const size_t size_meta = (n_loss + tensors_per_param*n_param + tensors_const) * ggml_tensor_overhead();
+        const size_t size_meta = (n_loss + tensors_const) * ggml_tensor_overhead();
         struct ggml_init_params params = {
             /*.mem_size   =*/ size_meta,
             /*.mem_buffer =*/ nullptr,
@@ -743,13 +739,48 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
 
         const int n_nodes = opt_ctx->gf->n_nodes;
         opt_ctx->grad_accs.resize(n_nodes);
+
+        // Keep the loss accumulator in the static buffer, but allocate parameter
+        // accumulators on the same buffer type as their corresponding parameters.
+        // Group tensors by buffer type to avoid creating one backend allocation per
+        // parameter while preserving the parameter-to-device placement.
+        std::map<ggml_backend_buffer_type_t, std::vector<int>> grad_acc_indices;
         for (int i = 0; i < n_nodes; ++i) {
             ggml_tensor * node = opt_ctx->gf->nodes[i];
-            if ((accumulate && (node->flags & GGML_TENSOR_FLAG_PARAM)) || (node->flags & GGML_TENSOR_FLAG_LOSS)) {
-                opt_ctx->grad_accs[i] = ggml_new_tensor(opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
+            if (node->flags & GGML_TENSOR_FLAG_LOSS) {
+                opt_ctx->grad_accs[i] = ggml_new_tensor(
+                    opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
+            } else if (accumulate && (node->flags & GGML_TENSOR_FLAG_PARAM)) {
+                const ggml_backend_buffer_type_t param_buft = node->buffer
+                    ? ggml_backend_buffer_get_type(node->buffer)
+                    : ggml_backend_cpu_buffer_type();
+                grad_acc_indices[param_buft].push_back(i);
+                opt_ctx->grad_accs[i] = nullptr;
             } else {
                 opt_ctx->grad_accs[i] = nullptr;
             }
+        }
+
+        for (const auto & entry : grad_acc_indices) {
+            const ggml_backend_buffer_type_t param_buft = entry.first;
+            const std::vector<int> & indices = entry.second;
+            const size_t size_meta = indices.size() * ggml_tensor_overhead();
+            struct ggml_init_params gparams = { size_meta, nullptr, true };
+            struct ggml_context * gctx = ggml_init(gparams);
+            GGML_ASSERT(gctx != nullptr);
+
+            for (int i : indices) {
+                ggml_tensor * node = opt_ctx->gf->nodes[i];
+                opt_ctx->grad_accs[i] = ggml_new_tensor(
+                    gctx, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
+                ggml_format_name(opt_ctx->grad_accs[i], "grad_acc for %s", node->name);
+            }
+
+            ggml_backend_buffer_t gbuf = ggml_backend_alloc_ctx_tensors_from_buft(gctx, param_buft);
+            GGML_ASSERT(gbuf != nullptr);
+            ggml_backend_buffer_clear(gbuf, 0);
+            opt_ctx->bufs_grad_accs.push_back(gbuf);
+            opt_ctx->ctxs_grad_accs.push_back(gctx);
         }
 
         if (need_momenta && opt_ctx->build_type_alloc >= GGML_OPT_BUILD_TYPE_OPT) {
@@ -1329,6 +1360,12 @@ void ggml_opt_free(ggml_opt_context_t opt_ctx) {
     }
     ggml_backend_buffer_free(opt_ctx->buf_static);
     ggml_backend_buffer_free(opt_ctx->buf_cpu);
+    for (ggml_backend_buffer_t buf : opt_ctx->bufs_grad_accs) {
+        ggml_backend_buffer_free(buf);
+    }
+    for (struct ggml_context * ctx : opt_ctx->ctxs_grad_accs) {
+        ggml_free(ctx);
+    }
     for (ggml_backend_buffer_t buf : opt_ctx->bufs_momenta) {
         ggml_backend_buffer_free(buf);
     }
