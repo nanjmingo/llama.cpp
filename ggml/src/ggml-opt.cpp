@@ -325,20 +325,27 @@ namespace {
             return;
         }
 
-        // Probe backend placement on a deep metadata clone. The scheduler's
-        // split pass mutates node->src[] to insert cross-backend copies; gf and
-        // gb_grad share tensor objects, so splitting gf directly corrupts the
-        // graph that will subsequently be evaluated.
-        const size_t n_tensors = opt_ctx->gf->visited_hash_set.size + 8;
+        // Probe backend placement on a deep metadata clone of the graph that
+        // will actually be scheduled. The scheduler's split pass mutates
+        // node->src[] to insert cross-backend copies; the probe must therefore
+        // be independent from the graph that will subsequently be evaluated.
+        //
+        // Do not probe gf alone: with gradient accumulation, gb_grad also
+        // contains persistent gradient-accumulator leaves and the backward
+        // graph. Those nodes participate in scheduler's graph-wide backend
+        // expansion and can change the placement of forward nodes. Probing only
+        // gf produces affinities that do not match the real graph, which leaves
+        // the appended recompute section concentrated on one GPU.
+        const size_t n_tensors = graph->visited_hash_set.size + 8;
         const size_t mem_size = n_tensors * ggml_tensor_overhead() +
-            ggml_graph_overhead_custom(opt_ctx->gf->size, /* grads = */ false) + 1024;
+            ggml_graph_overhead_custom(graph->size, /* grads = */ false) + 1024;
         ggml_init_params params = { mem_size, nullptr, true };
         ggml_context * ctx_probe = ggml_init(params);
         GGML_ASSERT(ctx_probe != nullptr);
 
         std::unordered_map<ggml_tensor *, ggml_tensor *> probe_tensors;
-        probe_tensors.reserve(opt_ctx->gf->visited_hash_set.size);
-        ggml_cgraph * graph_probe = ggml_opt_clone_graph_for_sched(ctx_probe, opt_ctx->gf, probe_tensors);
+        probe_tensors.reserve(graph->visited_hash_set.size);
+        ggml_cgraph * graph_probe = ggml_opt_clone_graph_for_sched(ctx_probe, graph, probe_tensors);
 
         ggml_backend_sched_split_graph(opt_ctx->backend_sched, graph_probe);
 
@@ -347,11 +354,11 @@ namespace {
         for (const auto & affinity : opt_ctx->recompute_backend_affinities) {
             GGML_ASSERT(affinity.first >= 0 && affinity.first < opt_ctx->gf->n_nodes);
             ggml_tensor * source_node = opt_ctx->gf->nodes[affinity.first];
+            // Read the backend chosen for the original forward node in the
+            // context of the complete forward + backward + accumulator graph.
             // Pin every recomputed node, including weight-backed operations, to
-            // the backend selected for its original forward node. The scheduler
-            // does not always infer weight placement through VIEW sources, so
-            // leaving those nodes unassigned lets the appended recompute graph
-            // inherit one neighboring GPU and creates a large memory skew.
+            // that backend so the appended recompute section mirrors the actual
+            // forward placement instead of inheriting one neighbouring GPU.
             ggml_tensor * probe_node = probe_tensors.at(source_node);
             ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(opt_ctx->backend_sched, probe_node);
             if (backend) {
