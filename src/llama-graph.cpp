@@ -34,9 +34,10 @@ static ggml_tensor * build_attn_inp_kq_mask(
         ggml_context * ctx,
         const llama_kv_cache_context * mctx,
         const llama_ubatch & ubatch,
-        const llama_cparams & cparams) {
-    const auto n_kv     = mctx->get_n_kv();
+        const llama_cparams & cparams,
+        bool use_current_kv = false) {
     const auto n_tokens = ubatch.n_tokens;
+    const auto n_kv     = cparams.training && use_current_kv ? n_tokens : mctx->get_n_kv();
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
     // flash attention requires an f16 mask
@@ -53,9 +54,10 @@ static bool can_reuse_kq_mask(
         ggml_tensor * kq_mask,
         const llama_kv_cache_context * mctx,
         const llama_ubatch & ubatch,
-        const llama_cparams & cparams) {
-    const auto n_kv     = mctx->get_n_kv();
+        const llama_cparams & cparams,
+        bool use_current_kv = false) {
     const auto n_tokens = ubatch.n_tokens;
+    const auto n_kv     = cparams.training && use_current_kv ? n_tokens : mctx->get_n_kv();
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
     bool res = true;
@@ -72,8 +74,9 @@ static bool can_reuse_attn_mask(
         const llm_attn_mask & attn_mask,
         const llama_kv_cache_context * mctx,
         const llama_ubatch & ubatch,
-        const llama_cparams & cparams) {
-    const uint32_t n_kv_rows = cparams.fused_kv_rows ? mctx->get_n_kv_rows() : 0;
+        const llama_cparams & cparams,
+        bool use_current_kv = false) {
+    const uint32_t n_kv_rows = cparams.fused_kv_rows && !cparams.training ? mctx->get_n_kv_rows() : 0;
     const uint32_t n_slices  = llama_kv_cache::get_n_kv_slices(ubatch);
     const auto     n_tokens  = ubatch.n_tokens;
 
@@ -86,7 +89,7 @@ static bool can_reuse_attn_mask(
     }
 
     if (!use_rows) {
-        return can_reuse_kq_mask(attn_mask.raw, mctx, ubatch, cparams);
+        return can_reuse_kq_mask(attn_mask.raw, mctx, ubatch, cparams, use_current_kv);
     }
 
     bool res = true;
@@ -105,16 +108,17 @@ static llm_attn_mask build_attn_inp_attn_mask(
         ggml_context * ctx,
         const llama_kv_cache_context * mctx,
         const llama_ubatch & ubatch,
-        const llama_cparams & cparams) {
+        const llama_cparams & cparams,
+        bool use_current_kv = false) {
     llm_attn_mask attn_mask;
 
     attn_mask.n_kv = mctx->get_n_kv();
 
-    const uint32_t n_kv_rows = cparams.fused_kv_rows ? mctx->get_n_kv_rows() : 0;
+    const uint32_t n_kv_rows = cparams.fused_kv_rows && !cparams.training ? mctx->get_n_kv_rows() : 0;
 
     if (n_kv_rows == 0) {
         attn_mask.rows = nullptr;
-        attn_mask.raw = build_attn_inp_kq_mask(ctx, mctx, ubatch, cparams);
+        attn_mask.raw = build_attn_inp_kq_mask(ctx, mctx, ubatch, cparams, use_current_kv);
     } else {
         const uint32_t n_slices = llama_kv_cache::get_n_kv_slices(ubatch);
 
@@ -569,6 +573,85 @@ void llm_graph_input_cross_embd::set_input(const llama_ubatch * ubatch) {
 }
 
 template <typename T>
+static void fill_attn_mask(
+        T * data,
+        int64_t n_elements,
+        int64_t n_kv,
+        const llama_ubatch * ubatch,
+        const llama_hparams & hparams,
+        int n_swa,
+        llama_swa_type swa_type,
+        bool causal) {
+    const int64_t n_tokens = ubatch->n_tokens;
+
+    GGML_ASSERT(n_kv >= n_tokens);
+    std::fill(data, data + n_elements, llama_cast<T>(-INFINITY));
+
+    for (int i1 = 0; i1 < n_tokens; ++i1) {
+        const llama_seq_id s1 = ubatch->seq_id[i1][0];
+        const llama_pos p1 = ubatch->pos[i1];
+        const uint64_t idst = i1*n_kv;
+
+        for (int i0 = 0; i0 < n_tokens; ++i0) {
+            const llama_seq_id s0 = ubatch->seq_id[i0][0];
+            const llama_pos p0 = ubatch->pos[i0];
+
+            if (s0 != s1 || (causal && p0 > p1) || llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
+                continue;
+            }
+
+            data[idst + i0] = llama_cast<T>(hparams.use_alibi ? -std::abs(p0 - p1) : 0.0f);
+        }
+    }
+}
+
+static void fill_training_attn_mask(
+        ggml_tensor * mask,
+        const llama_ubatch * ubatch,
+        const llama_hparams & hparams,
+        int n_swa,
+        llama_swa_type swa_type,
+        bool causal) {
+    if (!mask || !mask->buffer) {
+        return;
+    }
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(mask->buffer));
+
+    if (mask->type == GGML_TYPE_F16) {
+        fill_attn_mask((ggml_fp16_t *) mask->data, ggml_nelements(mask), mask->ne[0], ubatch, hparams, n_swa, swa_type, causal);
+    } else {
+        GGML_ASSERT(mask->type == GGML_TYPE_F32);
+        fill_attn_mask((float *) mask->data, ggml_nelements(mask), mask->ne[0], ubatch, hparams, n_swa, swa_type, causal);
+    }
+}
+
+static void fill_training_relative_pos(
+        ggml_tensor * dst,
+        const llama_ubatch * ubatch,
+        uint32_t extent) {
+    const int64_t n_tokens = ubatch->n_tokens;
+    const int64_t n_kv = dst->ne[0];
+
+    GGML_ASSERT(n_kv == n_tokens);
+    GGML_ASSERT(dst->ne[1] == n_tokens);
+
+    std::vector<int32_t> data(n_kv * n_tokens, (int32_t) extent);
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        for (int64_t j = 0; j < n_kv; ++j) {
+            if (ubatch->seq_id[i][0] != ubatch->seq_id[j][0]) {
+                continue;
+            }
+
+            const int64_t distance = int64_t(ubatch->pos[i]) - ubatch->pos[j];
+            data[i*n_kv + j] = distance >= 0 && distance < extent ? (int32_t) distance : (int32_t) extent;
+        }
+    }
+
+    ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
+}
+
+template <typename T>
 static void print_mask(const T * data, int64_t n_tokens, int64_t n_kv, int64_t n_swa, llama_swa_type swa_type) {
     LLAMA_LOG_DEBUG("%s: === Attention mask ===\n", __func__);
     const char * swa_type_str = "unknown";
@@ -688,7 +771,11 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     // the mask is left unallocated when the graph only stores K/V without attending
     // (e.g. DFlash's KV-injection pass)
     if (self_attn_mask.raw && self_attn_mask.raw->buffer) {
-        mctx->set_input_attn_mask(self_attn_mask, ubatch, cparams.causal_attn);
+        if (cparams.training) {
+            fill_training_attn_mask(self_attn_mask.raw, ubatch, hparams, 0, LLAMA_SWA_TYPE_NONE, cparams.causal_attn);
+        } else {
+            mctx->set_input_attn_mask(self_attn_mask, ubatch, cparams.causal_attn);
+        }
     }
 }
 
@@ -702,7 +789,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
-    res &= can_reuse_attn_mask(self_attn_mask, mctx, params.ubatch, params.cparams);
+    res &= can_reuse_attn_mask(self_attn_mask, mctx, params.ubatch, params.cparams, true);
 
     return res;
 }
@@ -758,7 +845,7 @@ bool llm_graph_input_attn_kv_msa::can_reuse(const llm_graph_params & params) {
         res &= self_k_idxs_idx->ne[0] == params.ubatch.n_tokens;
     }
 
-    res &= can_reuse_attn_mask(self_attn_mask, this->mctx, params.ubatch, params.cparams);
+    res &= can_reuse_attn_mask(self_attn_mask, this->mctx, params.ubatch, params.cparams, true);
 
     return res;
 }
@@ -767,7 +854,7 @@ void llm_graph_input_attn_k_dsa::set_input(const llama_ubatch * ubatch) {
     mctx->get_mla()->set_input_k_idxs(self_k_idxs_mla, ubatch);
 
     // leave unallocated when the top-k layers use the indexer mask
-    if (self_attn_mask_mla.raw->buffer) {
+    if (self_attn_mask_mla.raw && self_attn_mask_mla.raw->buffer) {
         mctx->get_mla()->set_input_attn_mask(self_attn_mask_mla, ubatch, cparams.causal_attn);
     }
 
@@ -823,7 +910,13 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     }
 
     // the kq mask guards on its own buffer: shared cells leave idxs unbacked while the mask stays live
-    mctx->get_base()->set_input_attn_mask(self_attn_mask, ubatch, cparams.causal_attn);
+    if (self_attn_mask.raw && self_attn_mask.raw->buffer) {
+        if (cparams.training) {
+            fill_training_attn_mask(self_attn_mask.raw, ubatch, hparams, 0, LLAMA_SWA_TYPE_NONE, cparams.causal_attn);
+        } else {
+            mctx->get_base()->set_input_attn_mask(self_attn_mask, ubatch, cparams.causal_attn);
+        }
+    }
 
     // swa tensors may not be allocated if there are no SWA attention layers
     if (self_k_idxs_swa && self_k_idxs_swa->buffer) {
@@ -833,7 +926,14 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
         }
     }
 
-    mctx->get_swa()->set_input_attn_mask(self_attn_mask_swa, ubatch, cparams.causal_attn);
+    if (self_attn_mask_swa.raw && self_attn_mask_swa.raw->buffer) {
+        if (cparams.training) {
+            const bool causal_swa = cparams.causal_attn || hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_DENSE_ONLY;
+            fill_training_attn_mask(self_attn_mask_swa.raw, ubatch, hparams, hparams.n_swa, hparams.swa_type, causal_swa);
+        } else {
+            mctx->get_swa()->set_input_attn_mask(self_attn_mask_swa, ubatch, cparams.causal_attn);
+        }
+    }
 }
 
 bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
@@ -850,7 +950,7 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
     }
 
     if (self_attn_mask.raw && self_attn_mask.raw->buffer) {
-        res &= can_reuse_attn_mask(self_attn_mask, mctx->get_base(), params.ubatch, params.cparams);
+        res &= can_reuse_attn_mask(self_attn_mask, mctx->get_base(), params.ubatch, params.cparams, true);
     }
 
     // swa tensors may not be allocated if there are no SWA attention layers
@@ -860,7 +960,7 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
     }
 
     if (self_attn_mask_swa.raw && self_attn_mask_swa.raw->buffer) {
-        res &= can_reuse_attn_mask(self_attn_mask_swa, mctx->get_swa(), params.ubatch, params.cparams);
+        res &= can_reuse_attn_mask(self_attn_mask_swa, mctx->get_swa(), params.ubatch, params.cparams, true);
     }
 
     return res;
@@ -1243,15 +1343,22 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
-    mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
-    mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+    const auto * attn_ctx = mctx->get_attn();
 
-    // kv_rows and the mask stay unallocated if all attention layers have their own (e.g. qwen4exp QSA)
-    mctx->get_attn()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
+    if (inp_attn->self_k_idxs && inp_attn->self_k_idxs->buffer) {
+        attn_ctx->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
+    }
+    if (inp_attn->self_v_idxs && inp_attn->self_v_idxs->buffer) {
+        attn_ctx->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+    }
+    // leave the mask unallocated if all attention layers have their own (e.g. qwen4exp QSA)
+    if (inp_attn->self_attn_mask.raw && inp_attn->self_attn_mask.raw->buffer) {
+        attn_ctx->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
+    }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -1288,16 +1395,18 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 // Instead of creating a hybrid input, the graph can simply create 2 separate inputs.
 // Refactoring is required in the future.
 void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
-    mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
+    const auto * attn_ctx = mctx->get_attn();
 
-    // leave the mask unallocated if all attention layers have their own (e.g. glm5-next DSA)
-    if (inp_attn->self_attn_mask.raw->buffer) {
-        mctx->get_attn()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
+    if (inp_attn->self_k_idxs && inp_attn->self_k_idxs->buffer) {
+        attn_ctx->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
+    }
+    if (inp_attn->self_attn_mask.raw && inp_attn->self_attn_mask.raw->buffer) {
+        attn_ctx->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -1339,7 +1448,11 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
     }
 
     if (inp_attn->self_attn_mask.raw && inp_attn->self_attn_mask.raw->buffer) {
-        attn_ctx->get_base()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
+        if (cparams.training) {
+            fill_training_attn_mask(inp_attn->self_attn_mask.raw, ubatch, inp_attn->hparams, 0, LLAMA_SWA_TYPE_NONE, cparams.causal_attn);
+        } else {
+            attn_ctx->get_base()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
+        }
     }
 
     // swa tensors may not be allocated if there are no SWA attention layers
@@ -1349,7 +1462,13 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
     }
 
     if (inp_attn->self_attn_mask_swa.raw && inp_attn->self_attn_mask_swa.raw->buffer) {
-        attn_ctx->get_swa()->set_input_attn_mask(inp_attn->self_attn_mask_swa, ubatch, cparams.causal_attn);
+        if (cparams.training) {
+            const auto & hparams = inp_attn->hparams;
+            const bool causal_swa = cparams.causal_attn || hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_DENSE_ONLY;
+            fill_training_attn_mask(inp_attn->self_attn_mask_swa.raw, ubatch, hparams, hparams.n_swa, hparams.swa_type, causal_swa);
+        } else {
+            attn_ctx->get_swa()->set_input_attn_mask(inp_attn->self_attn_mask_swa, ubatch, cparams.causal_attn);
+        }
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
@@ -1380,7 +1499,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
       //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
     }
 
-    res &= can_reuse_attn_mask(inp_attn->self_attn_mask, attn_ctx->get_base(), params.ubatch, params.cparams);
+    res &= can_reuse_attn_mask(inp_attn->self_attn_mask, attn_ctx->get_base(), params.ubatch, params.cparams, true);
 
     // swa tensors may not be allocated if there are no SWA attention layers
     if (inp_attn->self_k_idxs_swa && inp_attn->self_k_idxs_swa->buffer) {
@@ -1388,7 +1507,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
       //res &= inp_attn->self_v_idxs_swa->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
     }
 
-    res &= can_reuse_attn_mask(inp_attn->self_attn_mask_swa, attn_ctx->get_swa(), params.ubatch, params.cparams);
+    res &= can_reuse_attn_mask(inp_attn->self_attn_mask_swa, attn_ctx->get_swa(), params.ubatch, params.cparams, true);
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -1410,11 +1529,19 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
     }
 
     if (inp_attn->self_attn_mask.raw && inp_attn->self_attn_mask.raw->buffer) {
-        attn_ctx->get_base()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
+        if (cparams.training) {
+            fill_training_attn_mask(inp_attn->self_attn_mask.raw, ubatch, inp_attn->hparams, 0, LLAMA_SWA_TYPE_NONE, cparams.causal_attn);
+        } else {
+            attn_ctx->get_base()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
+        }
     }
 
     if (self_rel_pos->buffer) {
-        attn_ctx->get_base()->set_input_relative_pos(self_rel_pos, ubatch, extent);
+        if (cparams.training) {
+            fill_training_relative_pos(self_rel_pos, ubatch, extent);
+        } else {
+            attn_ctx->get_base()->set_input_relative_pos(self_rel_pos, ubatch, extent);
+        }
     }
 
     // swa tensors may not be allocated if there are no SWA attention layers
@@ -1424,11 +1551,21 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
     }
 
     if (inp_attn->self_attn_mask_swa.raw && inp_attn->self_attn_mask_swa.raw->buffer) {
-        attn_ctx->get_swa()->set_input_attn_mask(inp_attn->self_attn_mask_swa, ubatch, cparams.causal_attn);
+        if (cparams.training) {
+            const auto & hparams = inp_attn->hparams;
+            const bool causal_swa = cparams.causal_attn || hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_DENSE_ONLY;
+            fill_training_attn_mask(inp_attn->self_attn_mask_swa.raw, ubatch, hparams, hparams.n_swa, hparams.swa_type, causal_swa);
+        } else {
+            attn_ctx->get_swa()->set_input_attn_mask(inp_attn->self_attn_mask_swa, ubatch, cparams.causal_attn);
+        }
     }
 
     if (self_rel_pos_swa->buffer) {
-        attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
+        if (cparams.training) {
+            fill_training_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
+        } else {
+            attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
+        }
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
@@ -1460,9 +1597,9 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
         res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
     }
 
-    res &= can_reuse_kq_mask(inp_attn->self_attn_mask.raw, attn_ctx->get_base(), params.ubatch, params.cparams);
+    res &= can_reuse_kq_mask(inp_attn->self_attn_mask.raw, attn_ctx->get_base(), params.ubatch, params.cparams, true);
 
-    res &= self_rel_pos->ne[0] == attn_ctx->get_base()->get_n_kv();
+    res &= self_rel_pos->ne[0] == (params.cparams.training ? params.ubatch.n_tokens : attn_ctx->get_base()->get_n_kv());
     res &= self_rel_pos->ne[1] == params.ubatch.n_tokens;
 
     // swa tensors may not be allocated if there are no SWA attention layers
@@ -1470,9 +1607,9 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
         res &= inp_attn->self_k_idxs_swa->ne[0] == params.ubatch.n_tokens;
     }
 
-    res &= can_reuse_kq_mask(inp_attn->self_attn_mask_swa.raw, attn_ctx->get_swa(), params.ubatch, params.cparams);
+    res &= can_reuse_kq_mask(inp_attn->self_attn_mask_swa.raw, attn_ctx->get_swa(), params.ubatch, params.cparams, true);
 
-    res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
+    res &= self_rel_pos_swa->ne[0] == (params.cparams.training ? params.ubatch.n_tokens : attn_ctx->get_swa()->get_n_kv());
     res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
@@ -1681,6 +1818,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     model            (*params.model),
     hparams          (model.hparams),
     cparams          (params.cparams),
+    training_graph   (params.training_graph),
     ubatch           (params.ubatch),
     prec_policy      (model.prec_policy),
     n_embd           (hparams.n_embd),
@@ -1725,16 +1863,46 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
-    gf               (res->get_gf()) {
+    gf               (res->get_gf()),
+    shared_kv_k      (hparams.n_layer_all, nullptr),
+    shared_kv_v      (hparams.n_layer_all, nullptr) {
         res->set_params(params);
     }
+
+bool llm_graph_context::use_shared_kv_direct() const {
+    return cparams.training && hparams.has_shared_kv();
+}
+
+void llm_graph_context::resolve_shared_kv(uint32_t il, ggml_tensor * & k, ggml_tensor * & v) const {
+    if (!use_shared_kv_direct()) {
+        return;
+    }
+
+    GGML_ASSERT(il < shared_kv_k.size());
+
+    if (hparams.has_kv(il)) {
+        GGML_ASSERT(k != nullptr);
+        shared_kv_k[il] = k;
+        shared_kv_v[il] = v;
+        return;
+    }
+
+    const uint32_t source = hparams.kv_source(il);
+    GGML_ASSERT(source < il);
+    GGML_ASSERT(source < shared_kv_k.size());
+    GGML_ASSERT(shared_kv_k[source] != nullptr);
+
+    k = shared_kv_k[source];
+    if (shared_kv_v[source]) {
+        v = shared_kv_v[source];
+    }
+}
 
 void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
     if (cb_func) {
         cb_func(ubatch, cur, name, il);
     }
 }
-
 
 
 ggml_tensor * llm_graph_context::build_cvec(
@@ -1805,6 +1973,13 @@ ggml_tensor * llm_graph_context::build_rope_indexer(ggml_tensor * cur, ggml_tens
     return rp.n_rot > 0 && rp.n_offs > 0 ? ggml_rope_set_offset(res, rp.n_offs) : res;
 }
 
+static void llama_prec_policy_apply_matmul(const llama_prec_policy & prec_policy, ggml_tensor * res) {
+    const bool has_src1_prec_policy = prec_policy.apply(res);
+    if (has_src1_prec_policy && ggml_prec_get_src(res, 1) == GGML_PREC_F16) {
+        GGML_ASSERT(ggml_prec_set_acc(res, GGML_PREC_F32));
+    }
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
@@ -1832,11 +2007,10 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         const float adapter_scale = lora.second;
         const float scale = lw->get_scale(lora.first->alpha, adapter_scale);
 
-        ggml_tensor * ab_cur = ggml_mul_mat(
-                ctx0, lw->b,
-                ggml_mul_mat(ctx0, lw->a, cur)
-                );
-
+        ggml_tensor * lora_a_cur = ggml_mul_mat(ctx0, lw->a, cur);
+        llama_prec_policy_apply_matmul(prec_policy, lora_a_cur);
+        ggml_tensor * ab_cur = ggml_mul_mat(ctx0, lw->b, lora_a_cur);
+        llama_prec_policy_apply_matmul(prec_policy, ab_cur);
         ab_cur = ggml_scale(ctx0, ab_cur, scale);
         res = ggml_add(ctx0, res, ab_cur);
     }
@@ -1919,12 +2093,10 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         const float rank  = (float) lw->b->ne[0];
         const float scale = alpha ? lora.second * alpha / rank : lora.second;
 
-        ggml_tensor * ab_cur = ggml_mul_mat_id(
-                ctx0, lw->b,
-                ggml_mul_mat_id(ctx0, lw->a, cur, ids),
-                ids
-                );
-
+        ggml_tensor * lora_a_cur = ggml_mul_mat_id(ctx0, lw->a, cur, ids);
+        llama_prec_policy_apply_matmul(prec_policy, lora_a_cur);
+        ggml_tensor * ab_cur = ggml_mul_mat_id(ctx0, lw->b, lora_a_cur, ids);
+        llama_prec_policy_apply_matmul(prec_policy, ab_cur);
         ab_cur = ggml_scale(ctx0, ab_cur, scale);
         res = ggml_add(ctx0, res, ab_cur);
     }
@@ -3241,6 +3413,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             // The permutations are noops and only change how the tensor data is interpreted.
             cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
             cur = ggml_mul_mat(ctx0, v_mla, cur);
+            llama_prec_policy_apply_matmul(prec_policy, cur);
             cb(cur, "fattn_mla", il);
             cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
             cur = ggml_cont(ctx0, cur); // Needed because ggml_reshape_2d expects contiguous inputs.
@@ -3250,9 +3423,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
-        cb(kq, "kq", il);
-
         ggml_prec_set_acc(kq, GGML_PREC_BF16);
+        llama_prec_policy_apply_matmul(prec_policy, kq);
+        cb(kq, "kq", il);
 
         if (model.arch == LLM_ARCH_GROK) {
             // need to do the following:
@@ -3292,11 +3465,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
 
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
+        llama_prec_policy_apply_matmul(prec_policy, kqv);
         cb(kqv, "kqv", il);
 
         // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
         if (v_mla) {
             kqv = ggml_mul_mat(ctx0, v_mla, kqv);
+            llama_prec_policy_apply_matmul(prec_policy, kqv);
             cb(kqv, "kqv_mla", il);
         }
 
@@ -3322,8 +3497,8 @@ llm_graph_input_attn_no_cache * llm_graph_context::build_attn_inp_no_cache() con
     // flash attention requires an f16 mask
     const auto type_mask = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
-    // note: there is no KV cache, so the KV values are the tokens of the batch, padded like the KV cache (see llama_kv_cache::get_n_kv)
-    const int64_t n_kv = GGML_PAD(n_tokens, 256);
+    // Keep the exact token count for full-context training; retain KV-cache padding for other no-cache graphs.
+    const int64_t n_kv = cparams.training ? n_tokens : GGML_PAD(n_tokens, 256);
 
     inp->self_attn_mask.raw = ggml_new_tensor_4d(ctx0, type_mask, n_kv, n_tokens, 1, 1);
     ggml_set_input(inp->self_attn_mask.raw);
@@ -3354,6 +3529,8 @@ ggml_tensor * llm_graph_context::build_attn(
             int       il) const {
     GGML_UNUSED(n_tokens);
 
+    resolve_shared_kv(il, k_cur, v_cur);
+
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
     ggml_build_forward_expand(gf, q_cur);
@@ -3377,11 +3554,14 @@ ggml_tensor * llm_graph_context::build_attn(
     // the KV values and the KQ bias are padded with zeros up to the KV dimension of the mask
     const int64_t n_kv_pad = kq_mask->ne[0] - k->ne[2];
 
-    k = ggml_pad(ctx0, k, 0, 0, n_kv_pad, 0);
-    v = ggml_pad(ctx0, v, 0, 0, n_kv_pad, 0);
+    GGML_ASSERT(n_kv_pad >= 0);
+    if (n_kv_pad > 0) {
+        k = ggml_pad(ctx0, k, 0, 0, n_kv_pad, 0);
+        v = ggml_pad(ctx0, v, 0, 0, n_kv_pad, 0);
 
-    if (kq_b) {
-        kq_b = ggml_pad(ctx0, kq_b, n_kv_pad, 0, 0, 0);
+        if (kq_b) {
+            kq_b = ggml_pad(ctx0, kq_b, n_kv_pad, 0, 0, 0);
+        }
     }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
@@ -3417,7 +3597,8 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
 
-        inp->self_attn_mask = build_attn_inp_attn_mask(ctx0, mctx_cur, ubatch, cparams);
+        inp->self_attn_mask = build_attn_inp_attn_mask(ctx0, mctx_cur, ubatch, cparams, true);
+
     }
 
     inp->self_k_rot = mctx_cur->get_k_rot();
@@ -3485,21 +3666,26 @@ ggml_tensor * llm_graph_context::build_attn(
             float     kq_scale,
             int       il) const {
     const llm_arch arch = model.arch;
+    const bool use_direct_shared_kv = use_shared_kv_direct();
 
     GGML_ASSERT(v_mla == nullptr);
 
-    if (inp->self_k_rot[il]) {
+    resolve_shared_kv(il, k_cur, v_cur);
+
+    if (!use_direct_shared_kv && inp->self_k_rot[il]) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot[il]);
         k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot[il]);
     }
 
-    if (inp->self_v_rot[il]) {
+    if (!use_direct_shared_kv && inp->self_v_rot[il]) {
         v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot[il]);
     }
 
     const auto * mctx_cur = inp->mctx;
 
-    build_attn_scale_kv_inputs(ctx0, mctx_cur, q_cur, k_cur, v_cur, il);
+    if (!use_direct_shared_kv) {
+        build_attn_scale_kv_inputs(ctx0, mctx_cur, q_cur, k_cur, v_cur, il);
+    }
 
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
@@ -3513,8 +3699,6 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v;
 
     if (cparams.training) {
-        GGML_ASSERT(mctx_cur->get_n_kv() == n_tokens);
-
         k = k_cur;
         v = v_cur;
     } else {
@@ -3534,10 +3718,12 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kv_rows = inp->self_attn_mask.rows;
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
-    cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
+    if (!use_direct_shared_kv) {
+        cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
+    }
     cb(cur, "kqv_out", il);
 
-    if (inp->self_v_rot[il]) {
+    if (!use_direct_shared_kv && inp->self_v_rot[il]) {
         cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot[il]);
     }
 
@@ -3603,6 +3789,9 @@ ggml_tensor * llm_graph_context::build_attn(
             float     kq_scale,
             int       il) const {
     const llm_arch arch = model.arch;
+    const bool use_direct_shared_kv = use_shared_kv_direct();
+
+    resolve_shared_kv(il, k_cur, v_cur);
 
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
@@ -3613,8 +3802,8 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_cur = inp->mctx;
 
-    // store to KV cache
-    {
+    // store to KV cache unless training reads the source tensors directly
+    if (!use_direct_shared_kv) {
         const auto & k_idxs = inp->get_k_idxs();
 
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
@@ -3624,7 +3813,7 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kv_rows = inp->self_attn_mask.rows;
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * k = use_direct_shared_kv ? k_cur : mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
@@ -3711,6 +3900,9 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * top_k,
             float     kq_scale,
             int       il) const {
+    const bool use_direct_shared_kv = use_shared_kv_direct();
+    resolve_shared_kv(il, k_cur, v_cur);
+
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
     // expand k later to enable rope fusion which directly writes into k-v cache
@@ -3728,7 +3920,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // store to KV cache
     // note: k_cur is null for layers that reuse the KV cache of another layer
-    if (k_cur) {
+    if (k_cur && !use_direct_shared_kv) {
         const auto & k_idxs = inp->get_k_idxs_mla();
 
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
@@ -3744,7 +3936,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * kq_mask_top_k = build_top_k_mask(kq_mask, top_k, il);
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * k = use_direct_shared_kv ? k_cur : mctx_cur->get_k(ctx0, il);
 
     // MLA: V is a view of the first n_embd_v elements of K
     const int64_t n_embd_v = v_cur ? v_cur->ne[0] : v_mla->ne[0];
@@ -3788,17 +3980,20 @@ static ggml_tensor * build_attn_iswa_impl(
     const auto & cparams = gctx.cparams;
 
     const bool is_swa = hparams.is_swa(il);
+    const bool use_direct_shared_kv = gctx.use_shared_kv_direct();
+
+    gctx.resolve_shared_kv(il, k_cur, v_cur);
 
     auto * k_rot = is_swa ? inp->self_k_rot_swa[il] : inp->self_k_rot[il];
     auto * v_rot = is_swa ? inp->self_v_rot_swa[il] : inp->self_v_rot[il];
 
-    if (k_rot) {
+    if (!use_direct_shared_kv && k_rot) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, k_rot);
         if (k_cur) {
             k_cur = llama_mul_mat_hadamard(ctx0, k_cur, k_rot);
         }
     }
-    if (v_rot) {
+    if (!use_direct_shared_kv && v_rot) {
         if (v_cur) {
             v_cur = llama_mul_mat_hadamard(ctx0, v_cur, v_rot);
         }
@@ -3807,10 +4002,11 @@ static ggml_tensor * build_attn_iswa_impl(
     const auto * mctx_iswa = inp->mctx;
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
 
-    build_attn_scale_kv_inputs(ctx0, mctx_cur, q_cur, k_cur, v_cur, il);
+    if (!use_direct_shared_kv) {
+        build_attn_scale_kv_inputs(ctx0, mctx_cur, q_cur, k_cur, v_cur, il);
+    }
 
-    // these nodes are added to the graph together so that they are not reordered
-    // by doing so, the number of splits in the graph is reduced
+    // Keep the Q/K/V source nodes together to reduce graph splits.
     ggml_build_forward_expand(gf, q_cur);
 
     if (k_cur) {
@@ -3821,7 +4017,8 @@ static ggml_tensor * build_attn_iswa_impl(
         ggml_build_forward_expand(gf, v_cur);
     }
 
-    // whole seq fits into batch in training mode
+    // Full-context training reads the current K/V tensors directly. Shared-KV
+    // training also routes source tensors directly so gradients reach the source.
     const bool use_kv_cur = cparams.training && k_cur && v_cur;
     if (use_kv_cur) {
         GGML_ASSERT(mctx_cur->get_n_kv() == gctx.n_tokens);
@@ -3829,16 +4026,13 @@ static ggml_tensor * build_attn_iswa_impl(
 
     const bool store_kv = !use_kv_cur || hparams.n_layer_kv_from_start >= 0;
 
-    // optionally store to KV cache
     if (store_kv && k_cur) {
         const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
-
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
     }
 
     if (store_kv && v_cur) {
         const auto & v_idxs = is_swa ? inp->get_v_idxs_swa() : inp->get_v_idxs();
-
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
@@ -3847,19 +4041,17 @@ static ggml_tensor * build_attn_iswa_impl(
     ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
 
     ggml_tensor * cur = gctx.build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
-    cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
+    if (!use_direct_shared_kv) {
+        cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
+    }
     gctx.cb(cur, "kqv_out", il);
 
-    if (v_rot) {
+    if (!use_direct_shared_kv && v_rot) {
         cur = llama_mul_mat_hadamard(ctx0, cur, v_rot);
     }
 
     if (wo) {
         cur = gctx.build_lora_mm(wo, cur, wo_s);
-    }
-
-    if (wo_b) {
-        //cb(cur, "kqv_wo", il);
     }
 
     if (wo_b) {
@@ -3904,10 +4096,13 @@ ggml_tensor * llm_graph_context::build_attn(
             float     kq_scale,
             int       il) const {
     const bool is_swa = hparams.is_swa(il);
+    const bool use_direct_shared_kv = use_shared_kv_direct();
+
+    resolve_shared_kv(il, k_cur, v_cur);
 
     auto * k_rot = is_swa ? inp->self_k_rot_swa[il] : inp->self_k_rot[il];
 
-    if (k_rot) {
+    if (!use_direct_shared_kv && k_rot) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, k_rot);
         if (k_cur) {
             k_cur = llama_mul_mat_hadamard(ctx0, k_cur, k_rot);
@@ -3926,7 +4121,7 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
 
     // optionally store to KV cache
-    if (k_cur) {
+    if (k_cur && !use_direct_shared_kv) {
         const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
 
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
@@ -3937,13 +4132,13 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // MLA-style attention: the cached K is used as V
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * k = use_direct_shared_kv ? k_cur : mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
-    if (k_rot) {
+    if (!use_direct_shared_kv && k_rot) {
         cur = llama_mul_mat_hadamard(ctx0, cur, k_rot);
     }
 
@@ -4085,7 +4280,8 @@ llm_graph_input_attn_kv_msa * llm_graph_context::build_attn_inp_kv_msa(bool msa_
         inp->self_k_idxs = mctx_base->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_base->build_input_v_idxs(ctx0, ubatch);
 
-        inp->self_attn_mask.raw = build_attn_inp_kq_mask(ctx0, mctx_base, ubatch, cparams);
+        inp->self_attn_mask = build_attn_inp_attn_mask(ctx0, mctx_base, ubatch, cparams, true);
+
     }
 
     inp->self_k_rot = mctx_base->get_k_rot();
@@ -4110,7 +4306,8 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
         inp->self_k_idxs = mctx_cur->get_base()->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->get_base()->build_input_v_idxs(ctx0, ubatch);
 
-        inp->self_attn_mask = build_attn_inp_attn_mask(ctx0, mctx_cur->get_base(), ubatch, cparams);
+        inp->self_attn_mask = build_attn_inp_attn_mask(ctx0, mctx_cur->get_base(), ubatch, cparams, true);
+
     }
 
     {
@@ -4119,7 +4316,8 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
         inp->self_k_idxs_swa = mctx_cur->get_swa()->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs_swa = mctx_cur->get_swa()->build_input_v_idxs(ctx0, ubatch);
 
-        inp->self_attn_mask_swa = build_attn_inp_attn_mask(ctx0, mctx_cur->get_swa(), ubatch, cparams);
+        inp->self_attn_mask_swa = build_attn_inp_attn_mask(ctx0, mctx_cur->get_swa(), ubatch, cparams, true);
+
     }
 
     inp->self_k_rot = mctx_cur->get_base()->get_k_rot();
@@ -4411,15 +4609,13 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa()
     {
         inp_attn->self_k_idxs = attn_ctx->get_base()->build_input_k_idxs(ctx0, ubatch);
         inp_attn->self_v_idxs = attn_ctx->get_base()->build_input_v_idxs(ctx0, ubatch);
-
-        inp_attn->self_attn_mask = build_attn_inp_attn_mask(ctx0, attn_ctx->get_base(), ubatch, cparams);
+        inp_attn->self_attn_mask = build_attn_inp_attn_mask(ctx0, attn_ctx->get_base(), ubatch, cparams, true);
     }
 
     {
         inp_attn->self_k_idxs_swa = attn_ctx->get_swa()->build_input_k_idxs(ctx0, ubatch);
         inp_attn->self_v_idxs_swa = attn_ctx->get_swa()->build_input_v_idxs(ctx0, ubatch);
-
-        inp_attn->self_attn_mask_swa = build_attn_inp_attn_mask(ctx0, attn_ctx->get_swa(), ubatch, cparams);
+        inp_attn->self_attn_mask_swa = build_attn_inp_attn_mask(ctx0, attn_ctx->get_swa(), ubatch, cparams, true);
     }
 
     inp_attn->self_k_rot = attn_ctx->get_base()->get_k_rot();
@@ -4441,22 +4637,20 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
     auto inp_rs = build_rs_inp_impl(ctx0, ubatch, mctx_cur->get_recr());
 
     const auto * attn_ctx = mctx_cur->get_attn();
-
     auto inp_attn = std::make_unique<llm_graph_input_attn_kv_iswa>(hparams, cparams, attn_ctx);
 
-    // dense masks: the bias is gathered by the distance to each cell of the K/V view
+    // Inkling2 adds per-head relative-position bias to dense masks. In full-context
+    // training the K/V columns are the current batch, not cache cells.
     {
         inp_attn->self_k_idxs = attn_ctx->get_base()->build_input_k_idxs(ctx0, ubatch);
         inp_attn->self_v_idxs = attn_ctx->get_base()->build_input_v_idxs(ctx0, ubatch);
-
-        inp_attn->self_attn_mask.raw = build_attn_inp_kq_mask(ctx0, attn_ctx->get_base(), ubatch, cparams);
+        inp_attn->self_attn_mask.raw = build_attn_inp_kq_mask(ctx0, attn_ctx->get_base(), ubatch, cparams, true);
     }
 
     {
         inp_attn->self_k_idxs_swa = attn_ctx->get_swa()->build_input_k_idxs(ctx0, ubatch);
         inp_attn->self_v_idxs_swa = attn_ctx->get_swa()->build_input_v_idxs(ctx0, ubatch);
-
-        inp_attn->self_attn_mask_swa.raw = build_attn_inp_kq_mask(ctx0, attn_ctx->get_swa(), ubatch, cparams);
+        inp_attn->self_attn_mask_swa.raw = build_attn_inp_kq_mask(ctx0, attn_ctx->get_swa(), ubatch, cparams, true);
     }
 
     inp_attn->self_k_rot = attn_ctx->get_base()->get_k_rot();
@@ -4467,11 +4661,14 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid_iswa_rel>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur, extent, extent_swa);
 
-    inp->self_rel_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_base()->get_n_kv(), ubatch.n_tokens);
+    const int64_t n_kv_base = inp->inp_attn->self_attn_mask.raw->ne[0];
+    const int64_t n_kv_swa  = inp->inp_attn->self_attn_mask_swa.raw->ne[0];
+
+    inp->self_rel_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv_base, ubatch.n_tokens);
     ggml_set_input(inp->self_rel_pos);
     ggml_set_name(inp->self_rel_pos, "attn_inp_rel_pos");
 
-    inp->self_rel_pos_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_swa()->get_n_kv(), ubatch.n_tokens);
+    inp->self_rel_pos_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv_swa, ubatch.n_tokens);
     ggml_set_input(inp->self_rel_pos_swa);
     ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
 
@@ -4493,7 +4690,6 @@ ggml_tensor * llm_graph_context::build_attn(
     const bool is_swa = hparams.is_swa(il);
 
     auto * inp_attn = inp->get_attn();
-
     const auto & attn_mask = is_swa ? inp_attn->self_attn_mask_swa : inp_attn->self_attn_mask;
 
     // TODO: support kv_rows - fill the distances over the kv_rows cell lists and pass the rows to build_attn_mha,
