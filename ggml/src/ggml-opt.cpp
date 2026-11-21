@@ -310,11 +310,21 @@ namespace {
             ggml_cgraph * graph,
             std::unordered_map<ggml_tensor *, ggml_tensor *> & clones) {
         ggml_cgraph * clone = ggml_new_graph_custom(ctx, graph->size, /* grads = */ false);
+        // Preserve standalone graph leaves as well as node dependencies. Some
+        // graphs intentionally retain inputs that are not consumed by any node
+        // (for example, to keep scheduler graph inputs stable across batches).
+        // Cloning nodes alone would omit those leaves from the probe graph and
+        // leave them without an entry in the tensor clone map.
+        for (int i = 0; i < graph->n_leafs; ++i) {
+            ggml_tensor * leaf = ggml_opt_clone_tensor_for_sched(ctx, graph->leafs[i], clones);
+            ggml_build_forward_expand(clone, leaf);
+        }
         for (int i = 0; i < graph->n_nodes; ++i) {
             ggml_tensor * node = ggml_opt_clone_tensor_for_sched(ctx, graph->nodes[i], clones);
             ggml_build_forward_expand(clone, node);
         }
 
+        GGML_ASSERT(clone->n_leafs == graph->n_leafs);
         GGML_ASSERT(clone->n_nodes == graph->n_nodes);
         for (int i = 0; i < graph->n_nodes; ++i) {
             GGML_ASSERT(clone->nodes[i] == clones.at(graph->nodes[i]));
