@@ -360,8 +360,12 @@ namespace {
             size_t forward_bytes = 0;
             size_t recompute_nodes = 0;
             size_t recompute_bytes = 0;
+            size_t backward_nodes = 0;
+            size_t backward_bytes = 0;
             size_t parameter_tensors = 0;
             size_t parameter_bytes = 0;
+            size_t incoming_copy_tensors = 0;
+            size_t incoming_copy_bytes = 0;
         };
         const int n_backends = ggml_backend_sched_get_n_backends(opt_ctx->backend_sched);
         std::vector<backend_stats> stats(static_cast<size_t>(n_backends));
@@ -386,8 +390,11 @@ namespace {
             }
         }
 
+        std::unordered_set<int32_t> recompute_indices;
+        recompute_indices.reserve(opt_ctx->recompute_backend_affinities.size());
         for (const auto & affinity : opt_ctx->recompute_backend_affinities) {
             if (affinity.second < 0 || affinity.second >= graph->n_nodes) continue;
+            recompute_indices.insert(affinity.second);
             ggml_tensor * tensor = graph->nodes[affinity.second];
             const int b = backend_index(tensor);
             if (b >= 0) {
@@ -395,6 +402,49 @@ namespace {
                 if (tensor->op != GGML_OP_VIEW && tensor->op != GGML_OP_RESHAPE &&
                         tensor->op != GGML_OP_PERMUTE && tensor->op != GGML_OP_TRANSPOSE) {
                     stats[b].recompute_bytes += ggml_nbytes(tensor);
+                }
+            }
+        }
+
+        // The previous diagnostic only counted the original forward nodes and
+        // their checkpoint clones. For opt_period > 1, the remainder of gb_grad
+        // contains the actual backward/gradient-accumulation work. This is a
+        // substantial part of the graph and must be reported separately.
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            if (i < opt_ctx->gf->n_nodes || recompute_indices.count(i) != 0) {
+                continue;
+            }
+            ggml_tensor * tensor = graph->nodes[i];
+            const int b = backend_index(tensor);
+            if (b >= 0) {
+                stats[b].backward_nodes++;
+                if (tensor->op != GGML_OP_VIEW && tensor->op != GGML_OP_RESHAPE &&
+                        tensor->op != GGML_OP_PERMUTE && tensor->op != GGML_OP_TRANSPOSE) {
+                    stats[b].backward_bytes += ggml_nbytes(tensor);
+                }
+            }
+        }
+
+        // ggml_backend_sched_split_graph() inserts copy tensors into src[] at
+        // backend boundaries. These copies are not graph nodes, but they do
+        // consume memory in the receiving backend's scheduler buffer.
+        // Count unique inserted copies by their destination backend.
+        std::unordered_set<ggml_tensor *> graph_tensors;
+        graph_tensors.reserve(static_cast<size_t>(graph->n_nodes + graph->n_leafs));
+        for (int i = 0; i < graph->n_nodes; ++i) graph_tensors.insert(graph->nodes[i]);
+        for (int i = 0; i < graph->n_leafs; ++i) graph_tensors.insert(graph->leafs[i]);
+        std::unordered_set<ggml_tensor *> counted_copies;
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            ggml_tensor * node = graph->nodes[i];
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                ggml_tensor * src = node->src[j];
+                if (!src || graph_tensors.count(src) != 0 || !counted_copies.insert(src).second) {
+                    continue;
+                }
+                const int b = backend_index(src);
+                if (b >= 0) {
+                    stats[b].incoming_copy_tensors++;
+                    stats[b].incoming_copy_bytes += ggml_nbytes(src);
                 }
             }
         }
@@ -410,16 +460,21 @@ namespace {
         for (int i = 0; i < opt_ctx->gf->n_leafs; ++i) add_parameter(opt_ctx->gf->leafs[i]);
         for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) add_parameter(opt_ctx->gf->nodes[i]);
 
-        GGML_LOG_WARN("%s: AC-DIAG placement summary opt_period=%d graph_nodes=%d recompute_pairs=%zu\n",
-            __func__, opt_ctx->opt_period, graph->n_nodes, opt_ctx->recompute_backend_affinities.size());
+        GGML_LOG_WARN("%s: AC-DIAG placement summary opt_period=%d graph_nodes=%d forward_nodes=%d recompute_pairs=%zu backward_other_nodes=%d scheduler_splits=%d\n",
+            __func__, opt_ctx->opt_period, graph->n_nodes, opt_ctx->gf->n_nodes,
+            opt_ctx->recompute_backend_affinities.size(),
+            graph->n_nodes - opt_ctx->gf->n_nodes - static_cast<int>(recompute_indices.size()),
+            ggml_backend_sched_get_n_splits(opt_ctx->backend_sched));
         for (int i = 0; i < n_backends; ++i) {
             ggml_backend_t backend = ggml_backend_sched_get_backend(opt_ctx->backend_sched, i);
             const size_t sched_size = ggml_backend_sched_get_buffer_size(opt_ctx->backend_sched, backend);
-            GGML_LOG_WARN("%s: AC-DIAG backend[%d]=%s forward_ops=%zu/%zuMiB recompute_ops=%zu/%zuMiB params=%zu/%zuMiB scheduler_buffer=%zuMiB\n",
+            GGML_LOG_WARN("%s: AC-DIAG backend[%d]=%s forward_ops=%zu/%zuMiB recompute_ops=%zu/%zuMiB backward_ops=%zu/%zuMiB params=%zu/%zuMiB incoming_copies=%zu/%zuMiB scheduler_buffer=%zuMiB\n",
                 __func__, i, ggml_backend_name(backend),
                 stats[i].forward_nodes, stats[i].forward_bytes / (1024 * 1024),
                 stats[i].recompute_nodes, stats[i].recompute_bytes / (1024 * 1024),
+                stats[i].backward_nodes, stats[i].backward_bytes / (1024 * 1024),
                 stats[i].parameter_tensors, stats[i].parameter_bytes / (1024 * 1024),
+                stats[i].incoming_copy_tensors, stats[i].incoming_copy_bytes / (1024 * 1024),
                 sched_size / (1024 * 1024));
         }
 
