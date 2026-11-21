@@ -275,17 +275,16 @@ namespace {
         ggml_tensor * clone = ggml_dup_tensor(ctx, tensor);
         clones.emplace(tensor, clone);
 
-        // This graph is used only to query scheduler placement. Preserve the
-        // storage/backend metadata of preallocated leaves (weights and explicit
-        // inputs), but not of computed nodes: copying an old output buffer would
-        // make the probe treat a recomputable activation as already placed and
-        // can bias the assignment toward a stale device.
-        const bool preallocated_leaf = tensor->op == GGML_OP_NONE && tensor->buffer;
-        if (preallocated_leaf) {
-            clone->buffer = tensor->buffer;
-            clone->data   = tensor->data;
-            clone->extra  = tensor->extra;
-        }
+        // Keep the original buffer metadata for every tensor that already has
+        // storage. The scheduler uses this metadata to recover the backend of
+        // preallocated graph outputs as well as weights and inputs. In
+        // particular, dropping buffers from computed forward nodes makes the
+        // placement probe differ from the graph that will actually run; with a
+        // separate optimizer graph (gradient accumulation > 1), the recompute
+        // section can then inherit one neighbouring GPU and skew VRAM usage.
+        // The probe only performs graph splitting, not computation, so it does
+        // not need to share the source tensor's data pointer or backend extra.
+        clone->buffer = tensor->buffer;
         clone->op     = tensor->op;
         clone->flags  = tensor->flags;
         clone->view_offs = tensor->view_offs;
