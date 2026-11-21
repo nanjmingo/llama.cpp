@@ -150,7 +150,8 @@ static __global__ void mm_ids_helper(
                 if (it_compact + max(warp_size, n_expert_used) >= ne_store) {
                     ggml_cuda_syncwarp();
                     dump_store(ids_src1, ids_dst, n_expert_used, nchannels_y, sis1, write_inverse, store, nex_prev, n_dumped, it_compact);
-                    it_compact = 0;                }
+                    it_compact = 0;
+                }
             }
         }
         if (it_compact > 0) {
@@ -165,7 +166,8 @@ static __global__ void mm_ids_helper(
         const int iex = threadIdx.x % neu_padded; // The index at which the expert is used, if any.
 
         int it0 = 0;
-        for (; it0 < n_tokens && it_compact + n_unroll*warp_size <= ne_store; it0 += n_unroll*warp_size/neu_padded) {#pragma unroll
+        for (; it0 < n_tokens && it_compact + n_unroll*warp_size <= ne_store; it0 += n_unroll*warp_size/neu_padded) {
+#pragma unroll
             for (int it1 = 0; it1 < n_unroll*warp_size/neu_padded; it1 += warp_size/neu_padded) {
                 const int it = it0 + it1 + threadIdx.x / neu_padded;
                 const int expert_found = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
@@ -308,7 +310,6 @@ void ggml_cuda_launch_mm_ids_helper(
             break;
     }
 }
-
 
 static __global__ void mul_mat_id_back_gather_kernel(
         const float * __restrict__ grad,
