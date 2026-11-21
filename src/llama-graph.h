@@ -850,6 +850,7 @@ struct llm_graph_params {
     llama_ubatch ubatch; // note: intentionally make a copy
 
     llm_graph_type gtype;
+    bool training_graph = false;
 
     ggml_backend_sched_t sched;
     ggml_backend_t backend_cpu;
@@ -963,6 +964,7 @@ struct llm_graph_params {
             h_nextn_src   == other.h_nextn_src   &&
             model == other.model &&
             gtype == other.gtype &&
+            training_graph == other.training_graph &&
             cvec  == other.cvec  &&
             loras == other.loras &&
             cross == other.cross;
@@ -1090,6 +1092,7 @@ struct llm_graph_context {
 
     const llama_hparams & hparams;
     const llama_cparams & cparams;
+    const bool training_graph;
     const llama_ubatch  & ubatch;
 
     const llama_prec_policy & prec_policy;
@@ -1150,10 +1153,17 @@ struct llm_graph_context {
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
 
+    // K/V tensors retained for direct Shared-KV dependencies during training.
+    mutable std::vector<ggml_tensor *> shared_kv_k;
+    mutable std::vector<ggml_tensor *> shared_kv_v;
+
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
 
     void cb(ggml_tensor * cur, const char * name, int il) const;
+
+    bool use_shared_kv_direct() const;
+    void resolve_shared_kv(uint32_t il, ggml_tensor * & k, ggml_tensor * & v) const;
 
     // true when the last layer must be narrowed to the output rows before the nextn hidden state is captured
     bool crop_before_nextn(const ggml_tensor * inp_out_ids) const {
