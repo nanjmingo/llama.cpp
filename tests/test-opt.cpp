@@ -602,6 +602,78 @@ static std::pair<int, int> test_idata_split(
     return std::make_pair(npass, ntest);
 }
 
+static ggml_opt_optimizer_params helper_get_activation_checkpointing_opt_pars(void * userdata) {
+    ggml_opt_optimizer_params result = ggml_opt_get_default_optimizer_params(userdata);
+    result.adamw.alpha = 1e-2f;
+    result.adamw.beta1 = 0.0f;
+    result.adamw.beta2 = 0.0f;
+    result.adamw.eps   = 1e-8f;
+    result.adamw.wd    = 0.0f;
+    return result;
+}
+
+static std::pair<int, int> test_dynamic_activation_checkpointing(
+        ggml_backend_sched_t backend_sched, ggml_backend_t backend) {
+    int ntest = 0;
+    int npass = 0;
+
+    for (const int32_t opt_period : { 1, 2 }) {
+        ggml_init_params static_params = { 1024 * 1024, nullptr, true };
+        ggml_context * ctx_static = ggml_init(static_params);
+        ggml_tensor * weight = ggml_new_tensor_1d(ctx_static, GGML_TYPE_F32, 1);
+        ggml_set_name(weight, "weight");
+        ggml_set_param(weight);
+        ggml_backend_buffer_t weight_buffer = ggml_backend_alloc_ctx_tensors(ctx_static, backend);
+        const float initial_weight = 1.0f;
+        ggml_backend_tensor_set(weight, &initial_weight, 0, sizeof(initial_weight));
+
+        ggml_opt_params opt_params = ggml_opt_default_params(backend_sched, GGML_OPT_LOSS_TYPE_MEAN_SQUARED_ERROR);
+        opt_params.opt_period = opt_period;
+        opt_params.optimizer = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
+        opt_params.get_opt_pars = helper_get_activation_checkpointing_opt_pars;
+        ggml_opt_context_t opt_ctx = ggml_opt_init(opt_params);
+        ggml_opt_set_activation_checkpointing(opt_ctx, true);
+        ggml_opt_result_t result = ggml_opt_result_init();
+
+        // Run two complete optimizer steps to verify that the persistent
+        // gradient accumulators are cleared between updates at opt_period=1.
+        for (int32_t i = 0; i < 2 * opt_period; ++i) {
+            ggml_init_params compute_params = { 64 * 1024 * 1024, nullptr, true };
+            ggml_context * ctx_compute = ggml_init(compute_params);
+            ggml_tensor * input = ggml_new_tensor_1d(ctx_compute, GGML_TYPE_F32, 1);
+            ggml_set_input(input);
+            ggml_tensor * shifted = ggml_add(ctx_compute, input, weight);
+            ggml_tensor * squared = ggml_sqr(ctx_compute, shifted);
+            ggml_tensor * output = ggml_scale(ctx_compute, squared, 1.0f);
+            ggml_set_output(output);
+            ggml_cgraph * gf = ggml_new_graph_custom(ctx_compute, 8192, false);
+            ggml_build_forward_expand(gf, output);
+
+            ggml_opt_prepare_alloc(opt_ctx, ctx_compute, gf, input, output);
+            ggml_opt_alloc(opt_ctx, /*backward =*/ true);
+            const float input_value = 0.25f + 0.1f * (i % opt_period);
+            ggml_backend_tensor_set(input, &input_value, 0, sizeof(input_value));
+            ggml_tensor * labels = ggml_opt_labels(opt_ctx);
+            ggml_set_zero(labels);
+            ggml_opt_eval(opt_ctx, result);
+            ggml_free(ctx_compute);
+        }
+
+        float final_weight = initial_weight;
+        ggml_backend_tensor_get(weight, &final_weight, 0, sizeof(final_weight));
+        const bool subtest_ok = std::isfinite(final_weight) && almost_equal(final_weight, 0.98, 1e-5);
+        const std::string args = "activation_checkpointing=yes, opt_period=" + std::to_string(opt_period);
+        print_ok(__func__, subtest_ok, npass, ntest, args.c_str());
+
+        ggml_opt_result_free(result);
+        ggml_opt_free(opt_ctx);
+        ggml_backend_buffer_free(weight_buffer);
+        ggml_free(ctx_static);
+    }
+
+    return std::make_pair(npass, ntest);
+}
+
 static void helper_after_test_gradient_accumulation(
         enum ggml_opt_optimizer_type optim,
         const char * func, const int nbatch_physical, const enum ggml_opt_loss_type loss_type, const int epoch,
@@ -877,6 +949,11 @@ static std::pair<int, int> test_backend(
     }
     bool const adamw = optim == GGML_OPT_OPTIMIZER_TYPE_ADAMW;
     if (adamw) {
+        {
+            std::pair<int, int> partial = test_dynamic_activation_checkpointing(backend_sched, backend);
+            npass += partial.first;
+            ntest += partial.second;
+        }
         for (int32_t nbatch_physical : { 2, 1 }) {
             for (enum ggml_opt_loss_type loss_type : { GGML_OPT_LOSS_TYPE_SUM, GGML_OPT_LOSS_TYPE_MEAN }) {
                 std::pair<int, int> partial =

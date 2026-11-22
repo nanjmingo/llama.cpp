@@ -7648,6 +7648,9 @@ static size_t ggml_visit_parents_graph(struct ggml_cgraph * cgraph, struct ggml_
         }
 
         cgraph->nodes[cgraph->n_nodes] = node;
+        if (cgraph->backward_sources) {
+            cgraph->backward_sources[cgraph->n_nodes] = NULL;
+        }
         cgraph->n_nodes++;
     }
 
@@ -7810,9 +7813,19 @@ void ggml_build_backward_expand(
     }
 
     for (int i = n_nodes_f - 1; i >= 0; --i) {
+        // Keep the forward op responsible for each backward node. The optimizer
+        // can use this to place backward work with the corresponding forward op.
+        const int n_nodes_before = cgraph->n_nodes;
+
         // inplace operations to add gradients are not created by ggml_compute_backward except for gradient accumulation
         // use allocator to automatically make inplace operations
         ggml_compute_backward(ctx, cgraph, i, grads_needed);
+
+        if (cgraph->backward_sources) {
+            for (int j = n_nodes_before; j < cgraph->n_nodes; ++j) {
+                cgraph->backward_sources[j] = cgraph->nodes[i];
+            }
+        }
     }
 
     free(grads_needed);
@@ -7836,6 +7849,7 @@ static size_t ggml_graph_nbytes(size_t size, bool grads) {
     if (grads) {
         incr_ptr_aligned(&p, hash_size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)); // grads
         incr_ptr_aligned(&p, hash_size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)); // grad_accs
+        incr_ptr_aligned(&p, size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)); // backward_sources
     }
     incr_ptr_aligned(&p, ggml_bitset_size(hash_size) * sizeof(ggml_bitset_t), sizeof(ggml_bitset_t));
 
@@ -7867,6 +7881,7 @@ struct ggml_cgraph * ggml_new_graph_custom(struct ggml_context * ctx, size_t siz
     struct ggml_tensor ** hash_keys_ptr  =         incr_ptr_aligned(&p, hash_size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *));
     struct ggml_tensor ** grads_ptr      = grads ? incr_ptr_aligned(&p, hash_size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)) : NULL;
     struct ggml_tensor ** grad_accs_ptr  = grads ? incr_ptr_aligned(&p, hash_size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)) : NULL;
+    struct ggml_tensor ** backward_sources_ptr = grads ? incr_ptr_aligned(&p, size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)) : NULL;
 
     ggml_bitset_t * hash_used = incr_ptr_aligned(&p, ggml_bitset_size(hash_size) * sizeof(ggml_bitset_t), sizeof(ggml_bitset_t));
 
@@ -7880,6 +7895,7 @@ struct ggml_cgraph * ggml_new_graph_custom(struct ggml_context * ctx, size_t siz
         /*.nodes        =*/ nodes_ptr,
         /*.grads        =*/ grads_ptr,
         /*.grad_accs    =*/ grad_accs_ptr,
+        /*.backward_sources =*/ backward_sources_ptr,
         /*.leafs        =*/ leafs_ptr,
         /*.use_counts   =*/ use_counts_ptr,
         /*.hash_table   =*/ { hash_size, hash_used, hash_keys_ptr },
@@ -7891,6 +7907,7 @@ struct ggml_cgraph * ggml_new_graph_custom(struct ggml_context * ctx, size_t siz
     if (grads) {
         memset(cgraph->grads,     0, hash_size*sizeof(struct ggml_tensor *));
         memset(cgraph->grad_accs, 0, hash_size*sizeof(struct ggml_tensor *));
+        memset(cgraph->backward_sources, 0, size*sizeof(struct ggml_tensor *));
     }
 
     return cgraph;
@@ -7908,6 +7925,7 @@ struct ggml_cgraph ggml_graph_view(struct ggml_cgraph * cgraph0, int i0, int i1)
         /*.nodes            =*/ cgraph0->nodes + i0,
         /*.grads            =*/ NULL, // gradients would need visited_hash_set
         /*.grad_accs        =*/ NULL,
+        /*.backward_sources =*/ cgraph0->backward_sources ? cgraph0->backward_sources + i0 : NULL,
         /*.leafs            =*/ NULL,
         /*.use_counts       =*/ cgraph0->use_counts,
         /*.visited_hash_set =*/ cgraph0->visited_hash_set,
@@ -7933,6 +7951,9 @@ void ggml_graph_cpy(struct ggml_cgraph * src, struct ggml_cgraph * dst) {
 
     for (int i = 0; i < src->n_nodes; ++i) {
         dst->nodes[i] = src->nodes[i];
+        if (dst->backward_sources) {
+            dst->backward_sources[i] = src->backward_sources ? src->backward_sources[i] : NULL;
+        }
     }
 
     for (size_t i = 0; i < src->visited_hash_set.size; ++i) {
@@ -8051,6 +8072,9 @@ int ggml_graph_n_nodes(struct ggml_cgraph * cgraph) {
 void ggml_graph_add_node(struct ggml_cgraph * cgraph, struct ggml_tensor * tensor) {
     GGML_ASSERT(cgraph->size > cgraph->n_nodes);
     cgraph->nodes[cgraph->n_nodes] = tensor;
+    if (cgraph->backward_sources) {
+        cgraph->backward_sources[cgraph->n_nodes] = NULL;
+    }
     cgraph->n_nodes++;
 }
 
