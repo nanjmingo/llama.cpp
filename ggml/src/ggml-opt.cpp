@@ -215,6 +215,7 @@ namespace {
 
         ggml_cgraph * reordered = ggml_new_graph_custom(opt_ctx->ctx_compute, graph->size, graph->grads != nullptr);
         GGML_ASSERT(reordered && "failed to allocate activation checkpoint graph");
+        reordered->separate_backward_target_copies = graph->separate_backward_target_copies;
         for (int i = 0; i < n_forward; ++i) {
             ggml_build_forward_expand(reordered, graph->nodes[i]);
         }
@@ -263,13 +264,15 @@ namespace {
         // forward nodes and backward nodes. Preserve the forward op that
         // generated each backward node across this reorder.
         for (int i = n_forward; i < graph->n_nodes; ++i) {
-            ggml_tensor * source = graph->backward_sources[i];
-            if (!source) {
+            ggml_tensor * source = graph->backward_sources ? graph->backward_sources[i] : nullptr;
+            ggml_tensor * target = graph->backward_targets ? graph->backward_targets[i] : nullptr;
+            if (!source && !target) {
                 continue;
             }
             const auto node = reordered_indices.find(graph->nodes[i]);
             GGML_ASSERT(node != reordered_indices.end());
             reordered->backward_sources[node->second] = source;
+            reordered->backward_targets[node->second] = target;
         }
 
         ggml_graph_clear(graph);
@@ -379,6 +382,8 @@ namespace {
             size_t parameter_bytes = 0;
             size_t incoming_copy_tensors = 0;
             size_t incoming_copy_bytes = 0;
+            size_t target_gradient_outputs = 0;
+            size_t target_gradient_bytes = 0;
         };
         const int n_backends = ggml_backend_sched_get_n_backends(opt_ctx->backend_sched);
         std::vector<backend_stats> stats(static_cast<size_t>(n_backends));
@@ -438,6 +443,29 @@ namespace {
             }
         }
 
+        // Count gradient roots and explicit gradient-transfer nodes placed
+        // on the backend owning the forward tensor they differentiate.
+        for (int i = opt_ctx->gf->n_nodes; i < graph->n_nodes; ++i) {
+            ggml_tensor * node = graph->nodes[i];
+            ggml_tensor * target = graph->backward_targets ? graph->backward_targets[i] : nullptr;
+            if (!target) {
+                continue;
+            }
+            const bool is_gradient_root = ggml_graph_get_grad(graph, target) == node;
+            const bool is_gradient_transfer = node->op == GGML_OP_CONT;
+            const bool is_gradient_accumulation = is_gradient_root &&
+                (node->op == GGML_OP_ADD ||
+                 node->op == GGML_OP_ACC || node->op == GGML_OP_SUB || node->op == GGML_OP_SCALE);
+            if (!is_gradient_transfer && !is_gradient_accumulation) {
+                continue;
+            }
+            const int b = backend_index(node);
+            if (b >= 0) {
+                stats[b].target_gradient_outputs++;
+                stats[b].target_gradient_bytes += ggml_nbytes(node);
+            }
+        }
+
         // ggml_backend_sched_split_graph() inserts copy tensors into src[] at
         // backend boundaries. These copies are not graph nodes, but they do
         // consume memory in the receiving backend's scheduler buffer.
@@ -481,11 +509,12 @@ namespace {
         for (int i = 0; i < n_backends; ++i) {
             ggml_backend_t backend = ggml_backend_sched_get_backend(opt_ctx->backend_sched, i);
             const size_t sched_size = ggml_backend_sched_get_buffer_size(opt_ctx->backend_sched, backend);
-            GGML_LOG_WARN("%s: AC-DIAG backend[%d]=%s forward_ops=%zu/%zuMiB recompute_ops=%zu/%zuMiB backward_ops=%zu/%zuMiB params=%zu/%zuMiB incoming_copies=%zu/%zuMiB scheduler_buffer=%zuMiB\n",
+            GGML_LOG_WARN("%s: AC-DIAG backend[%d]=%s forward_ops=%zu/%zuMiB recompute_ops=%zu/%zuMiB backward_ops=%zu/%zuMiB grad_outputs=%zu/%zuMiB params=%zu/%zuMiB incoming_copies=%zu/%zuMiB scheduler_buffer=%zuMiB\n",
                 __func__, i, ggml_backend_name(backend),
                 stats[i].forward_nodes, stats[i].forward_bytes / (1024 * 1024),
                 stats[i].recompute_nodes, stats[i].recompute_bytes / (1024 * 1024),
                 stats[i].backward_nodes, stats[i].backward_bytes / (1024 * 1024),
+                stats[i].target_gradient_outputs, stats[i].target_gradient_bytes / (1024 * 1024),
                 stats[i].parameter_tensors, stats[i].parameter_bytes / (1024 * 1024),
                 stats[i].incoming_copy_tensors, stats[i].incoming_copy_bytes / (1024 * 1024),
                 sched_size / (1024 * 1024));
@@ -558,6 +587,31 @@ namespace {
         // affinity for backward nodes and can cluster their temporary buffers
         // on a different GPU from the corresponding forward layer.
         for (int i = opt_ctx->gf->n_nodes; i < graph->n_nodes; ++i) {
+            ggml_tensor * node = graph->nodes[i];
+            ggml_tensor * target = graph->backward_targets ? graph->backward_targets[i] : nullptr;
+
+            // MUL_MAT_ID backward computes the activation gradient next to the
+            // expert weights. Its final CONT node transfers that gradient to
+            // the backend that owns the preceding layer's activation.
+            const bool is_gradient_root = target && ggml_graph_get_grad(graph, target) == node;
+            const bool is_gradient_transfer = target && node->op == GGML_OP_CONT;
+            const bool is_gradient_accumulation = is_gradient_root &&
+                (node->op == GGML_OP_ADD ||
+                 node->op == GGML_OP_ACC || node->op == GGML_OP_SUB || node->op == GGML_OP_SCALE);
+            if (is_gradient_transfer || is_gradient_accumulation) {
+                const auto it_target = probe_tensors.find(target);
+                if (it_target != probe_tensors.end()) {
+                    ggml_backend_t target_backend = ggml_backend_sched_get_tensor_backend(opt_ctx->backend_sched, it_target->second);
+                    if (target_backend && ggml_backend_supports_op(target_backend, node)) {
+                        opt_ctx->checkpoint_backend_assignments.emplace_back(node, target_backend);
+                        continue;
+                    }
+                }
+            }
+
+            // Keep derivative computation beside the forward op whose
+            // derivative it computes. This keeps weight-dependent work near
+            // the expert weights while the CONT output is placed separately.
             ggml_tensor * source = graph->backward_sources ? graph->backward_sources[i] : nullptr;
             if (!source) {
                 continue;
@@ -567,8 +621,8 @@ namespace {
                 continue;
             }
             ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(opt_ctx->backend_sched, it->second);
-            if (backend && ggml_backend_supports_op(backend, graph->nodes[i])) {
-                opt_ctx->checkpoint_backend_assignments.emplace_back(graph->nodes[i], backend);
+            if (backend && ggml_backend_supports_op(backend, node)) {
+                opt_ctx->checkpoint_backend_assignments.emplace_back(node, backend);
             }
         }
 
@@ -924,6 +978,7 @@ static ggml_cgraph * dup_graph(ggml_context * ctx, ggml_cgraph * src) {
     std::map<ggml_tensor *, ggml_tensor *> tensor_map;
 
     ggml_cgraph * dst = ggml_new_graph_custom(ctx, src->size, /*grads =*/ true);
+    dst->separate_backward_target_copies = src->separate_backward_target_copies;
 
     for (int i = 0; i < src->n_leafs; i++) {
         ggml_build_forward_expand(dst, map_tensor(tensor_map, ctx, src->leafs[i]));
@@ -935,6 +990,7 @@ static ggml_cgraph * dup_graph(ggml_context * ctx, ggml_cgraph * src) {
     GGML_ASSERT(dst->n_nodes == src->n_nodes);
     for (int i = 0; i < src->n_nodes; ++i) {
         dst->backward_sources[i] = src->backward_sources ? src->backward_sources[i] : nullptr;
+        dst->backward_targets[i] = src->backward_targets ? src->backward_targets[i] : nullptr;
     }
     for (int i = 0; i < src->n_nodes; ++i) {
         const size_t igrad_src = ggml_hash_find(&src->visited_hash_set, src->nodes[i]);
@@ -1201,6 +1257,8 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
 
     // gb_grad == graph backward gradients, forward pass, then backward pass to calculate gradients.
     opt_ctx->gb_grad = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gf, /*force_grads =*/ true);
+    opt_ctx->gb_grad->separate_backward_target_copies =
+        opt_ctx->activation_checkpointing && !opt_ctx->static_graphs;
     ggml_build_backward_expand(opt_ctx->ctx_compute, opt_ctx->gb_grad, opt_ctx->grad_accs.data());
     ggml_opt_recompute_checkpoints(opt_ctx);
 

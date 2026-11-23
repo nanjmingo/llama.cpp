@@ -356,12 +356,16 @@ struct ggml_cgraph {
     struct ggml_tensor ** grads;     // the outputs of these tensors are the gradients of the nodes
     struct ggml_tensor ** grad_accs; // accumulators for node gradients
     struct ggml_tensor ** backward_sources; // forward op that generated each backward node
+    struct ggml_tensor ** backward_targets; // forward tensor whose gradient is produced by each backward node
     struct ggml_tensor ** leafs;     // tensors with constant data
     int32_t             * use_counts;// number of uses of each tensor, indexed by hash table slot
 
     struct ggml_hash_set visited_hash_set;
 
     enum ggml_cgraph_eval_order order;
+
+    // Separate cross-backend activation-gradient transfers for dynamic activation-checkpoint graphs.
+    bool separate_backward_target_copies;
 
     // an optional identifier that can be utilized to recognize same graphs if two non-zero values match
     // a value of 0 means it is not set and should be ignored
