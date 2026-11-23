@@ -2297,6 +2297,16 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_cross_entropy_loss_back(params, tensor);
             }
             break;
+        case GGML_OP_CROSS_ENTROPY_LOSS_SPARSE:
+            {
+                ggml_compute_forward_cross_entropy_loss_sparse(params, tensor);
+            }
+            break;
+        case GGML_OP_CROSS_ENTROPY_LOSS_SPARSE_BACK:
+            {
+                ggml_compute_forward_cross_entropy_loss_sparse_back(params, tensor);
+            }
+            break;
         case GGML_OP_OPT_STEP_ADAMW:
             {
                 ggml_compute_forward_opt_step_adamw(params, tensor);
@@ -2650,6 +2660,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             } break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+        case GGML_OP_CROSS_ENTROPY_LOSS_SPARSE:
+        case GGML_OP_CROSS_ENTROPY_LOSS_SPARSE_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
             {
@@ -3185,6 +3197,10 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_CROSS_ENTROPY_LOSS:
                     {
                         cur = ggml_type_size(node->type)*(n_tasks + node->src[0]->ne[0]*n_tasks);
+                    } break;
+                case GGML_OP_CROSS_ENTROPY_LOSS_SPARSE:
+                    {
+                        cur = sizeof(float) * n_tasks;
                     } break;
                 case GGML_OP_GATED_DELTA_NET:
                     {

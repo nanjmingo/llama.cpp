@@ -178,3 +178,157 @@ void ggml_cuda_cross_entropy_loss_back(ggml_backend_cuda_context & ctx, ggml_ten
         cross_entropy_loss_back_f32<false><<<blocks_num, blocks_dim, 0, stream>>>(grad_d, src0f_d, src1f_d, dst_d, ne00);
     }
 }
+
+
+static __global__ void cross_entropy_loss_sparse_f32(
+        const float * __restrict__ logits,
+        const int32_t * __restrict__ labels,
+        const float * __restrict__ weights,
+        float * __restrict__ dst,
+        const int nclasses,
+        const int nrows) {
+    const int row = blockIdx.x;
+    const int label = labels[row];
+    const float weight = weights[row];
+
+    if (label < -1 || label >= nclasses || !isfinite(weight) || weight < 0.0f) {
+        if (threadIdx.x == 0) dst[row] = NAN;
+        return;
+    }
+    if (label == -1 || weight == 0.0f) {
+        if (threadIdx.x == 0) dst[row] = 0.0f;
+        return;
+    }
+
+    logits += int64_t(row)*nclasses;
+
+    float max_logit = -INFINITY;
+    for (int i = threadIdx.x; i < nclasses; i += WARP_SIZE) {
+        max_logit = fmaxf(max_logit, logits[i]);
+    }
+    max_logit = warp_reduce_max(max_logit);
+
+    float sum_exp = 0.0f;
+    for (int i = threadIdx.x; i < nclasses; i += WARP_SIZE) {
+        sum_exp += expf(logits[i] - max_logit);
+    }
+    sum_exp = warp_reduce_sum(sum_exp);
+
+    const float loss = -weight * (logits[label] - max_logit - logf(sum_exp)) / (float) nrows;
+    if (threadIdx.x == 0) dst[row] = loss;
+}
+
+static __global__ void cross_entropy_loss_sparse_back_f32(
+        const float * __restrict__ grad,
+        const float * __restrict__ logits,
+        const int32_t * __restrict__ labels,
+        const float * __restrict__ weights,
+        float * __restrict__ dst,
+        const int nclasses,
+        const int nrows) {
+    const int row = blockIdx.x;
+    const int label = labels[row];
+    const float weight = weights[row];
+
+    logits += int64_t(row)*nclasses;
+    dst    += int64_t(row)*nclasses;
+
+    if (label < -1 || label >= nclasses || !isfinite(weight) || weight < 0.0f) {
+        for (int i = threadIdx.x; i < nclasses; i += WARP_SIZE) {
+            dst[i] = NAN;
+        }
+        return;
+    }
+    if (label == -1 || weight == 0.0f) {
+        for (int i = threadIdx.x; i < nclasses; i += WARP_SIZE) {
+            dst[i] = 0.0f;
+        }
+        return;
+    }
+
+    float max_logit = -INFINITY;
+    for (int i = threadIdx.x; i < nclasses; i += WARP_SIZE) {
+        max_logit = fmaxf(max_logit, logits[i]);
+    }
+    max_logit = warp_reduce_max(max_logit);
+
+    float sum_exp = 0.0f;
+    for (int i = threadIdx.x; i < nclasses; i += WARP_SIZE) {
+        sum_exp += expf(logits[i] - max_logit);
+    }
+    sum_exp = warp_reduce_sum(sum_exp);
+
+    const float scale = *grad * weight / (float) nrows;
+    for (int i = threadIdx.x; i < nclasses; i += WARP_SIZE) {
+        const float probability = expf(logits[i] - max_logit) / sum_exp;
+        dst[i] = (probability - (i == label ? 1.0f : 0.0f)) * scale;
+    }
+}
+
+void ggml_cuda_cross_entropy_loss_sparse(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * logits  = dst->src[0];
+    const ggml_tensor * labels  = dst->src[1];
+    const ggml_tensor * weights = dst->src[2];
+
+    GGML_ASSERT(logits->type == GGML_TYPE_F32);
+    GGML_ASSERT(labels->type == GGML_TYPE_I32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(logits));
+    GGML_ASSERT(ggml_is_contiguous(labels));
+    GGML_ASSERT(ggml_is_contiguous(weights));
+    GGML_ASSERT(ggml_nelements(labels) == ggml_nrows(logits));
+    GGML_ASSERT(ggml_nelements(weights) == ggml_nrows(logits));
+    GGML_ASSERT(ggml_is_scalar(dst) && dst->type == GGML_TYPE_F32);
+
+    const int nclasses = (int) logits->ne[0];
+    const int nrows = (int) ggml_nrows(logits);
+    const float * logits_d = (const float *) logits->data;
+    const int32_t * labels_d = (const int32_t *) labels->data;
+    const float * weights_d = (const float *) weights->data;
+    float * dst_d = (float *) dst->data;
+
+    ggml_cuda_pool & pool = ctx.pool();
+    cudaStream_t stream = ctx.stream();
+    const dim3 blocks_dim(WARP_SIZE, 1, 1);
+    const dim3 blocks_num(nrows, 1, 1);
+    ggml_cuda_pool_alloc<float> row_losses(pool, blocks_num.x);
+
+    cross_entropy_loss_sparse_f32<<<blocks_num, blocks_dim, 0, stream>>>(
+        logits_d, labels_d, weights_d, row_losses.ptr, nclasses, nrows);
+    CUDA_CHECK(cudaGetLastError());
+    sum_f32_cuda(pool, row_losses.ptr, dst_d, blocks_num.x, stream);
+}
+
+void ggml_cuda_cross_entropy_loss_sparse_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * grad    = dst->src[0];
+    const ggml_tensor * logits  = dst->src[1];
+    const ggml_tensor * labels  = dst->src[2];
+    const ggml_tensor * weights = dst->src[3];
+
+    GGML_ASSERT(ggml_is_scalar(grad) && grad->type == GGML_TYPE_F32);
+    GGML_ASSERT(logits->type == GGML_TYPE_F32);
+    GGML_ASSERT(labels->type == GGML_TYPE_I32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(grad));
+    GGML_ASSERT(ggml_is_contiguous(logits));
+    GGML_ASSERT(ggml_is_contiguous(labels));
+    GGML_ASSERT(ggml_is_contiguous(weights));
+    GGML_ASSERT(ggml_are_same_shape(logits, dst));
+    GGML_ASSERT(ggml_nelements(labels) == ggml_nrows(logits));
+    GGML_ASSERT(ggml_nelements(weights) == ggml_nrows(logits));
+
+    const int nclasses = (int) logits->ne[0];
+    const int nrows = (int) ggml_nrows(logits);
+    const float * grad_d = (const float *) grad->data;
+    const float * logits_d = (const float *) logits->data;
+    const int32_t * labels_d = (const int32_t *) labels->data;
+    const float * weights_d = (const float *) weights->data;
+    float * dst_d = (float *) dst->data;
+
+    cudaStream_t stream = ctx.stream();
+    const dim3 blocks_dim(WARP_SIZE, 1, 1);
+    const dim3 blocks_num(nrows, 1, 1);
+    cross_entropy_loss_sparse_back_f32<<<blocks_num, blocks_dim, 0, stream>>>(
+        grad_d, logits_d, labels_d, weights_d, dst_d, nclasses, nrows);
+    CUDA_CHECK(cudaGetLastError());
+}

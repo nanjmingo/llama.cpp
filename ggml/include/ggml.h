@@ -436,6 +436,8 @@ extern "C" {
         GGML_OP_OUT_PROD_ID,
         GGML_OP_GATED_DELTA_NET_BACK,
         GGML_OP_MUL_MAT_ID_BACK,
+        GGML_OP_CROSS_ENTROPY_LOSS_SPARSE,
+        GGML_OP_CROSS_ENTROPY_LOSS_SPARSE_BACK,
 
         GGML_OP_COUNT,
     };
@@ -2640,6 +2642,23 @@ extern "C" {
             struct ggml_tensor  * a,  // logits
             struct ggml_tensor  * b,  // labels
             struct ggml_tensor  * c); // gradients of cross_entropy_loss result
+
+    // Sparse cross entropy for one class ID and one weight per logits row.
+    // Labels must be I32; valid IDs are [0, nclasses), and -1 skips a row.
+    // Weights must be finite and nonnegative; zero weights also skip a row.
+    // The loss is divided by the total number of rows, including skipped rows.
+    GGML_API struct ggml_tensor * ggml_cross_entropy_loss_sparse(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * logits,
+            struct ggml_tensor  * labels,  // I32 [nrows]
+            struct ggml_tensor  * weights); // F32 [nrows]
+
+    GGML_API struct ggml_tensor * ggml_cross_entropy_loss_sparse_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * grad,    // scalar gradient of sparse cross entropy
+            struct ggml_tensor  * logits,
+            struct ggml_tensor  * labels,  // I32 [nrows]
+            struct ggml_tensor  * weights); // F32 [nrows]
 
     // AdamW optimizer step
     // Paper: https://arxiv.org/pdf/1711.05101v3.pdf

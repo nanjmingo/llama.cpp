@@ -3300,6 +3300,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_CROSS_ENTROPY_LOSS:
             ggml_cuda_cross_entropy_loss(ctx, dst);
             break;
+        case GGML_OP_CROSS_ENTROPY_LOSS_SPARSE:
+            ggml_cuda_cross_entropy_loss_sparse(ctx, dst);
+            break;
         case GGML_OP_TRI:
             ggml_cuda_op_tri(ctx, dst);
             break;
@@ -3329,6 +3332,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
             ggml_cuda_cross_entropy_loss_back(ctx, dst);
+            break;
+        case GGML_OP_CROSS_ENTROPY_LOSS_SPARSE_BACK:
+            ggml_cuda_cross_entropy_loss_sparse_back(ctx, dst);
             break;
         case GGML_OP_OPT_STEP_ADAMW:
             ggml_cuda_opt_step_adamw(ctx, dst);
@@ -7137,6 +7143,8 @@ static bool ggml_backend_cuda_device_supports_op_impl(ggml_backend_dev_t dev, co
         }
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+        case GGML_OP_CROSS_ENTROPY_LOSS_SPARSE:
+        case GGML_OP_CROSS_ENTROPY_LOSS_SPARSE_BACK:
         case GGML_OP_OPT_STEP_SGD:
         case GGML_OP_FILL:
         case GGML_OP_CUMSUM:

@@ -32,6 +32,10 @@ extern "C" {
         GGML_OPT_LOSS_TYPE_SUM,
         GGML_OPT_LOSS_TYPE_CROSS_ENTROPY,
         GGML_OPT_LOSS_TYPE_MEAN_SQUARED_ERROR,
+        // Sparse labels use one I32 class ID and one F32 weight per output row.
+        // I32 labels contain class IDs in [0, nclasses); -1 and zero weights ignore a row.
+        // Weights must be finite and nonnegative. The loss is averaged over all rows.
+        GGML_OPT_LOSS_TYPE_SPARSE_CROSS_ENTROPY,
     };
 
     // ====== Dataset ======
@@ -43,6 +47,8 @@ extern "C" {
             int64_t        ne_label,     // number of elements per label
             int64_t        ndata,        // total number of datapoints/labels
             int64_t        ndata_shard); // number of datapoints/labels per shard (unit at which the dataset is shuffled/copied)
+    // Weighted datasets can be used with sparse cross entropy by setting
+    // type_label=GGML_TYPE_I32, type_weights=GGML_TYPE_F32, and both extents to 1.
     GGML_API ggml_opt_dataset_t ggml_opt_dataset_init_with_weights(
             enum ggml_type type_data,
             enum ggml_type type_label,
@@ -182,7 +188,9 @@ extern "C" {
     // if not using static graphs these pointers become invalid with the next call to ggml_opt_alloc
     GGML_API struct ggml_tensor * ggml_opt_inputs(  ggml_opt_context_t opt_ctx); // forward graph input tensor
     GGML_API struct ggml_tensor * ggml_opt_outputs( ggml_opt_context_t opt_ctx); // forward graph output tensor
-    GGML_API struct ggml_tensor * ggml_opt_labels(  ggml_opt_context_t opt_ctx); // labels to compare outputs against
+    GGML_API struct ggml_tensor * ggml_opt_labels(  ggml_opt_context_t opt_ctx); // dense labels (legacy loss types)
+    GGML_API struct ggml_tensor * ggml_opt_sparse_labels(ggml_opt_context_t opt_ctx); // I32 class ID per output row; -1 means ignored
+    GGML_API struct ggml_tensor * ggml_opt_sparse_label_weights(ggml_opt_context_t opt_ctx); // F32 weight per row; zero means ignored
     GGML_API struct ggml_tensor * ggml_opt_loss(    ggml_opt_context_t opt_ctx); // scalar tensor that contains the loss
     GGML_API struct ggml_tensor * ggml_opt_pred(    ggml_opt_context_t opt_ctx); // predictions made by outputs
     GGML_API struct ggml_tensor * ggml_opt_ncorrect(ggml_opt_context_t opt_ctx); // number of matching predictions between outputs and labels

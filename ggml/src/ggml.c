@@ -1120,9 +1120,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OUT_PROD_ID",
     "GATED_DELTA_NET_BACK",
     "MUL_MAT_ID_BACK",
+    "CROSS_ENTROPY_LOSS_SPARSE",
+    "CROSS_ENTROPY_LOSS_SPARSE_BACK",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1239,9 +1241,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "X_id⊗Y_id",
     "gated_delta_net_back(q, k, v, g, beta, s, d)",
     "dY -> dB via X[i]^T",
+    "cross_entropy_loss_sparse(logits, labels, weights)",
+    "cross_entropy_loss_sparse_back(grad, logits, labels, weights)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6319,6 +6323,61 @@ struct ggml_tensor * ggml_cross_entropy_loss_back(
     return result;
 }
 
+// ggml_cross_entropy_loss_sparse
+
+struct ggml_tensor * ggml_cross_entropy_loss_sparse(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * logits,
+        struct ggml_tensor  * labels,
+        struct ggml_tensor  * weights) {
+    GGML_ASSERT(logits->type == GGML_TYPE_F32);
+    GGML_ASSERT(labels->type == GGML_TYPE_I32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(logits));
+    GGML_ASSERT(ggml_is_contiguous(labels));
+    GGML_ASSERT(ggml_is_contiguous(weights));
+    GGML_ASSERT(ggml_nelements(labels) == ggml_nrows(logits));
+    GGML_ASSERT(ggml_nelements(weights) == ggml_nrows(logits));
+    GGML_ASSERT(ggml_nrows(logits) > 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    result->op     = GGML_OP_CROSS_ENTROPY_LOSS_SPARSE;
+    result->src[0] = logits;
+    result->src[1] = labels;
+    result->src[2] = weights;
+    return result;
+}
+
+// ggml_cross_entropy_loss_sparse_back
+
+struct ggml_tensor * ggml_cross_entropy_loss_sparse_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * grad,
+        struct ggml_tensor  * logits,
+        struct ggml_tensor  * labels,
+        struct ggml_tensor  * weights) {
+    GGML_ASSERT(ggml_is_scalar(grad));
+    GGML_ASSERT(grad->type == GGML_TYPE_F32);
+    GGML_ASSERT(logits->type == GGML_TYPE_F32);
+    GGML_ASSERT(labels->type == GGML_TYPE_I32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(grad));
+    GGML_ASSERT(ggml_is_contiguous(logits));
+    GGML_ASSERT(ggml_is_contiguous(labels));
+    GGML_ASSERT(ggml_is_contiguous(weights));
+    GGML_ASSERT(ggml_nelements(labels) == ggml_nrows(logits));
+    GGML_ASSERT(ggml_nelements(weights) == ggml_nrows(logits));
+    GGML_ASSERT(ggml_nrows(logits) > 0);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, logits);
+    result->op     = GGML_OP_CROSS_ENTROPY_LOSS_SPARSE_BACK;
+    result->src[0] = grad;
+    result->src[1] = logits;
+    result->src[2] = labels;
+    result->src[3] = weights;
+    return result;
+}
+
 // opt_step_adamw
 
 struct ggml_tensor * ggml_opt_step_adamw(
@@ -7502,6 +7561,14 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_cross_entropy_loss_back(ctx, grad, src0, src1));
             }
             GGML_ASSERT(!src1_needs_grads && "backward pass for labels not implemented");
+        } break;
+        case GGML_OP_CROSS_ENTROPY_LOSS_SPARSE: {
+            if (src0_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc0,
+                    ggml_cross_entropy_loss_sparse_back(ctx, grad, src0, src1, src2));
+            }
+            GGML_ASSERT(!src1_needs_grads && "backward pass for sparse labels not implemented");
+            GGML_ASSERT(!src2_needs_grads && "backward pass for sparse label weights not implemented");
         } break;
         case GGML_OP_GLU: {
             switch (ggml_get_glu_op(tensor)) {

@@ -9501,6 +9501,99 @@ struct test_cross_entropy_loss_back : public test_case {
     }
 };
 
+// GGML_OP_CROSS_ENTROPY_LOSS_SPARSE
+struct test_cross_entropy_loss_sparse : public test_case {
+    const std::array<int64_t, 4> ne;
+
+    std::string vars() override {
+        return var_to_str(ne);
+    }
+
+    explicit test_cross_entropy_loss_sparse(std::array<int64_t, 4> ne = {10, 5, 4, 3}) : ne(ne) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * logits = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_param(logits);
+        ggml_set_name(logits, "logits");
+
+        const int64_t nrows = ne[1] * ne[2] * ne[3];
+        ggml_tensor * labels = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, nrows);
+        ggml_set_name(labels, "labels_sparse");
+        ggml_tensor * weights = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nrows);
+        ggml_set_name(weights, "label_weights");
+
+        ggml_tensor * out = ggml_cross_entropy_loss_sparse(ctx, logits, labels, weights);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const int64_t nclasses = ne[0];
+        const int64_t nrows = ne[1] * ne[2] * ne[3];
+        ggml_tensor * logits = ggml_get_tensor(ctx, "logits");
+        ggml_tensor * labels = ggml_get_tensor(ctx, "labels_sparse");
+        ggml_tensor * weights = ggml_get_tensor(ctx, "label_weights");
+        init_tensor_uniform(logits, -10.0f, 10.0f);
+
+        std::vector<int32_t> label_data(nrows);
+        std::vector<float> weight_data(nrows);
+        for (int64_t i = 0; i < nrows; ++i) {
+            label_data[i] = (i % 7 == 0) ? -1 : (int32_t) (i % nclasses);
+            weight_data[i] = (i % 5 == 0) ? 0.0f : 0.25f * (float) (1 + (i % 4));
+        }
+        ggml_backend_tensor_set(labels, label_data.data(), 0, label_data.size() * sizeof(label_data[0]));
+        ggml_backend_tensor_set(weights, weight_data.data(), 0, weight_data.size() * sizeof(weight_data[0]));
+    }
+
+    float grad_eps() override {
+        return 1e-1f;
+    }
+
+    bool grad_precise() override {
+        return true;
+    }
+};
+
+// GGML_OP_CROSS_ENTROPY_LOSS_SPARSE_BACK
+struct test_cross_entropy_loss_sparse_back : public test_case {
+    const std::array<int64_t, 4> ne;
+
+    std::string vars() override {
+        return var_to_str(ne);
+    }
+
+    explicit test_cross_entropy_loss_sparse_back(std::array<int64_t, 4> ne = {10, 5, 4, 3}) : ne(ne) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * grad = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_set_name(grad, "grad");
+        ggml_tensor * logits = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(logits, "logits");
+        const int64_t nrows = ne[1] * ne[2] * ne[3];
+        ggml_tensor * labels = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, nrows);
+        ggml_set_name(labels, "labels_sparse");
+        ggml_tensor * weights = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nrows);
+        ggml_set_name(weights, "label_weights");
+        return ggml_cross_entropy_loss_sparse_back(ctx, grad, logits, labels, weights);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const int64_t nclasses = ne[0];
+        const int64_t nrows = ne[1] * ne[2] * ne[3];
+        init_tensor_uniform(ggml_get_tensor(ctx, "grad"), -2.0f, 2.0f);
+        init_tensor_uniform(ggml_get_tensor(ctx, "logits"), -10.0f, 10.0f);
+
+        std::vector<int32_t> label_data(nrows);
+        std::vector<float> weight_data(nrows);
+        for (int64_t i = 0; i < nrows; ++i) {
+            label_data[i] = (i % 7 == 0) ? -1 : (int32_t) (i % nclasses);
+            weight_data[i] = (i % 5 == 0) ? 0.0f : 0.25f * (float) (1 + (i % 4));
+        }
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "labels_sparse"), label_data.data(), 0, label_data.size() * sizeof(label_data[0]));
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "label_weights"), weight_data.data(), 0, weight_data.size() * sizeof(weight_data[0]));
+    }
+};
+
 // GGML_OP_OPT_STEP_ADAMW
 struct test_opt_step_adamw : public test_case {
     const ggml_type type;
@@ -13511,6 +13604,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {30000, 1, 1, 1}));
+
+    test_cases.emplace_back(new test_cross_entropy_loss_sparse({   10, 5, 4, 3}));
+    test_cases.emplace_back(new test_cross_entropy_loss_sparse({30000, 3, 1, 1}));
+    test_cases.emplace_back(new test_cross_entropy_loss_sparse_back({   10, 5, 4, 3}));
+    test_cases.emplace_back(new test_cross_entropy_loss_sparse_back({30000, 1, 1, 1}));
 
     test_cases.emplace_back(new test_opt_step_adamw(GGML_TYPE_F32, {10, 5, 4, 3}));
     test_cases.emplace_back(new test_opt_step_sgd(GGML_TYPE_F32, {10, 5, 4, 3}));

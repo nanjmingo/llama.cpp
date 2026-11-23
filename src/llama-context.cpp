@@ -4299,7 +4299,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
         sched_need_reserve = false;
     }
 
-    ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
+    ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), GGML_OPT_LOSS_TYPE_SPARSE_CROSS_ENTROPY);
     opt_params.opt_period      = n_batch / n_ubatch;
     opt_params.get_opt_pars    = lopt_params.get_opt_pars;
     opt_params.get_opt_pars_ud = lopt_params.get_opt_pars_ud;
@@ -4500,34 +4500,32 @@ bool llama_context::opt_epoch_iter(
 
             res->set_inputs(&ubatch);
             {
-                struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
-                GGML_ASSERT(labels->ne[1] == n_ubatch);
-                ggml_set_zero(labels);
+                struct ggml_tensor * labels  = ggml_opt_sparse_labels(opt_ctx);
+                struct ggml_tensor * weights = ggml_opt_sparse_label_weights(opt_ctx);
+                GGML_ASSERT(labels && labels->type == GGML_TYPE_I32);
+                GGML_ASSERT(weights && weights->type == GGML_TYPE_F32);
+                GGML_ASSERT(ggml_nelements(labels) == n_ubatch);
+                GGML_ASSERT(ggml_nelements(weights) == n_ubatch);
 
-                const bool labels_host = ggml_backend_buffer_is_host(labels->buffer);
-                ggml_backend_t labels_backend = nullptr;
-                if (!labels_host) {
-                    labels_backend = ggml_backend_sched_get_tensor_backend(sched.get(), labels);
-                    GGML_ASSERT(labels_backend);
-                }
-
+                std::vector<int32_t> labels_batch(n_ubatch, -1);
+                std::vector<float> weights_batch(n_ubatch, 0.0f);
                 for (uint32_t pos_ubatch = 0; pos_ubatch < n_ubatch; ++pos_ubatch) {
                     const uint32_t ilabel = pos_ctx + pos_batch + pos_ubatch;
                     const float weight = label_weights[ilabel];
+                    const llama_token label = labels_sparse[ilabel];
                     GGML_ASSERT(std::isfinite(weight) && weight >= 0.0f && weight <= 1.0f);
-                    if (labels_sparse[ilabel] < 0 || weight <= 0.0f) continue;
-                    GGML_ASSERT(labels_sparse[ilabel] < labels->ne[0]);
-                    const size_t offset = (static_cast<size_t>(pos_ubatch) * labels->ne[0] +
-                        static_cast<size_t>(labels_sparse[ilabel])) * sizeof(float);
-                    if (labels_host) {
-                        static_cast<float *>(labels->data)[offset / sizeof(float)] = weight;
-                    } else {
-                        ggml_backend_tensor_set_async(labels_backend, labels, &label_weights[ilabel], offset, sizeof(float));
+                    if (label < 0 || weight == 0.0f) {
+                        continue;
                     }
+                    GGML_ASSERT(static_cast<uint32_t>(label) < model.vocab.n_tokens());
+                    labels_batch[pos_ubatch] = label;
+                    weights_batch[pos_ubatch] = weight;
                 }
-                if (!labels_host) {
-                    ggml_backend_synchronize(labels_backend);
-                }
+
+                // Sparse labels and weights are tiny compared with the dense
+                // [vocab, n_ubatch] one-hot tensor used by dense cross entropy.
+                ggml_backend_tensor_set(labels, labels_batch.data(), 0, labels_batch.size() * sizeof(labels_batch[0]));
+                ggml_backend_tensor_set(weights, weights_batch.data(), 0, weights_batch.size() * sizeof(weights_batch[0]));
             }
 
             copy_experts.reset();

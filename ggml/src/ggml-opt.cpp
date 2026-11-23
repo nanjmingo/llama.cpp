@@ -55,6 +55,8 @@ struct ggml_opt_context {
     struct ggml_tensor * inputs  = nullptr;
     struct ggml_tensor * outputs = nullptr;
     struct ggml_tensor * labels  = nullptr;
+    struct ggml_tensor * labels_sparse = nullptr;
+    struct ggml_tensor * label_weights = nullptr;
 
     struct ggml_tensor * loss     = nullptr;
     struct ggml_tensor * pred     = nullptr;
@@ -877,6 +879,33 @@ void ggml_opt_dataset_get_batch_host(ggml_opt_dataset_t dataset, void * data_bat
     }
 }
 
+static void ggml_opt_dataset_get_weights_batch(
+        ggml_opt_dataset_t dataset,
+        struct ggml_tensor * data_batch,
+        struct ggml_tensor * weights_batch,
+        int64_t ibatch) {
+    GGML_ASSERT(dataset->weights != nullptr);
+    GGML_ASSERT(data_batch && ggml_is_contiguous(data_batch));
+    GGML_ASSERT(weights_batch && ggml_is_contiguous(weights_batch));
+    GGML_ASSERT(dataset->weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(dataset->weights->ne[0] == 1 && dataset->weights->ne[1] == dataset->ndata &&
+        "sparse cross entropy expects one weight per datapoint");
+    GGML_ASSERT(weights_batch->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_nelements(weights_batch) > 0);
+
+    const size_t nb_data_batch = ggml_nbytes(data_batch);
+    GGML_ASSERT(nb_data_batch % dataset->nbs_data == 0);
+    const int64_t shards_per_batch = nb_data_batch / dataset->nbs_data;
+    GGML_ASSERT(ggml_nbytes(weights_batch) == (size_t) shards_per_batch * dataset->nbs_weights);
+    GGML_ASSERT((ibatch + 1) * shards_per_batch <= (int64_t) dataset->permutation.size());
+
+    for (int64_t i = 0; i < shards_per_batch; ++i) {
+        const int64_t shard = dataset->permutation[ibatch * shards_per_batch + i];
+        const char * src = (const char *) dataset->weights->data + shard * dataset->nbs_weights;
+        ggml_backend_tensor_set(weights_batch, src, i * dataset->nbs_weights, dataset->nbs_weights);
+    }
+}
+
 void ggml_opt_dataset_get_batch_host_with_weights(
         ggml_opt_dataset_t dataset,
         void * data_batch,
@@ -1041,7 +1070,8 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         //   - ncorrect (if using static graphs, 2 tensors).
         constexpr size_t n_loss = 1;
         const size_t tensors_const = opt_ctx->static_graphs ?
-            9 + (opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY ? 11 : 0) : 0;
+            9 + (opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY ? 11 :
+                 opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_SPARSE_CROSS_ENTROPY ? 13 : 0) : 0;
         const size_t size_meta = (n_loss + tensors_const) * ggml_tensor_overhead();
         struct ggml_init_params params = {
             /*.mem_size   =*/ size_meta,
@@ -1100,6 +1130,26 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             opt_ctx->loss_per_datapoint = true;
             break;
         }
+        case GGML_OPT_LOSS_TYPE_SPARSE_CROSS_ENTROPY: {
+            const int64_t nrows = ggml_nrows(opt_ctx->outputs);
+            opt_ctx->labels_sparse = ggml_new_tensor_1d(ctx_results, GGML_TYPE_I32, nrows);
+            ggml_set_input(opt_ctx->labels_sparse);
+            ggml_set_name(opt_ctx->labels_sparse, "labels_sparse");
+
+            opt_ctx->label_weights = ggml_new_tensor_1d(ctx_results, GGML_TYPE_F32, nrows);
+            ggml_set_input(opt_ctx->label_weights);
+            ggml_set_name(opt_ctx->label_weights, "label_weights");
+
+            opt_ctx->loss = ggml_cross_entropy_loss_sparse(
+                ctx_results, opt_ctx->outputs, opt_ctx->labels_sparse, opt_ctx->label_weights);
+            ggml_set_name(opt_ctx->loss, "loss_cross_entropy_sparse");
+            if (opt_ctx->opt_period > 1) {
+                opt_ctx->loss = ggml_scale(ctx_results, opt_ctx->loss, 1.0f / opt_ctx->opt_period);
+                ggml_set_name(opt_ctx->loss, "loss_cross_entropy_sparse_scaled");
+            }
+            opt_ctx->loss_per_datapoint = true;
+            break;
+        }
         case GGML_OPT_LOSS_TYPE_MEAN_SQUARED_ERROR: {
             opt_ctx->labels = ggml_dup_tensor(ctx_results, opt_ctx->outputs);
             ggml_set_input(opt_ctx->labels);
@@ -1121,15 +1171,32 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     ggml_set_loss(opt_ctx->loss);
     ggml_build_forward_expand(opt_ctx->gf, opt_ctx->loss);
 
-    if (opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY) {
+    if (opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY ||
+            opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_SPARSE_CROSS_ENTROPY) {
         opt_ctx->pred = ggml_argmax(ctx_results, opt_ctx->outputs);
         ggml_set_name(opt_ctx->pred, "pred");
         ggml_set_output(opt_ctx->pred);
         ggml_build_forward_expand(opt_ctx->gf, opt_ctx->pred);
 
-        ggml_tensor * labels_sum = ggml_sum_rows(ctx_results, opt_ctx->labels);
-        ggml_tensor * labels_valid = ggml_step(ctx_results, ggml_abs(ctx_results, labels_sum));
-        labels_valid = ggml_reshape_1d(ctx_results, labels_valid, ggml_nelements(opt_ctx->pred));
+        ggml_tensor * labels_valid;
+        ggml_tensor * label_ids;
+        if (opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY) {
+            ggml_tensor * labels_sum = ggml_sum_rows(ctx_results, opt_ctx->labels);
+            labels_valid = ggml_step(ctx_results, ggml_abs(ctx_results, labels_sum));
+            labels_valid = ggml_reshape_1d(ctx_results, labels_valid, ggml_nelements(opt_ctx->pred));
+            label_ids = ggml_argmax(ctx_results, opt_ctx->labels);
+        } else {
+            // A sparse row contributes to accuracy only when it has a valid class ID
+            // and a positive weight. Adding one maps the -1 ignore marker to zero.
+            ggml_tensor * label_ids_f32 = ggml_cast(ctx_results, opt_ctx->labels_sparse, GGML_TYPE_F32);
+            ggml_tensor * label_present = ggml_sgn(ctx_results,
+                ggml_scale_bias(ctx_results, label_ids_f32, 1.0f, 1.0f));
+            ggml_tensor * weight_present = ggml_sgn(ctx_results, opt_ctx->label_weights);
+            labels_valid = ggml_mul(ctx_results, label_present, weight_present);
+            labels_valid = ggml_reshape_1d(ctx_results, labels_valid, ggml_nelements(opt_ctx->pred));
+            label_ids = opt_ctx->labels_sparse;
+        }
+
         ggml_tensor * labels_invalid = ggml_scale_bias(ctx_results, labels_valid, -1.0f, 1.0f);
 
         ggml_tensor * pred_masked = ggml_mul(ctx_results,
@@ -1138,7 +1205,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             ggml_scale(ctx_results, labels_invalid, (float) opt_ctx->outputs->ne[0]));
         pred_masked = ggml_cast(ctx_results, pred_masked, GGML_TYPE_I32);
 
-        opt_ctx->ncorrect = ggml_count_equal(ctx_results, pred_masked, ggml_argmax(ctx_results, opt_ctx->labels));
+        opt_ctx->ncorrect = ggml_count_equal(ctx_results, pred_masked, label_ids);
         ggml_set_name(opt_ctx->ncorrect, "ncorrect");
         ggml_set_output(opt_ctx->ncorrect);
         ggml_build_forward_expand(opt_ctx->gf, opt_ctx->ncorrect);
@@ -1307,7 +1374,8 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
 
         if (grad && (node->flags & GGML_TENSOR_FLAG_PARAM)) {
             if (opt_ctx->loss_normalizer > 0.0f) {
-                GGML_ASSERT(opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
+                GGML_ASSERT(opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY ||
+                    opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_SPARSE_CROSS_ENTROPY);
                 const float scale = static_cast<float>(
                     ggml_nrows(opt_ctx->outputs) * opt_ctx->opt_period) / opt_ctx->loss_normalizer;
                 grad = ggml_scale(opt_ctx->ctx_compute, grad, scale);
@@ -1816,7 +1884,8 @@ void ggml_opt_set_seed(ggml_opt_context_t opt_ctx, uint32_t seed) {
 void ggml_opt_set_loss_normalizer(ggml_opt_context_t opt_ctx, float loss_normalizer) {
     GGML_ASSERT(opt_ctx != nullptr);
     GGML_ASSERT(std::isfinite(loss_normalizer) && loss_normalizer > 0.0f);
-    GGML_ASSERT(opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
+    GGML_ASSERT(opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY ||
+        opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_SPARSE_CROSS_ENTROPY);
     GGML_ASSERT(!opt_ctx->static_graphs && "loss normalization is only supported for dynamic graphs");
     GGML_ASSERT(!opt_ctx->eval_ready);
     GGML_ASSERT(opt_ctx->opt_i == 0 && "loss normalizer can only change between optimizer steps");
@@ -1875,6 +1944,14 @@ struct ggml_tensor * ggml_opt_outputs(ggml_opt_context_t opt_ctx) {
 
 struct ggml_tensor * ggml_opt_labels(ggml_opt_context_t opt_ctx) {
     return opt_ctx->labels;
+}
+
+struct ggml_tensor * ggml_opt_sparse_labels(ggml_opt_context_t opt_ctx) {
+    return opt_ctx->labels_sparse;
+}
+
+struct ggml_tensor * ggml_opt_sparse_label_weights(ggml_opt_context_t opt_ctx) {
+    return opt_ctx->label_weights;
 }
 
 struct ggml_tensor * ggml_opt_loss(ggml_opt_context_t opt_ctx) {
@@ -2225,9 +2302,19 @@ void ggml_opt_epoch(
         ggml_opt_epoch_callback callback_eval) {
     GGML_ASSERT(ggml_opt_static_graphs(opt_ctx) && "ggml_opt_epoch requires static graphs");
     struct ggml_tensor * inputs = ggml_opt_inputs(opt_ctx);
-    struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
+    const bool sparse_cross_entropy = opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_SPARSE_CROSS_ENTROPY;
+    struct ggml_tensor * labels = sparse_cross_entropy
+        ? ggml_opt_sparse_labels(opt_ctx) : ggml_opt_labels(opt_ctx);
+    struct ggml_tensor * weights = sparse_cross_entropy
+        ? ggml_opt_sparse_label_weights(opt_ctx) : nullptr;
     struct ggml_tensor * data   = ggml_opt_dataset_data(dataset);
     GGML_ASSERT(data->ne[0] == inputs->ne[0]);
+    if (sparse_cross_entropy) {
+        GGML_ASSERT(dataset->labels && dataset->labels->type == GGML_TYPE_I32);
+        GGML_ASSERT(dataset->labels->ne[0] == 1 && dataset->labels->ne[1] == dataset->ndata);
+        GGML_ASSERT(dataset->weights && dataset->weights->type == GGML_TYPE_F32);
+        GGML_ASSERT(dataset->weights->ne[0] == 1 && dataset->weights->ne[1] == dataset->ndata);
+    }
 
     const int64_t ndata       =   data->ne[1];
     const int64_t ndata_batch = inputs->ne[1];
@@ -2244,6 +2331,9 @@ void ggml_opt_epoch(
     for (; ibatch < ibatch_split; ++ibatch) {
         ggml_opt_alloc(opt_ctx, /*backward =*/ true);
         ggml_opt_dataset_get_batch(dataset, inputs, labels, ibatch);
+        if (sparse_cross_entropy) {
+            ggml_opt_dataset_get_weights_batch(dataset, inputs, weights, ibatch);
+        }
         ggml_opt_eval(opt_ctx, result_train);
         if (callback_train) {
             callback_train(true, opt_ctx, dataset, result_train, ibatch+1, ibatch_split, t_loop_start);
@@ -2253,6 +2343,9 @@ void ggml_opt_epoch(
     for (; ibatch < nbatches; ++ibatch) {
         ggml_opt_alloc(opt_ctx, /*backward =*/ false);
         ggml_opt_dataset_get_batch(dataset, inputs, labels, ibatch);
+        if (sparse_cross_entropy) {
+            ggml_opt_dataset_get_weights_batch(dataset, inputs, weights, ibatch);
+        }
         ggml_opt_eval(opt_ctx, result_eval);
         if (callback_eval) {
             callback_eval(false, opt_ctx, dataset, result_eval, ibatch+1-ibatch_split, nbatches-ibatch_split, t_loop_start);

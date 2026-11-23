@@ -12531,6 +12531,121 @@ void ggml_compute_forward_cross_entropy_loss_back(
     }
 }
 
+void ggml_compute_forward_cross_entropy_loss_sparse(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * logits  = dst->src[0];
+    const ggml_tensor * labels  = dst->src[1];
+    const ggml_tensor * weights = dst->src[2];
+
+    GGML_ASSERT(logits->type == GGML_TYPE_F32);
+    GGML_ASSERT(labels->type == GGML_TYPE_I32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(logits));
+    GGML_ASSERT(ggml_is_contiguous(labels));
+    GGML_ASSERT(ggml_is_contiguous(weights));
+    GGML_ASSERT(ggml_nelements(labels) == ggml_nrows(logits));
+    GGML_ASSERT(ggml_nelements(weights) == ggml_nrows(logits));
+    GGML_ASSERT(ggml_is_scalar(dst) && dst->type == GGML_TYPE_F32);
+
+    const int64_t nclasses = logits->ne[0];
+    const int64_t nrows = ggml_nrows(logits);
+    const int64_t dr = (nrows + params->nth - 1)/params->nth;
+    const int64_t ir0 = dr*params->ith;
+    const int64_t ir1 = MIN(ir0 + dr, nrows);
+    const int32_t * label_data = (const int32_t *) labels->data;
+    const float * weight_data = (const float *) weights->data;
+    float * partial_sums = (float *) params->wdata;
+    float partial_sum = 0.0f;
+
+    GGML_ASSERT(params->wsize >= sizeof(float) * params->nth);
+
+    for (int64_t row = ir0; row < ir1; ++row) {
+        const int32_t label = label_data[row];
+        const float weight = weight_data[row];
+        GGML_ASSERT(std::isfinite(weight) && weight >= 0.0f);
+        GGML_ASSERT(label == -1 || (label >= 0 && label < nclasses));
+        if (label == -1 || weight == 0.0f) {
+            continue;
+        }
+        const float * row_logits = (const float *) ((const char *) logits->data + row*logits->nb[1]);
+        float max_logit = -INFINITY;
+        ggml_vec_max_f32(nclasses, &max_logit, row_logits);
+
+        float sum_exp = 0.0f;
+        for (int64_t col = 0; col < nclasses; ++col) {
+            sum_exp += expf(row_logits[col] - max_logit);
+        }
+        partial_sum -= weight * (row_logits[label] - max_logit - logf(sum_exp));
+    }
+
+    partial_sums[params->ith] = partial_sum;
+    ggml_barrier(params->threadpool);
+
+    if (params->ith == 0) {
+        float total = 0.0f;
+        for (int i = 0; i < params->nth; ++i) {
+            total += partial_sums[i];
+        }
+        ((float *) dst->data)[0] = total / (float) nrows;
+    }
+}
+
+void ggml_compute_forward_cross_entropy_loss_sparse_back(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * grad    = dst->src[0];
+    const ggml_tensor * logits  = dst->src[1];
+    const ggml_tensor * labels  = dst->src[2];
+    const ggml_tensor * weights = dst->src[3];
+
+    GGML_ASSERT(ggml_is_scalar(grad) && grad->type == GGML_TYPE_F32);
+    GGML_ASSERT(logits->type == GGML_TYPE_F32);
+    GGML_ASSERT(labels->type == GGML_TYPE_I32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(grad));
+    GGML_ASSERT(ggml_is_contiguous(logits));
+    GGML_ASSERT(ggml_is_contiguous(labels));
+    GGML_ASSERT(ggml_is_contiguous(weights));
+    GGML_ASSERT(ggml_are_same_shape(logits, dst));
+    GGML_ASSERT(ggml_nelements(labels) == ggml_nrows(logits));
+    GGML_ASSERT(ggml_nelements(weights) == ggml_nrows(logits));
+
+    const int64_t nclasses = logits->ne[0];
+    const int64_t nrows = ggml_nrows(logits);
+    const int64_t dr = (nrows + params->nth - 1)/params->nth;
+    const int64_t ir0 = dr*params->ith;
+    const int64_t ir1 = MIN(ir0 + dr, nrows);
+    const int32_t * label_data = (const int32_t *) labels->data;
+    const float * weight_data = (const float *) weights->data;
+    const float scale = ((const float *) grad->data)[0] / (float) nrows;
+
+    for (int64_t row = ir0; row < ir1; ++row) {
+        float * row_grad = (float *) ((char *) dst->data + row*dst->nb[1]);
+        const int32_t label = label_data[row];
+        const float weight = weight_data[row];
+        GGML_ASSERT(std::isfinite(weight) && weight >= 0.0f);
+        GGML_ASSERT(label == -1 || (label >= 0 && label < nclasses));
+        if (label == -1 || weight == 0.0f) {
+            ggml_vec_set_f32(nclasses, row_grad, 0.0f);
+            continue;
+        }
+        const float * row_logits = (const float *) ((const char *) logits->data + row*logits->nb[1]);
+        float max_logit = -INFINITY;
+        ggml_vec_max_f32(nclasses, &max_logit, row_logits);
+
+        float sum_exp = 0.0f;
+        for (int64_t col = 0; col < nclasses; ++col) {
+            sum_exp += expf(row_logits[col] - max_logit);
+        }
+        const float row_scale = scale * weight;
+        for (int64_t col = 0; col < nclasses; ++col) {
+            const float probability = expf(row_logits[col] - max_logit) / sum_exp;
+            row_grad[col] = (probability - (col == label ? 1.0f : 0.0f)) * row_scale;
+        }
+    }
+}
+
 static void ggml_compute_forward_opt_step_adamw_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
