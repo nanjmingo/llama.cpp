@@ -598,7 +598,16 @@ namespace {
             const bool is_gradient_accumulation = is_gradient_root &&
                 (node->op == GGML_OP_ADD ||
                  node->op == GGML_OP_ACC || node->op == GGML_OP_SUB || node->op == GGML_OP_SCALE);
-            if (is_gradient_transfer || is_gradient_accumulation) {
+            // In-place gradient accumulation creates an ADD/ACC/SUB/SCALE view
+            // of the previous accumulator value. Every such intermediate view
+            // must stay on the accumulator owner's backend, not merely the
+            // current gradient root. Otherwise an older view can be pinned by
+            // backward_sources to an unrelated forward op's backend, overriding
+            // the storage placement and corrupting the accumulated gradients.
+            const bool is_inplace_gradient_accumulation = target && node->view_src != nullptr &&
+                (node->op == GGML_OP_ADD || node->op == GGML_OP_ACC ||
+                 node->op == GGML_OP_SUB || node->op == GGML_OP_SCALE);
+            if (is_gradient_transfer || is_gradient_accumulation || is_inplace_gradient_accumulation) {
                 const auto it_target = probe_tensors.find(target);
                 if (it_target != probe_tensors.end()) {
                     ggml_backend_t target_backend = ggml_backend_sched_get_tensor_backend(opt_ctx->backend_sched, it_target->second);
