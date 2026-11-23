@@ -553,24 +553,12 @@ namespace {
             record_forward_assignment(opt_ctx->gf->nodes[i]);
         }
 
-        // Keep each backward operation beside the forward operation whose
-        // derivative it computes. Otherwise the scheduler has no layer-level
-        // affinity for backward nodes and can cluster their temporary buffers
-        // on a different GPU from the corresponding forward layer.
-        for (int i = opt_ctx->gf->n_nodes; i < graph->n_nodes; ++i) {
-            ggml_tensor * source = graph->backward_sources ? graph->backward_sources[i] : nullptr;
-            if (!source) {
-                continue;
-            }
-            const auto it = probe_tensors.find(source);
-            if (it == probe_tensors.end()) {
-                continue;
-            }
-            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(opt_ctx->backend_sched, it->second);
-            if (backend && ggml_backend_supports_op(backend, graph->nodes[i])) {
-                opt_ctx->checkpoint_backend_assignments.emplace_back(graph->nodes[i], backend);
-            }
-        }
+        // Do not pin backward operations to the backend of the forward op that
+        // produced their gradient. A single forward op can generate gradients
+        // for inputs with different device ownership (for example, weights and
+        // activations in a multi-GPU matmul). Leave backward placement to the
+        // scheduler, which can account for the actual gradient sources and
+        // persistent gradient-accumulator buffers.
 
         // Each checkpoint recomputation must run on the same backend as the
         // original forward operation which produced its activation.
