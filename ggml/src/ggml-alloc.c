@@ -129,6 +129,39 @@ struct ggml_dyn_tallocr {
 #endif
 };
 
+static bool ggml_dyn_tallocr_trace_enabled(void) {
+    return getenv("GGML_ALLOCATOR_TRACE") != NULL;
+}
+
+static void ggml_dyn_tallocr_get_usage(
+        const struct ggml_dyn_tallocr * alloc,
+        size_t * extent,
+        size_t * occupied_span,
+        size_t * free_bytes,
+        size_t * largest_free_block) {
+    *extent = 0;
+    *occupied_span = 0;
+    *free_bytes = 0;
+    *largest_free_block = 0;
+
+    for (int c = 0; c < alloc->n_chunks; ++c) {
+        const struct tallocr_chunk * chunk = alloc->chunks[c];
+        *extent += chunk->max_size;
+        for (int i = 0; i < chunk->n_free_blocks; ++i) {
+            const struct free_block * block = &chunk->free_blocks[i];
+            if (block->offset >= chunk->max_size) {
+                continue;
+            }
+            const size_t available = MIN(block->size, chunk->max_size - block->offset);
+            *free_bytes += available;
+            *largest_free_block = MAX(*largest_free_block, available);
+        }
+    }
+
+    *occupied_span = *extent - *free_bytes;
+}
+
+
 static void ggml_dyn_tallocr_insert_block(struct tallocr_chunk * chunk, size_t offset, size_t size) {
     GGML_ASSERT(chunk->n_free_blocks < MAX_FREE_BLOCKS && "out of free blocks");
     // insert the new block in the correct position to keep the array sorted by address (to make merging blocks faster)
@@ -196,7 +229,7 @@ static void remove_allocated_tensor(struct ggml_dyn_tallocr * alloc, struct buff
 }
 #endif
 
-static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * alloc, size_t size, const struct ggml_tensor * tensor) {
+static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * alloc, size_t size, const struct ggml_tensor * tensor, int buffer_id) {
     size = aligned_offset(NULL, size, alloc->alignment);
 
     AT_PRINTF("%s: allocating %s (%zu bytes) - ", __func__, tensor->name, size);
@@ -243,10 +276,19 @@ static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * al
         }
     }
 
+    bool new_chunk = false;
     if (best_fit_block == -1) {
         // none of the existing chunks have enough space left
+        if (ggml_dyn_tallocr_trace_enabled() && (alloc->n_chunks > 0 || size >= 8 * 1024 * 1024)) {
+            size_t extent, occupied_span, free_bytes, largest_free_block;
+            ggml_dyn_tallocr_get_usage(alloc, &extent, &occupied_span, &free_bytes, &largest_free_block);
+            GGML_LOG_WARN("ALLOC-DIAG backend=%d new_chunk tensor=%s op=%s type=%s request=%zu chunks=%d extent=%zu occupied_span=%zu holes=%zu largest_hole=%zu\n",
+                buffer_id, tensor->name, ggml_op_name(tensor->op), ggml_type_name(tensor->type), size,
+                alloc->n_chunks, extent, occupied_span, free_bytes, largest_free_block);
+        }
         best_fit_chunk = ggml_dyn_tallocr_new_chunk(alloc, size);
         best_fit_block = 0;
+        new_chunk = true;
     }
     if (best_fit_chunk == -1) {
         // since the last chunk always has virtually endless memory, this should never happen
@@ -298,7 +340,17 @@ static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * al
     }
 #endif
 
+    const size_t old_max_size = chunk->max_size;
     chunk->max_size = MAX(chunk->max_size, addr.offset + size);
+
+    if (((new_chunk && size >= 8 * 1024 * 1024) ||
+            chunk->max_size - old_max_size >= 32 * 1024 * 1024) && ggml_dyn_tallocr_trace_enabled()) {
+        size_t extent, occupied_span, free_bytes, largest_free_block;
+        ggml_dyn_tallocr_get_usage(alloc, &extent, &occupied_span, &free_bytes, &largest_free_block);
+        GGML_LOG_WARN("ALLOC-DIAG backend=%d grow tensor=%s op=%s type=%s bytes=%zu chunk=%d chunk_extent=%zu allocator_extent=%zu occupied_span=%zu holes=%zu largest_hole=%zu chunks=%d\n",
+            buffer_id, tensor->name, ggml_op_name(tensor->op), ggml_type_name(tensor->type), size,
+            addr.chunk, chunk->max_size, extent, occupied_span, free_bytes, largest_free_block, alloc->n_chunks);
+    }
 
     return addr;
 
@@ -681,7 +733,7 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
         ggml_backend_buffer_type_t buft = galloc->bufts[buffer_id];
         size_t size = ggml_backend_buft_get_alloc_size(buft, node);
         hn->buffer_id = buffer_id;
-        hn->addr = ggml_dyn_tallocr_alloc(alloc, size, node);
+        hn->addr = ggml_dyn_tallocr_alloc(alloc, size, node, buffer_id);
     }
 }
 
