@@ -176,63 +176,80 @@ static void print_ok(bool subtest_ok) {
 }
 
 static bool test_sparse_cross_entropy_dense_equivalence(ggml_backend_t backend) {
-    ggml_init_params init_params = { 1024 * 1024, nullptr, true };
-    ggml_context * ctx = ggml_init(init_params);
-    ggml_tensor * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3, 4);
-    ggml_set_param(logits);
-    ggml_tensor * dense_labels = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3, 4);
-    ggml_tensor * sparse_labels = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4);
-    ggml_tensor * sparse_weights = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    const int64_t class_counts[] = { 3, 17, 33 };
+    const int32_t label_indices[] = { -1, 1, 2, 0 };
+    const float weight_data[] = { 0.0f, 0.25f, 0.8f, 1.0f };
 
-    ggml_tensor * dense_loss = ggml_cross_entropy_loss(ctx, logits, dense_labels);
-    ggml_tensor * sparse_loss = ggml_cross_entropy_loss_sparse(ctx, logits, sparse_labels, sparse_weights);
-    ggml_tensor * difference = ggml_sub(ctx, sparse_loss, dense_loss);
-    ggml_set_loss(difference);
+    for (int64_t nclasses : class_counts) {
+        ggml_init_params init_params = { 1024 * 1024, nullptr, true };
+        ggml_context * ctx = ggml_init(init_params);
+        ggml_tensor * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nclasses, 4);
+        ggml_set_param(logits);
+        ggml_tensor * dense_labels = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nclasses, 4);
+        ggml_tensor * sparse_labels = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4);
+        ggml_tensor * sparse_weights = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
 
-    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 256, true);
-    ggml_build_forward_expand(graph, difference);
-    ggml_build_backward_expand(ctx, graph, nullptr);
+        ggml_tensor * dense_loss = ggml_cross_entropy_loss(ctx, logits, dense_labels);
+        ggml_tensor * sparse_loss = ggml_cross_entropy_loss_sparse(ctx, logits, sparse_labels, sparse_weights);
+        ggml_tensor * difference = ggml_sub(ctx, sparse_loss, dense_loss);
+        ggml_set_loss(difference);
 
-    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
-    GGML_ASSERT(buffer != nullptr);
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx, 256, true);
+        ggml_build_forward_expand(graph, difference);
+        ggml_build_backward_expand(ctx, graph, nullptr);
 
-    const float logits_data[12] = {
-        -1.0f, 2.0f, 0.5f,
-         3.0f, -0.5f, 1.0f,
-         0.2f, 1.5f, -2.0f,
-        -0.7f, 0.1f, 2.2f,
-    };
-    const float dense_data[12] = {
-        0.0f, 0.0f, 0.0f,
-        0.0f, 0.25f, 0.0f,
-        0.0f, 0.0f, 0.8f,
-        1.0f, 0.0f, 0.0f,
-    };
-    const int32_t label_data[4] = { -1, 1, 2, 0 };
-    const float weight_data[4] = { 0.0f, 0.25f, 0.8f, 1.0f };
-    ggml_backend_tensor_set(logits, logits_data, 0, sizeof(logits_data));
-    ggml_backend_tensor_set(dense_labels, dense_data, 0, sizeof(dense_data));
-    ggml_backend_tensor_set(sparse_labels, label_data, 0, sizeof(label_data));
-    ggml_backend_tensor_set(sparse_weights, weight_data, 0, sizeof(weight_data));
+        ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        GGML_ASSERT(buffer != nullptr);
 
-    const ggml_status status = ggml_backend_graph_compute(backend, graph);
-    float dense_value = NAN;
-    float sparse_value = NAN;
-    ggml_backend_tensor_get(dense_loss, &dense_value, 0, sizeof(dense_value));
-    ggml_backend_tensor_get(sparse_loss, &sparse_value, 0, sizeof(sparse_value));
+        std::vector<float> logits_data(nclasses * 4);
+        std::vector<float> dense_data(nclasses * 4, 0.0f);
+        for (int64_t row = 0; row < 4; ++row) {
+            for (int64_t col = 0; col < nclasses; ++col) {
+                const int32_t value = (int32_t) ((row * 7 + col * 5) % 23) - 11;
+                logits_data[row*nclasses + col] = value * 0.13f;
+            }
+            if (label_indices[row] >= 0) {
+                const int32_t label = row == 1 ? (int32_t) (nclasses - 1) :
+                    row == 2 ? (int32_t) (nclasses / 2) : label_indices[row];
+                dense_data[row*nclasses + label] = weight_data[row];
+            }
+        }
+        int32_t labels_data[4] = {
+            -1, (int32_t) (nclasses - 1), (int32_t) (nclasses / 2), 0,
+        };
+        ggml_backend_tensor_set(logits, logits_data.data(), 0, ggml_nbytes(logits));
+        ggml_backend_tensor_set(dense_labels, dense_data.data(), 0, ggml_nbytes(dense_labels));
+        ggml_backend_tensor_set(sparse_labels, labels_data, 0, sizeof(labels_data));
+        ggml_backend_tensor_set(sparse_weights, weight_data, 0, sizeof(weight_data));
 
-    ggml_tensor * logits_grad = ggml_graph_get_grad(graph, logits);
-    std::vector<float> grad(ggml_nelements(logits_grad));
-    ggml_backend_tensor_get(logits_grad, grad.data(), 0, ggml_nbytes(logits_grad));
-    float max_grad = 0.0f;
-    for (float value : grad) max_grad = std::max(max_grad, std::fabs(value));
+        const ggml_status status = ggml_backend_graph_compute(backend, graph);
+        float dense_value = NAN;
+        float sparse_value = NAN;
+        ggml_backend_tensor_get(dense_loss, &dense_value, 0, sizeof(dense_value));
+        ggml_backend_tensor_get(sparse_loss, &sparse_value, 0, sizeof(sparse_value));
 
-    const bool ok = status == GGML_STATUS_SUCCESS && std::isfinite(dense_value) &&
-        std::isfinite(sparse_value) && std::fabs(dense_value - sparse_value) < 1e-6f && max_grad < 1e-6f;
+        ggml_tensor * logits_grad = ggml_graph_get_grad(graph, logits);
+        std::vector<float> grad(ggml_nelements(logits_grad));
+        ggml_backend_tensor_get(logits_grad, grad.data(), 0, ggml_nbytes(logits_grad));
+        float max_grad = 0.0f;
+        for (float value : grad) max_grad = std::max(max_grad, std::fabs(value));
 
-    ggml_backend_buffer_free(buffer);
-    ggml_free(ctx);
-    return ok;
+        const float loss_diff = std::fabs(dense_value - sparse_value);
+        const bool ok = status == GGML_STATUS_SUCCESS && std::isfinite(dense_value) &&
+            std::isfinite(sparse_value) && loss_diff < 1e-6f && max_grad < 1e-6f;
+        if (!ok) {
+            fprintf(stderr, "sparse/dense cross entropy mismatch: nclasses=%" PRId64 " status=%d dense=%g sparse=%g loss_diff=%g max_grad=%g\n",
+                    nclasses, (int) status, dense_value, sparse_value, loss_diff, max_grad);
+        }
+
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+        if (!ok) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 static std::pair<int, int> test_sparse_cross_entropy(

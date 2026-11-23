@@ -12556,7 +12556,7 @@ void ggml_compute_forward_cross_entropy_loss_sparse(
     const int32_t * label_data = (const int32_t *) labels->data;
     const float * weight_data = (const float *) weights->data;
     float * partial_sums = (float *) params->wdata;
-    float partial_sum = 0.0f;
+    float sum_thread = 0.0f;
 
     GGML_ASSERT(params->wsize >= sizeof(float) * params->nth);
 
@@ -12572,22 +12572,23 @@ void ggml_compute_forward_cross_entropy_loss_sparse(
         float max_logit = -INFINITY;
         ggml_vec_max_f32(nclasses, &max_logit, row_logits);
 
-        float sum_exp = 0.0f;
+        ggml_float sum_exp = 0.0;
         for (int64_t col = 0; col < nclasses; ++col) {
-            sum_exp += expf(row_logits[col] - max_logit);
+            sum_exp += (ggml_float) expf(row_logits[col] - max_logit);
         }
-        partial_sum -= weight * (row_logits[label] - max_logit - logf(sum_exp));
+        const float log_sum = logf(sum_exp);
+        const float log_prob = (row_logits[label] - max_logit) - log_sum;
+        const float sum_st = log_prob * weight;
+        sum_thread += sum_st;
     }
 
-    partial_sums[params->ith] = partial_sum;
+    partial_sums[params->ith] = sum_thread;
     ggml_barrier(params->threadpool);
 
     if (params->ith == 0) {
-        float total = 0.0f;
-        for (int i = 0; i < params->nth; ++i) {
-            total += partial_sums[i];
-        }
-        ((float *) dst->data)[0] = total / (float) nrows;
+        float * result = (float *) dst->data;
+        ggml_vec_sum_f32(params->nth, result, partial_sums);
+        result[0] *= -1.0f / (float) nrows;
     }
 }
 
@@ -12618,7 +12619,7 @@ void ggml_compute_forward_cross_entropy_loss_sparse_back(
     const int64_t ir1 = MIN(ir0 + dr, nrows);
     const int32_t * label_data = (const int32_t *) labels->data;
     const float * weight_data = (const float *) weights->data;
-    const float scale = ((const float *) grad->data)[0] / (float) nrows;
+    const float d_by_nr = ((const float *) grad->data)[0] / (float) nrows;
 
     for (int64_t row = ir0; row < ir1; ++row) {
         float * row_grad = (float *) ((char *) dst->data + row*dst->nb[1]);
@@ -12634,15 +12635,11 @@ void ggml_compute_forward_cross_entropy_loss_sparse_back(
         float max_logit = -INFINITY;
         ggml_vec_max_f32(nclasses, &max_logit, row_logits);
 
-        float sum_exp = 0.0f;
-        for (int64_t col = 0; col < nclasses; ++col) {
-            sum_exp += expf(row_logits[col] - max_logit);
-        }
-        const float row_scale = scale * weight;
-        for (int64_t col = 0; col < nclasses; ++col) {
-            const float probability = expf(row_logits[col] - max_logit) / sum_exp;
-            row_grad[col] = (probability - (col == label ? 1.0f : 0.0f)) * row_scale;
-        }
+        const ggml_float sum = ggml_vec_soft_max_f32(nclasses, row_grad, row_logits, max_logit);
+        ggml_vec_scale_f32(nclasses, row_grad, 1.0 / sum);
+        ggml_vec_scale_f32(nclasses, row_grad, weight);
+        row_grad[label] -= weight;
+        ggml_vec_scale_f32(nclasses, row_grad, d_by_nr);
     }
 }
 
