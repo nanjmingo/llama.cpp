@@ -68,7 +68,7 @@ struct ggml_opt_context {
     bool eval_ready              = false;
     std::vector<struct ggml_tensor *> grad_accs;
     std::vector<std::pair<int32_t, int32_t>> recompute_backend_affinities;
-    std::vector<std::pair<struct ggml_tensor *, ggml_backend_t>> graph_backend_assignments;
+    std::vector<std::pair<struct ggml_tensor *, ggml_backend_t>> checkpoint_backend_assignments;
     bool checkpoint_diagnostics_logged = false;
     bool checkpoint_forward_buffer_logged = false;
     bool checkpoint_optimizer_buffer_logged = false;
@@ -259,6 +259,19 @@ namespace {
             opt_ctx->recompute_backend_affinities.emplace_back(source->second, clone->second);
         }
 
+        // The reordered graph inserts checkpoint clones between the original
+        // forward nodes and backward nodes. Preserve the forward op that
+        // generated each backward node across this reorder.
+        for (int i = n_forward; i < graph->n_nodes; ++i) {
+            ggml_tensor * source = graph->backward_sources[i];
+            if (!source) {
+                continue;
+            }
+            const auto node = reordered_indices.find(graph->nodes[i]);
+            GGML_ASSERT(node != reordered_indices.end());
+            reordered->backward_sources[node->second] = source;
+        }
+
         ggml_graph_clear(graph);
         ggml_graph_cpy(reordered, graph);
     }
@@ -333,7 +346,7 @@ namespace {
     }
 
     static void ggml_opt_log_sched_buffers(ggml_opt_context_t opt_ctx, const char * graph_name) {
-        if (!opt_ctx->activation_checkpointing || opt_ctx->opt_period <= 1) {
+        if (!opt_ctx->activation_checkpointing) {
             return;
         }
         bool & logged = strcmp(graph_name, "optimizer-update") == 0
@@ -350,7 +363,7 @@ namespace {
     }
 
     static void ggml_opt_log_checkpoint_placement(ggml_opt_context_t opt_ctx, ggml_cgraph * graph) {
-        if (!opt_ctx->activation_checkpointing || opt_ctx->opt_period <= 1 ||
+        if (!opt_ctx->activation_checkpointing ||
                 opt_ctx->checkpoint_diagnostics_logged || graph != opt_ctx->gb_grad) {
             return;
         }
@@ -407,8 +420,8 @@ namespace {
         }
 
         // The previous diagnostic only counted the original forward nodes and
-        // their checkpoint clones. For opt_period > 1, the remainder of gb_grad
-        // contains the actual backward/gradient-accumulation work. This is a
+        // their checkpoint clones. The remainder of gb_grad contains the actual
+        // backward/gradient-accumulation work. This is a
         // substantial part of the graph and must be reported separately.
         for (int i = 0; i < graph->n_nodes; ++i) {
             if (i < opt_ctx->gf->n_nodes || recompute_indices.count(i) != 0) {
@@ -479,30 +492,31 @@ namespace {
         }
 
         size_t mismatches = 0;
-        for (const auto & assignment : opt_ctx->graph_backend_assignments) {
+        for (const auto & assignment : opt_ctx->checkpoint_backend_assignments) {
             if (ggml_backend_sched_get_tensor_backend(opt_ctx->backend_sched, assignment.first) != assignment.second) {
                 ++mismatches;
             }
         }
         GGML_LOG_WARN("%s: AC-DIAG pinned_tensors=%zu backend_mismatches=%zu\n",
-            __func__, opt_ctx->graph_backend_assignments.size(), mismatches);
+            __func__, opt_ctx->checkpoint_backend_assignments.size(), mismatches);
         opt_ctx->checkpoint_diagnostics_logged = true;
     }
 
-    static void ggml_opt_set_graph_backend_affinities(
+    static void ggml_opt_set_recompute_backend_affinities(
             ggml_opt_context_t opt_ctx,
             ggml_cgraph * graph) {
-        opt_ctx->graph_backend_assignments.clear();
+        opt_ctx->checkpoint_backend_assignments.clear();
         if (opt_ctx->static_graphs || graph != opt_ctx->gb_grad ||
-                (opt_ctx->opt_period <= 1 && opt_ctx->recompute_backend_affinities.empty())) {
+                !opt_ctx->activation_checkpointing) {
             return;
         }
 
         // Determine the model's normal layer placement from the forward graph
         // alone. Probing gb_grad is not suitable: it contains the entire
-        // backward graph and (for opt_period > 1) persistent gradient-accumulator
+        // backward graph and persistent gradient-accumulator
         // leaves. Because the scheduler expands assignments across adjacent
-        // nodes, those extra nodes can shift the forward and recompute placement.
+        // nodes, those extra nodes can shift the original forward placement and
+        // the appended recompute section together onto one GPU.
         //
         // Clone gf before splitting it. ggml_backend_sched_split_graph mutates
         // node->src[] when inserting cross-backend copies, while gf and gb_grad
@@ -520,18 +534,12 @@ namespace {
 
         ggml_backend_sched_split_graph(opt_ctx->backend_sched, graph_probe);
 
-        std::unordered_map<ggml_tensor *, ggml_backend_t> forward_backends;
-        forward_backends.reserve(opt_ctx->gf->visited_hash_set.size);
-        std::unordered_set<ggml_tensor *> forward_tensors;
-        forward_tensors.reserve(opt_ctx->gf->visited_hash_set.size);
         auto record_forward_assignment = [&](ggml_tensor * tensor) {
             const auto it = probe_tensors.find(tensor);
             GGML_ASSERT(it != probe_tensors.end());
             ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(opt_ctx->backend_sched, it->second);
             GGML_ASSERT(backend != nullptr && "scheduler did not assign a backend to a forward tensor");
-            forward_backends.emplace(tensor, backend);
-            forward_tensors.insert(tensor);
-            opt_ctx->graph_backend_assignments.emplace_back(tensor, backend);
+            opt_ctx->checkpoint_backend_assignments.emplace_back(tensor, backend);
         };
 
         // Pin every original forward node and leaf to the placement selected
@@ -545,68 +553,43 @@ namespace {
             record_forward_assignment(opt_ctx->gf->nodes[i]);
         }
 
+        // Keep each backward operation beside the forward operation whose
+        // derivative it computes. Otherwise the scheduler has no layer-level
+        // affinity for backward nodes and can cluster their temporary buffers
+        // on a different GPU from the corresponding forward layer.
+        for (int i = opt_ctx->gf->n_nodes; i < graph->n_nodes; ++i) {
+            ggml_tensor * source = graph->backward_sources ? graph->backward_sources[i] : nullptr;
+            if (!source) {
+                continue;
+            }
+            const auto it = probe_tensors.find(source);
+            if (it == probe_tensors.end()) {
+                continue;
+            }
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(opt_ctx->backend_sched, it->second);
+            if (backend && ggml_backend_supports_op(backend, graph->nodes[i])) {
+                opt_ctx->checkpoint_backend_assignments.emplace_back(graph->nodes[i], backend);
+            }
+        }
+
         // Each checkpoint recomputation must run on the same backend as the
         // original forward operation which produced its activation.
         for (const auto & affinity : opt_ctx->recompute_backend_affinities) {
             GGML_ASSERT(affinity.first >= 0 && affinity.first < opt_ctx->gf->n_nodes);
             GGML_ASSERT(affinity.second >= opt_ctx->gf->n_nodes && affinity.second < graph->n_nodes);
             ggml_tensor * source_node = opt_ctx->gf->nodes[affinity.first];
-            const auto it = forward_backends.find(source_node);
-            GGML_ASSERT(it != forward_backends.end());
-            opt_ctx->graph_backend_assignments.emplace_back(graph->nodes[affinity.second], it->second);
+            const auto it = probe_tensors.find(source_node);
+            GGML_ASSERT(it != probe_tensors.end());
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(opt_ctx->backend_sched, it->second);
+            GGML_ASSERT(backend != nullptr);
+            opt_ctx->checkpoint_backend_assignments.emplace_back(graph->nodes[affinity.second], backend);
         }
 
-        if (opt_ctx->opt_period > 1) {
-            // Parameter gradient accumulators already live beside their parameters.
-            // Gradients of intermediate activations are graph temporaries, however,
-            // and without an affinity the scheduler places them by neighbouring
-            // graph nodes. The backward graph is not ordered by forward layer, so
-            // that heuristic can put a layer's gradients on the other GPU from its
-            // activations and cause large cross-device copies to remain live.
-            // Place each unallocated gradient root beside the forward tensor it
-            // differentiates. Skip preallocated accumulators and views: their
-            // storage/backend is already fixed by the buffer or view source.
-            std::unordered_map<ggml_tensor *, ggml_backend_t> gradient_backends;
-            std::unordered_set<ggml_tensor *> conflicting_gradients;
-            auto record_gradient_affinity = [&](ggml_tensor * tensor) {
-                const auto forward_it = forward_backends.find(tensor);
-                if (forward_it == forward_backends.end()) {
-                    return;
-                }
-                ggml_tensor * grad = ggml_graph_get_grad(graph, tensor);
-                if (!grad || forward_tensors.count(grad) != 0 || grad->buffer || grad->view_src || grad->op == GGML_OP_VIEW ||
-                        grad->op == GGML_OP_RESHAPE || grad->op == GGML_OP_PERMUTE ||
-                        grad->op == GGML_OP_TRANSPOSE) {
-                    return;
-                }
-                if (grad->op != GGML_OP_NONE && !ggml_backend_supports_op(forward_it->second, grad)) {
-                    return;
-                }
-                const auto inserted = gradient_backends.emplace(grad, forward_it->second);
-                if (!inserted.second && inserted.first->second != forward_it->second) {
-                    conflicting_gradients.insert(grad);
-                }
-            };
-
-            for (int i = 0; i < opt_ctx->gf->n_leafs; ++i) {
-                record_gradient_affinity(opt_ctx->gf->leafs[i]);
-            }
-            for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
-                record_gradient_affinity(opt_ctx->gf->nodes[i]);
-            }
-            for (const auto & affinity : gradient_backends) {
-                if (conflicting_gradients.count(affinity.first) == 0) {
-                    opt_ctx->graph_backend_assignments.emplace_back(affinity.first, affinity.second);
-                }
-            }
-        }
-
-        // Clear probe state and apply the forward, recompute, and gradient
-        // affinities to the real graph. Unpinned backward operations remain
-        // scheduler-assigned, but their gradient outputs now anchor each layer
-        // to the backend selected for its forward operation.
+        // Clear probe state and apply the forward, backward, and recompute
+        // affinities to the real graph. Backward ops unsupported by their
+        // forward backend are left to the scheduler.
         ggml_backend_sched_reset(opt_ctx->backend_sched);
-        for (const auto & assignment : opt_ctx->graph_backend_assignments) {
+        for (const auto & assignment : opt_ctx->checkpoint_backend_assignments) {
             ggml_backend_sched_set_tensor_backend(
                 opt_ctx->backend_sched, assignment.first, assignment.second);
         }
@@ -951,6 +934,9 @@ static ggml_cgraph * dup_graph(ggml_context * ctx, ggml_cgraph * src) {
     }
     GGML_ASSERT(dst->n_nodes == src->n_nodes);
     for (int i = 0; i < src->n_nodes; ++i) {
+        dst->backward_sources[i] = src->backward_sources ? src->backward_sources[i] : nullptr;
+    }
+    for (int i = 0; i < src->n_nodes; ++i) {
         const size_t igrad_src = ggml_hash_find(&src->visited_hash_set, src->nodes[i]);
         const size_t igrad_dst = ggml_hash_find(&dst->visited_hash_set, dst->nodes[i]);
 
@@ -972,12 +958,12 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
 
     const enum ggml_opt_optimizer_type optimizer = opt_ctx->optimizer;
 
-    // Parameter gradients only need a persistent accumulator when more than
-    // one microbatch contributes to an optimizer step. In dynamic mode the
-    // old condition kept a separate F32 GPU buffer even for opt_period == 1,
-    // although the optimizer consumes that gradient only once.
-    const bool accumulate = opt_ctx->build_type_alloc >= GGML_OPT_BUILD_TYPE_GRAD &&
-        opt_ctx->opt_period > 1;
+    // With activation checkpointing, keep the optimizer update in a separate
+    // graph even for opt_period == 1. Otherwise all parameter gradients remain
+    // live while the optimizer nodes are appended to the backward graph,
+    // increasing the peak scheduler buffer for the checkpointed graph.
+    const bool use_grad_accumulators = opt_ctx->build_type_alloc >= GGML_OPT_BUILD_TYPE_GRAD &&
+        (opt_ctx->opt_period > 1 || (!opt_ctx->static_graphs && opt_ctx->activation_checkpointing));
 
     const bool need_momenta = opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT &&
         opt_ctx->optimizer == GGML_OPT_OPTIMIZER_TYPE_ADAMW;
@@ -1143,7 +1129,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             if (node->flags & GGML_TENSOR_FLAG_LOSS) {
                 opt_ctx->grad_accs[i] = ggml_new_tensor(
                     opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
-            } else if (accumulate && (node->flags & GGML_TENSOR_FLAG_PARAM)) {
+            } else if (use_grad_accumulators && (node->flags & GGML_TENSOR_FLAG_PARAM)) {
                 const ggml_backend_buffer_type_t param_buft = node->buffer
                     ? ggml_backend_buffer_get_type(node->buffer)
                     : ggml_backend_cpu_buffer_type();
@@ -1230,18 +1216,13 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     GGML_ASSERT(opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT);
 
     // Static graphs keep a duplicated graph with the optimizer update.
-    // Dynamic graphs with accumulation run the update in a separate graph that
-    // consumes the persistent gradient accumulators. With opt_period == 1, the
-    // update is appended directly to gb_grad below, so it can consume the
-    // computed gradients without another accumulator or a second backward pass.
+    // Dynamic graphs with persistent gradient accumulators run the update in
+    // a separate graph. Activation checkpointing also uses this path for a
+    // single microbatch to keep optimizer temporaries out of the large
+    // forward/recompute/backward scheduler allocation.
     if (opt_ctx->static_graphs) {
         opt_ctx->gb_opt = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gb_grad, /*force_grads =*/ true);
-    } else if (opt_ctx->opt_period == 1) {
-        // With one microbatch the optimizer can consume the freshly computed
-        // parameter gradients directly. Append the update to the backward graph
-        // so it runs in the same scheduler allocation; a separate graph would
-        // pull the gradient-producing subgraph in again (or require a duplicate
-        // persistent gradient buffer).
+    } else if (!use_grad_accumulators) {
         opt_ctx->gb_opt = nullptr;
     } else {
         const int graph_size = std::max(16, 2 * opt_ctx->gf->n_nodes + 16);
@@ -1254,7 +1235,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     ggml_set_input(adamw_params);
     const char * optimizer_name = ggml_opt_optimizer_name(opt_ctx->optimizer);
     ggml_format_name(adamw_params, "%s_params", optimizer_name);
-    ggml_cgraph * optimizer_graph = opt_ctx->static_graphs || opt_ctx->opt_period > 1
+    ggml_cgraph * optimizer_graph = opt_ctx->static_graphs || use_grad_accumulators
         ? opt_ctx->gb_opt : opt_ctx->gb_grad;
     for (int i = opt_ctx->gf->n_nodes - 1; i >= 0; --i) {
         struct ggml_tensor * node = opt_ctx->static_graphs
@@ -1262,7 +1243,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             : opt_ctx->gb_grad->nodes[i];
         struct ggml_tensor * grad = opt_ctx->static_graphs
             ? ggml_graph_get_grad(opt_ctx->gb_opt, node)
-            : (opt_ctx->opt_period > 1
+            : (use_grad_accumulators
                 ? ggml_graph_get_grad_acc(opt_ctx->gb_grad, node)
                 : ggml_graph_get_grad(opt_ctx->gb_grad, node));
 
@@ -1301,7 +1282,8 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         opt_ctx->buf_static = ggml_backend_alloc_ctx_tensors(
             opt_ctx->ctx_static, ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0));
         // In dynamic mode the persistent parameter gradient accumulators belong
-        // to gb_grad; for opt_period == 1, optimizer updates are also part of gb_grad.
+        // to gb_grad. Optimizer updates may share that graph when neither gradient
+        // accumulation nor activation checkpointing requires a separate update.
         ggml_graph_reset(opt_ctx->static_graphs ? opt_ctx->gb_opt : opt_ctx->gb_grad);
     }
 
@@ -2002,7 +1984,7 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     }
 
     ggml_backend_sched_reset(opt_ctx->backend_sched); // clear allocation of previous graph
-    ggml_opt_set_graph_backend_affinities(opt_ctx, graph);
+    ggml_opt_set_recompute_backend_affinities(opt_ctx, graph);
 
     if (opt_ctx->static_graphs) {
         ggml_init_params params = {
@@ -2020,19 +2002,19 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
 
     ggml_backend_sched_alloc_graph(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
 
-    if (!opt_ctx->graph_backend_assignments.empty()) {
+    if (!opt_ctx->checkpoint_backend_assignments.empty()) {
         size_t mismatches = 0;
-        for (const auto & assignment : opt_ctx->graph_backend_assignments) {
+        for (const auto & assignment : opt_ctx->checkpoint_backend_assignments) {
             if (ggml_backend_sched_get_tensor_backend(opt_ctx->backend_sched, assignment.first) != assignment.second) {
                 ++mismatches;
             }
         }
         if (mismatches != 0) {
-            GGML_LOG_WARN("%s: graph backend affinity mismatch: %zu/%zu tensors were reassigned\n",
-                __func__, mismatches, opt_ctx->graph_backend_assignments.size());
+            GGML_LOG_WARN("%s: activation-checkpoint backend pinning mismatch: %zu/%zu tensors were reassigned\n",
+                __func__, mismatches, opt_ctx->checkpoint_backend_assignments.size());
         } else {
-            GGML_LOG_DEBUG("%s: pinned %zu forward/recompute/gradient tensors\n",
-                __func__, opt_ctx->graph_backend_assignments.size());
+            GGML_LOG_DEBUG("%s: activation-checkpoint pinned %zu forward/backward/recompute tensors\n",
+                __func__, opt_ctx->checkpoint_backend_assignments.size());
         }
     }
     ggml_opt_log_checkpoint_placement(opt_ctx, graph);
@@ -2097,7 +2079,8 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     const bool optimizer_step = opt_ctx->static_graphs
         ? opt_ctx->allocated_graph == opt_ctx->gb_opt
         : opt_ctx->build_type == GGML_OPT_BUILD_TYPE_OPT;
-    const bool separate_optimizer_graph = optimizer_step && !opt_ctx->static_graphs && opt_ctx->opt_period > 1;
+    const bool separate_optimizer_graph = optimizer_step && !opt_ctx->static_graphs &&
+        (opt_ctx->opt_period > 1 || opt_ctx->activation_checkpointing);
 
     if (optimizer_step) {
         const ggml_opt_optimizer_params & opt_pars = opt_ctx->get_opt_pars(opt_ctx->get_opt_pars_ud);
@@ -2139,8 +2122,8 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
         }
     }
 
-    // The selected graph may include the optimizer update (opt_period == 1),
-    // or only forward/backward work when using a separate accumulated update.
+    // The selected graph may include the optimizer update, or only
+    // forward/backward work when using a separate optimizer graph.
     // Copy metrics before the scheduler allocation is reused for that update.
     ggml_backend_sched_graph_compute(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
     ggml_opt_result_add(opt_ctx, result);
@@ -2166,7 +2149,7 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
         opt_ctx->allocated_graph      = nullptr;
         opt_ctx->allocated_graph_copy = nullptr;
         opt_ctx->recompute_backend_affinities.clear();
-        opt_ctx->graph_backend_assignments.clear();
+        opt_ctx->checkpoint_backend_assignments.clear();
     }
 
     opt_ctx->eval_ready = false;
