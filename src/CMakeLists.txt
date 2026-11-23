@@ -18,7 +18,6 @@ set(LLAMA_CORE_SOURCES
     llama-cparams.cpp
     llama-grammar.cpp
     llama-graph.cpp
-    llama-graph-training.cpp
     llama-hparams.cpp
     llama-impl.cpp
     llama-io.cpp
