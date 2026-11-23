@@ -6825,28 +6825,6 @@ static void ggml_hash_map_free(struct hash_map * map) {
     GGML_FREE(map);
 }
 
-// Record which forward tensor a gradient output belongs to. Only gradient
-// roots are tagged; the intermediate derivative operations retain their
-// backward_sources affinity (the forward op being differentiated).
-static void ggml_mark_backward_target(
-        struct ggml_cgraph * cgraph,
-        size_t               isrc) {
-    if (!cgraph->backward_targets) {
-        return;
-    }
-    struct ggml_tensor * src = cgraph->visited_hash_set.keys[isrc];
-    struct ggml_tensor * grad = cgraph->grads[isrc];
-    if (!src || !grad) {
-        return;
-    }
-    for (int i = 0; i < cgraph->n_nodes; ++i) {
-        if (cgraph->nodes[i] == grad) {
-            cgraph->backward_targets[i] = src;
-            return;
-        }
-    }
-}
-
 // utility functions to change gradients
 // isrc is the index of tensor in cgraph->visited_has_set.keys
 // the corresponding gradient (accumulators) are also at position isrc
@@ -6868,26 +6846,6 @@ static void ggml_add_or_set(
     }
     ggml_format_name(cgraph->grads[isrc], "grad for %s", src->name);
     ggml_build_forward_expand(cgraph, cgraph->grads[isrc]);
-    ggml_mark_backward_target(cgraph, isrc);
-}
-
-// Make the result of a gradient contribution available on the backend that
-// owns the forward tensor being differentiated. The derivative itself may be
-// computed next to a large weight tensor on a different backend; this explicit
-// CONT node separates the compute placement from the gradient's destination.
-static void ggml_copy_grad_to_target_backend(
-        struct ggml_context * ctx,
-        struct ggml_cgraph  * cgraph,
-        size_t                isrc) {
-    struct ggml_tensor * src = cgraph->visited_hash_set.keys[isrc];
-    GGML_ASSERT(src);
-    GGML_ASSERT(cgraph->grads[isrc]);
-
-    cgraph->grads[isrc] = ggml_cont(ctx, cgraph->grads[isrc]);
-    ggml_format_name(cgraph->grads[isrc], "grad for %s", src->name);
-
-    ggml_build_forward_expand(cgraph, cgraph->grads[isrc]);
-    ggml_mark_backward_target(cgraph, isrc);
 }
 
 static void ggml_acc_or_set(
@@ -6909,7 +6867,6 @@ static void ggml_acc_or_set(
     }
     ggml_format_name(cgraph->grads[isrc], "grad for %s", cgraph->visited_hash_set.keys[isrc]->name);
     ggml_build_forward_expand(cgraph, cgraph->grads[isrc]);
-    ggml_mark_backward_target(cgraph, isrc);
 }
 
 static void ggml_sub_or_set(
@@ -6926,7 +6883,6 @@ static void ggml_sub_or_set(
     }
     ggml_format_name(cgraph->grads[isrc], "grad for %s", src->name);
     ggml_build_forward_expand(cgraph, cgraph->grads[isrc]);
-    ggml_mark_backward_target(cgraph, isrc);
 }
 
 static enum ggml_prec ggml_prec_compute_type_for_grad(const struct ggml_tensor * tensor) {
@@ -7180,10 +7136,6 @@ static void ggml_compute_backward(
                     }
                 }
                 ggml_add_or_set(ctx, cgraph, isrc1, grad_b);
-                if (cgraph->separate_backward_target_copies &&
-                        !(src1->flags & GGML_TENSOR_FLAG_PARAM)) {
-                    ggml_copy_grad_to_target_backend(ctx, cgraph, isrc1);
-                }
             }
         } break;
         case GGML_OP_SCALE: {
@@ -7699,9 +7651,6 @@ static size_t ggml_visit_parents_graph(struct ggml_cgraph * cgraph, struct ggml_
         if (cgraph->backward_sources) {
             cgraph->backward_sources[cgraph->n_nodes] = NULL;
         }
-        if (cgraph->backward_targets) {
-            cgraph->backward_targets[cgraph->n_nodes] = NULL;
-        }
         cgraph->n_nodes++;
     }
 
@@ -7901,7 +7850,6 @@ static size_t ggml_graph_nbytes(size_t size, bool grads) {
         incr_ptr_aligned(&p, hash_size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)); // grads
         incr_ptr_aligned(&p, hash_size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)); // grad_accs
         incr_ptr_aligned(&p, size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)); // backward_sources
-        incr_ptr_aligned(&p, size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)); // backward_targets
     }
     incr_ptr_aligned(&p, ggml_bitset_size(hash_size) * sizeof(ggml_bitset_t), sizeof(ggml_bitset_t));
 
@@ -7934,7 +7882,6 @@ struct ggml_cgraph * ggml_new_graph_custom(struct ggml_context * ctx, size_t siz
     struct ggml_tensor ** grads_ptr      = grads ? incr_ptr_aligned(&p, hash_size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)) : NULL;
     struct ggml_tensor ** grad_accs_ptr  = grads ? incr_ptr_aligned(&p, hash_size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)) : NULL;
     struct ggml_tensor ** backward_sources_ptr = grads ? incr_ptr_aligned(&p, size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)) : NULL;
-    struct ggml_tensor ** backward_targets_ptr = grads ? incr_ptr_aligned(&p, size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)) : NULL;
 
     ggml_bitset_t * hash_used = incr_ptr_aligned(&p, ggml_bitset_size(hash_size) * sizeof(ggml_bitset_t), sizeof(ggml_bitset_t));
 
@@ -7949,12 +7896,10 @@ struct ggml_cgraph * ggml_new_graph_custom(struct ggml_context * ctx, size_t siz
         /*.grads        =*/ grads_ptr,
         /*.grad_accs    =*/ grad_accs_ptr,
         /*.backward_sources =*/ backward_sources_ptr,
-        /*.backward_targets =*/ backward_targets_ptr,
         /*.leafs        =*/ leafs_ptr,
         /*.use_counts   =*/ use_counts_ptr,
         /*.hash_table   =*/ { hash_size, hash_used, hash_keys_ptr },
         /*.order        =*/ GGML_CGRAPH_EVAL_ORDER_LEFT_TO_RIGHT,
-        /*.separate_backward_target_copies =*/ false,
         /*.uid          =*/ 0,
     };
 
@@ -7963,7 +7908,6 @@ struct ggml_cgraph * ggml_new_graph_custom(struct ggml_context * ctx, size_t siz
         memset(cgraph->grads,     0, hash_size*sizeof(struct ggml_tensor *));
         memset(cgraph->grad_accs, 0, hash_size*sizeof(struct ggml_tensor *));
         memset(cgraph->backward_sources, 0, size*sizeof(struct ggml_tensor *));
-        memset(cgraph->backward_targets, 0, size*sizeof(struct ggml_tensor *));
     }
 
     return cgraph;
@@ -7982,12 +7926,10 @@ struct ggml_cgraph ggml_graph_view(struct ggml_cgraph * cgraph0, int i0, int i1)
         /*.grads            =*/ NULL, // gradients would need visited_hash_set
         /*.grad_accs        =*/ NULL,
         /*.backward_sources =*/ cgraph0->backward_sources ? cgraph0->backward_sources + i0 : NULL,
-        /*.backward_targets =*/ cgraph0->backward_targets ? cgraph0->backward_targets + i0 : NULL,
         /*.leafs            =*/ NULL,
         /*.use_counts       =*/ cgraph0->use_counts,
         /*.visited_hash_set =*/ cgraph0->visited_hash_set,
         /*.order            =*/ cgraph0->order,
-        /*.separate_backward_target_copies =*/ cgraph0->separate_backward_target_copies,
         /*.uid              =*/ 0
     };
 
@@ -8002,7 +7944,6 @@ void ggml_graph_cpy(struct ggml_cgraph * src, struct ggml_cgraph * dst) {
     dst->n_leafs = src->n_leafs;
     dst->n_nodes = src->n_nodes;
     dst->order   = src->order;
-    dst->separate_backward_target_copies = src->separate_backward_target_copies;
 
     for (int i = 0; i < src->n_leafs; ++i) {
         dst->leafs[i] = src->leafs[i];
@@ -8012,9 +7953,6 @@ void ggml_graph_cpy(struct ggml_cgraph * src, struct ggml_cgraph * dst) {
         dst->nodes[i] = src->nodes[i];
         if (dst->backward_sources) {
             dst->backward_sources[i] = src->backward_sources ? src->backward_sources[i] : NULL;
-        }
-        if (dst->backward_targets) {
-            dst->backward_targets[i] = src->backward_targets ? src->backward_targets[i] : NULL;
         }
     }
 
@@ -8136,9 +8074,6 @@ void ggml_graph_add_node(struct ggml_cgraph * cgraph, struct ggml_tensor * tenso
     cgraph->nodes[cgraph->n_nodes] = tensor;
     if (cgraph->backward_sources) {
         cgraph->backward_sources[cgraph->n_nodes] = NULL;
-    }
-    if (cgraph->backward_targets) {
-        cgraph->backward_targets[cgraph->n_nodes] = NULL;
     }
     cgraph->n_nodes++;
 }
