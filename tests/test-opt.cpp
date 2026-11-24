@@ -175,6 +175,199 @@ static void print_ok(bool subtest_ok) {
     printf(subtest_ok ? "\033[1;32mOK\033[0m\n" : "\033[1;31mFAIL\033[0m\n");
 }
 
+static bool test_sparse_cross_entropy_dense_equivalence(ggml_backend_t backend) {
+    const int64_t class_counts[] = { 3, 17, 33 };
+    const int32_t label_indices[] = { -1, 1, 2, 0 };
+    const float weight_data[] = { 0.0f, 0.25f, 0.8f, 1.0f };
+
+    for (int64_t nclasses : class_counts) {
+        ggml_init_params init_params = { 1024 * 1024, nullptr, true };
+        ggml_context * ctx = ggml_init(init_params);
+        ggml_tensor * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nclasses, 4);
+        ggml_set_param(logits);
+        ggml_tensor * dense_labels = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nclasses, 4);
+        ggml_tensor * sparse_labels = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4);
+        ggml_tensor * sparse_weights = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+
+        ggml_tensor * dense_loss = ggml_cross_entropy_loss(ctx, logits, dense_labels);
+        ggml_tensor * sparse_loss = ggml_cross_entropy_loss_sparse(ctx, logits, sparse_labels, sparse_weights);
+        ggml_tensor * difference = ggml_sub(ctx, sparse_loss, dense_loss);
+        ggml_set_loss(difference);
+
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx, 256, true);
+        ggml_build_forward_expand(graph, difference);
+        ggml_build_backward_expand(ctx, graph, nullptr);
+
+        ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        GGML_ASSERT(buffer != nullptr);
+
+        std::vector<float> logits_data(nclasses * 4);
+        std::vector<float> dense_data(nclasses * 4, 0.0f);
+        for (int64_t row = 0; row < 4; ++row) {
+            for (int64_t col = 0; col < nclasses; ++col) {
+                const int32_t value = (int32_t) ((row * 7 + col * 5) % 23) - 11;
+                logits_data[row*nclasses + col] = value * 0.13f;
+            }
+            if (label_indices[row] >= 0) {
+                const int32_t label = row == 1 ? (int32_t) (nclasses - 1) :
+                    row == 2 ? (int32_t) (nclasses / 2) : label_indices[row];
+                dense_data[row*nclasses + label] = weight_data[row];
+            }
+        }
+        int32_t labels_data[4] = {
+            -1, (int32_t) (nclasses - 1), (int32_t) (nclasses / 2), 0,
+        };
+        ggml_backend_tensor_set(logits, logits_data.data(), 0, ggml_nbytes(logits));
+        ggml_backend_tensor_set(dense_labels, dense_data.data(), 0, ggml_nbytes(dense_labels));
+        ggml_backend_tensor_set(sparse_labels, labels_data, 0, sizeof(labels_data));
+        ggml_backend_tensor_set(sparse_weights, weight_data, 0, sizeof(weight_data));
+
+        const ggml_status status = ggml_backend_graph_compute(backend, graph);
+        float dense_value = NAN;
+        float sparse_value = NAN;
+        ggml_backend_tensor_get(dense_loss, &dense_value, 0, sizeof(dense_value));
+        ggml_backend_tensor_get(sparse_loss, &sparse_value, 0, sizeof(sparse_value));
+
+        ggml_tensor * logits_grad = ggml_graph_get_grad(graph, logits);
+        std::vector<float> grad(ggml_nelements(logits_grad));
+        ggml_backend_tensor_get(logits_grad, grad.data(), 0, ggml_nbytes(logits_grad));
+        float max_grad = 0.0f;
+        for (float value : grad) max_grad = std::max(max_grad, std::fabs(value));
+
+        const float loss_diff = std::fabs(dense_value - sparse_value);
+        const bool ok = status == GGML_STATUS_SUCCESS && std::isfinite(dense_value) &&
+            std::isfinite(sparse_value) && loss_diff < 1e-6f && max_grad < 1e-6f;
+        if (!ok) {
+            fprintf(stderr, "sparse/dense cross entropy mismatch: nclasses=%" PRId64 " status=%d dense=%g sparse=%g loss_diff=%g max_grad=%g\n",
+                    nclasses, (int) status, dense_value, sparse_value, loss_diff, max_grad);
+        }
+
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+        if (!ok) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static std::pair<int, int> test_sparse_cross_entropy(
+        enum ggml_opt_optimizer_type optimizer,
+        ggml_backend_sched_t backend_sched,
+        ggml_backend_t backend) {
+    int ntest = 0;
+    int npass = 0;
+
+    ggml_init_params static_params = { 2 * ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx_static = ggml_init(static_params);
+    ggml_tensor * class_bias = ggml_new_tensor_2d(ctx_static, GGML_TYPE_F32, 1, 3);
+    ggml_set_name(class_bias, "class_bias");
+    ggml_set_param(class_bias);
+    ggml_tensor * inputs = ggml_new_tensor_2d(ctx_static, GGML_TYPE_F32, 1, 4);
+    ggml_set_name(inputs, "inputs");
+    ggml_set_input(inputs);
+    ggml_backend_buffer_t static_buffer = ggml_backend_alloc_ctx_tensors(ctx_static, backend);
+    GGML_ASSERT(static_buffer != nullptr);
+    const float initial_bias[3] = { 0.0f, 0.0f, 0.0f };
+    ggml_backend_tensor_set(class_bias, initial_bias, 0, sizeof(initial_bias));
+
+    ggml_init_params compute_params = { 32 * 1024 * 1024, nullptr, true };
+    ggml_context * ctx_compute = ggml_init(compute_params);
+    ggml_tensor * outputs = ggml_mul_mat(ctx_compute, class_bias, inputs);
+    ggml_set_name(outputs, "logits");
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx_compute, 1024, false);
+    ggml_build_forward_expand(gf, outputs);
+
+    ggml_opt_params params = ggml_opt_default_params(backend_sched, GGML_OPT_LOSS_TYPE_SPARSE_CROSS_ENTROPY);
+    params.optimizer = optimizer;
+    params.get_opt_pars = helper_get_test_opt_pars;
+    ggml_opt_context_t opt_ctx = ggml_opt_init(params);
+    ggml_opt_prepare_alloc(opt_ctx, ctx_compute, gf, inputs, outputs);
+    ggml_opt_alloc(opt_ctx, /*backward =*/ true);
+
+    const float input_values[4] = { 0.1f, -0.2f, 0.3f, 0.0f };
+    const int32_t label_values[4] = { 0, -1, 1, 2 };
+    const float weight_values[4] = { 1.0f, 0.0f, 0.5f, 1.0f };
+    ggml_backend_tensor_set(inputs, input_values, 0, sizeof(input_values));
+    ggml_backend_tensor_set(ggml_opt_sparse_labels(opt_ctx), label_values, 0, sizeof(label_values));
+    ggml_backend_tensor_set(ggml_opt_sparse_label_weights(opt_ctx), weight_values, 0, sizeof(weight_values));
+
+    ggml_opt_result_t result = ggml_opt_result_init();
+    ggml_opt_eval(opt_ctx, result);
+
+    float updated_bias[3] = {};
+    ggml_backend_tensor_get(class_bias, updated_bias, 0, sizeof(updated_bias));
+    double loss = 0.0;
+    ggml_opt_result_last_loss(result, &loss);
+    const bool changed = !almost_equal(updated_bias[0], initial_bias[0], 1e-6) ||
+        !almost_equal(updated_bias[1], initial_bias[1], 1e-6) ||
+        !almost_equal(updated_bias[2], initial_bias[2], 1e-6);
+    const bool subtest_ok = std::isfinite(loss) && loss > 0.0 && changed;
+
+    printf("  %s(optimizer=%s): ", __func__, ggml_opt_optimizer_name(optimizer));
+    print_ok(subtest_ok);
+    if (subtest_ok) npass++;
+    ntest++;
+
+    ggml_opt_result_free(result);
+    ggml_opt_free(opt_ctx);
+    ggml_free(ctx_compute);
+    ggml_backend_buffer_free(static_buffer);
+    ggml_free(ctx_static);
+    return std::make_pair(npass, ntest);
+}
+
+static bool test_sparse_cross_entropy_dataset(
+        enum ggml_opt_optimizer_type optimizer,
+        ggml_backend_sched_t backend_sched,
+        ggml_backend_t backend) {
+    ggml_init_params static_params = { 2 * ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx_static = ggml_init(static_params);
+    ggml_tensor * class_weights = ggml_new_tensor_2d(ctx_static, GGML_TYPE_F32, 1, 3);
+    ggml_set_name(class_weights, "class_weights");
+    ggml_set_param(class_weights);
+    ggml_tensor * inputs = ggml_new_tensor_2d(ctx_static, GGML_TYPE_F32, 1, 2);
+    ggml_set_name(inputs, "inputs");
+    ggml_set_input(inputs);
+    ggml_backend_buffer_t static_buffer = ggml_backend_alloc_ctx_tensors(ctx_static, backend);
+    GGML_ASSERT(static_buffer != nullptr);
+    const float initial_weights[3] = { 0.0f, 0.0f, 0.0f };
+    ggml_backend_tensor_set(class_weights, initial_weights, 0, sizeof(initial_weights));
+
+    ggml_init_params compute_params = { 32 * 1024 * 1024, nullptr, true };
+    ggml_context * ctx_compute = ggml_init(compute_params);
+    ggml_tensor * outputs = ggml_mul_mat(ctx_compute, class_weights, inputs);
+
+    ggml_opt_dataset_t dataset = ggml_opt_dataset_init_with_weights(
+        GGML_TYPE_F32, GGML_TYPE_I32, GGML_TYPE_F32,
+        /*ne_datapoint =*/ 1, /*ne_label =*/ 1, /*ne_weights =*/ 1,
+        /*ndata =*/ 4, /*ndata_shard =*/ 2);
+    const float data_values[4] = { 0.1f, -0.2f, 0.3f, 0.0f };
+    const int32_t label_values[4] = { 0, -1, 1, 2 };
+    const float weight_values[4] = { 1.0f, 0.0f, 0.5f, 1.0f };
+    ggml_backend_tensor_set(ggml_opt_dataset_data(dataset), data_values, 0, sizeof(data_values));
+    ggml_backend_tensor_set(ggml_opt_dataset_labels(dataset), label_values, 0, sizeof(label_values));
+    ggml_backend_tensor_set(ggml_opt_dataset_weights(dataset), weight_values, 0, sizeof(weight_values));
+
+    ggml_opt_fit(backend_sched, ctx_compute, inputs, outputs, dataset,
+        GGML_OPT_LOSS_TYPE_SPARSE_CROSS_ENTROPY, optimizer,
+        helper_get_test_opt_pars, /*nepoch =*/ 1, /*nbatch_logical =*/ 2,
+        /*val_split =*/ 0.0f, /*silent =*/ true);
+
+    float updated_weights[3] = {};
+    ggml_backend_tensor_get(class_weights, updated_weights, 0, sizeof(updated_weights));
+    const bool changed = !almost_equal(updated_weights[0], initial_weights[0], 1e-6) ||
+        !almost_equal(updated_weights[1], initial_weights[1], 1e-6) ||
+        !almost_equal(updated_weights[2], initial_weights[2], 1e-6);
+
+    ggml_opt_dataset_free(dataset);
+    ggml_free(ctx_compute);
+    ggml_backend_buffer_free(static_buffer);
+    ggml_free(ctx_static);
+    return changed;
+}
+
 static void helper_after_test(
         enum ggml_opt_optimizer_type optim,
         const char * func, const bool high_level, const std::string options,
@@ -602,6 +795,78 @@ static std::pair<int, int> test_idata_split(
     return std::make_pair(npass, ntest);
 }
 
+static ggml_opt_optimizer_params helper_get_activation_checkpointing_opt_pars(void * userdata) {
+    ggml_opt_optimizer_params result = ggml_opt_get_default_optimizer_params(userdata);
+    result.adamw.alpha = 1e-2f;
+    result.adamw.beta1 = 0.0f;
+    result.adamw.beta2 = 0.0f;
+    result.adamw.eps   = 1e-8f;
+    result.adamw.wd    = 0.0f;
+    return result;
+}
+
+static std::pair<int, int> test_dynamic_activation_checkpointing(
+        ggml_backend_sched_t backend_sched, ggml_backend_t backend) {
+    int ntest = 0;
+    int npass = 0;
+
+    for (const int32_t opt_period : { 1, 2 }) {
+        ggml_init_params static_params = { 1024 * 1024, nullptr, true };
+        ggml_context * ctx_static = ggml_init(static_params);
+        ggml_tensor * weight = ggml_new_tensor_1d(ctx_static, GGML_TYPE_F32, 1);
+        ggml_set_name(weight, "weight");
+        ggml_set_param(weight);
+        ggml_backend_buffer_t weight_buffer = ggml_backend_alloc_ctx_tensors(ctx_static, backend);
+        const float initial_weight = 1.0f;
+        ggml_backend_tensor_set(weight, &initial_weight, 0, sizeof(initial_weight));
+
+        ggml_opt_params opt_params = ggml_opt_default_params(backend_sched, GGML_OPT_LOSS_TYPE_MEAN_SQUARED_ERROR);
+        opt_params.opt_period = opt_period;
+        opt_params.optimizer = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
+        opt_params.get_opt_pars = helper_get_activation_checkpointing_opt_pars;
+        ggml_opt_context_t opt_ctx = ggml_opt_init(opt_params);
+        ggml_opt_set_activation_checkpointing(opt_ctx, true);
+        ggml_opt_result_t result = ggml_opt_result_init();
+
+        // Run two complete optimizer steps to verify that the persistent
+        // gradient accumulators are cleared between updates at opt_period=1.
+        for (int32_t i = 0; i < 2 * opt_period; ++i) {
+            ggml_init_params compute_params = { 64 * 1024 * 1024, nullptr, true };
+            ggml_context * ctx_compute = ggml_init(compute_params);
+            ggml_tensor * input = ggml_new_tensor_1d(ctx_compute, GGML_TYPE_F32, 1);
+            ggml_set_input(input);
+            ggml_tensor * shifted = ggml_add(ctx_compute, input, weight);
+            ggml_tensor * squared = ggml_sqr(ctx_compute, shifted);
+            ggml_tensor * output = ggml_scale(ctx_compute, squared, 1.0f);
+            ggml_set_output(output);
+            ggml_cgraph * gf = ggml_new_graph_custom(ctx_compute, 8192, false);
+            ggml_build_forward_expand(gf, output);
+
+            ggml_opt_prepare_alloc(opt_ctx, ctx_compute, gf, input, output);
+            ggml_opt_alloc(opt_ctx, /*backward =*/ true);
+            const float input_value = 0.25f + 0.1f * (i % opt_period);
+            ggml_backend_tensor_set(input, &input_value, 0, sizeof(input_value));
+            ggml_tensor * labels = ggml_opt_labels(opt_ctx);
+            ggml_set_zero(labels);
+            ggml_opt_eval(opt_ctx, result);
+            ggml_free(ctx_compute);
+        }
+
+        float final_weight = initial_weight;
+        ggml_backend_tensor_get(weight, &final_weight, 0, sizeof(final_weight));
+        const bool subtest_ok = std::isfinite(final_weight) && almost_equal(final_weight, 0.98, 1e-5);
+        const std::string args = "activation_checkpointing=yes, opt_period=" + std::to_string(opt_period);
+        print_ok(__func__, subtest_ok, npass, ntest, args.c_str());
+
+        ggml_opt_result_free(result);
+        ggml_opt_free(opt_ctx);
+        ggml_backend_buffer_free(weight_buffer);
+        ggml_free(ctx_static);
+    }
+
+    return std::make_pair(npass, ntest);
+}
+
 static void helper_after_test_gradient_accumulation(
         enum ggml_opt_optimizer_type optim,
         const char * func, const int nbatch_physical, const enum ggml_opt_loss_type loss_type, const int epoch,
@@ -877,6 +1142,11 @@ static std::pair<int, int> test_backend(
     }
     bool const adamw = optim == GGML_OPT_OPTIMIZER_TYPE_ADAMW;
     if (adamw) {
+        {
+            std::pair<int, int> partial = test_dynamic_activation_checkpointing(backend_sched, backend);
+            npass += partial.first;
+            ntest += partial.second;
+        }
         for (int32_t nbatch_physical : { 2, 1 }) {
             for (enum ggml_opt_loss_type loss_type : { GGML_OPT_LOSS_TYPE_SUM, GGML_OPT_LOSS_TYPE_MEAN }) {
                 std::pair<int, int> partial =
@@ -970,10 +1240,26 @@ int main(void) {
                 ggml_free(ctx);
             }
 
+            if (!skip && ggml_backend_dev_type(devs[i]) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                const bool equivalent = test_sparse_cross_entropy_dense_equivalence(backends[i]);
+                printf("  sparse/dense cross entropy equivalence: ");
+                print_ok(equivalent);
+                GGML_ASSERT(equivalent);
+            }
+
             std::pair<int, int> result;
             if (!skip) {
                 result = test_backend(backend_sched, backends[i], optim);
                 printf("  %d/%d tests passed\n", result.first, result.second);
+                const std::pair<int, int> sparse_result = test_sparse_cross_entropy(optim, backend_sched, backends[i]);
+                result.first += sparse_result.first;
+                result.second += sparse_result.second;
+                if (ggml_backend_dev_type(devs[i]) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    const bool sparse_dataset_ok = test_sparse_cross_entropy_dataset(optim, backend_sched, backends[i]);
+                    printf("  sparse cross entropy dataset/fit: ");
+                    print_ok(sparse_dataset_ok);
+                    GGML_ASSERT(sparse_dataset_ok);
+                }
             }
 
             printf("  Backend %s %s: ", ggml_backend_name(backends[i]), ggml_opt_optimizer_name(optim));
