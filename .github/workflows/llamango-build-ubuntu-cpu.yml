@@ -1,0 +1,199 @@
+name: Llamango Ubuntu CPU Build
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: GitHub-hosted runner label.
+        required: true
+        type: string
+      architecture:
+        description: Target architecture (x64 or arm64).
+        required: true
+        type: string
+      cache_key_prefix:
+        description: Stable prefix for the ccache key.
+        required: true
+        type: string
+      release_tag:
+        description: Prerelease tag created by the orchestrator.
+        required: true
+        type: string
+      asset_name:
+        description: Package asset filename.
+        required: true
+        type: string
+      skip_build:
+        description: Skip this build when its release asset already exists.
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  build:
+    if: ${{ !inputs.skip_build }}
+    concurrency:
+      group: ${{ inputs.cache_key_prefix }}-${{ github.ref }}
+      queue: max
+    name: CPU
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      actions: write
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential ccache cmake ninja-build git libgomp1 libssl-dev python3 python3-venv python3-pip
+
+      - name: Setup Python test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 -m venv .venv-ci
+          .venv-ci/bin/python -m pip install --disable-pip-version-check --upgrade pip
+          .venv-ci/bin/python -m pip install --disable-pip-version-check \
+            -r requirements/requirements-convert_hf_to_gguf.txt \
+            'Jinja2>=3.1,<4'
+
+          .venv-ci/bin/python - <<'PYTHON'
+          from importlib.metadata import version
+          from jinja2 import Environment
+          import numpy
+          import safetensors
+          import torch
+
+          jinja_version = version('Jinja2')
+          if 'items' not in Environment().filters:
+              raise SystemExit(f'Jinja2 items filter is unavailable (found {jinja_version})')
+
+          PYTHON
+
+          echo "$GITHUB_WORKSPACE/.venv-ci/bin" >> "$GITHUB_PATH"
+
+      - name: Setup ccache
+        uses: ./.github/actions/llamango-ccache-linux
+        with:
+          cache-key-prefix: ${{ inputs.cache_key_prefix }}
+
+      - name: Configure full CPU build
+        env:
+          CC: gcc-12
+          CXX: g++-12
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_BUILD_RPATH_USE_ORIGIN=ON \
+            -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DLLAMA_BUILD_COMMON=ON \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DLLAMA_BUILD_TESTS=ON \
+            -DLLAMA_BUILD_EXAMPLES=ON \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_APP=ON \
+            -DLLAMA_FATAL_WARNINGS=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU=ON \
+            -DGGML_CUDA=OFF
+
+      - name: Build all targets
+        id: build
+        run: |
+          set -euo pipefail
+          cmake --build build --parallel "$(nproc)"
+
+      - name: Package Ubuntu CPU build
+        id: package
+        if: always() && steps.build.outcome == 'success'
+        env:
+          ASSET_NAME: ${{ inputs.asset_name }}
+        run: |
+          set -euo pipefail
+          tar -czf "$ASSET_NAME" -C build/bin .
+
+      - name: Publish Ubuntu CPU package
+        if: always() && steps.package.outcome == 'success'
+        uses: ./.github/actions/llamango-upload-release-asset
+        with:
+          release-tag: ${{ inputs.release_tag }}
+          asset-path: ${{ inputs.asset_name }}
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+
+      - name: Evict stale ccache entries
+        if: always() && steps.build.outcome == 'success'
+        shell: bash
+        run: |
+          if ! ccache --evict-older-than 3d >/dev/null 2>&1; then
+            echo "::warning::Failed to evict stale ccache entries; continuing without cleanup."
+          fi
+
+      - name: Save ccache
+        if: always() && steps.build.outcome == 'success'
+        uses: actions/cache/save@v6
+        with:
+          path: .ccache
+          key: ${{ inputs.cache_key_prefix }}-${{ github.run_id }}
+
+      - name: Cleanup ccache
+        if: always() && !cancelled()
+        uses: ./.github/actions/llamango-ccache-cleanup
+        with:
+          cache-key-prefix: ${{ inputs.cache_key_prefix }}
+
+      - name: Run all CPU tests
+        id: test
+        if: always() && steps.build.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        env:
+          ARCHITECTURE: ${{ inputs.architecture }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set +e
+          junit_file="$GITHUB_WORKSPACE/test-${RELEASE_TAG}-ubuntu-${ARCHITECTURE}-cpu.xml"
+          ctest_args=(
+            --test-dir build
+            -L main
+            --output-on-failure
+            --timeout 900
+            --parallel "$(nproc)"
+          )
+          if ctest --help 2>&1 | grep -q -- '--output-junit'; then
+            ctest_args+=(--output-junit "$junit_file")
+          else
+            echo "::warning::CTest does not support --output-junit (requires CTest 3.21 or newer); JUnit XML will not be published."
+          fi
+          ctest "${ctest_args[@]}"
+          test_status=$?
+          set -e
+
+          if [[ -s "$junit_file" ]]; then
+            printf 'junit_file=%s\n' "$(basename "$junit_file")" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::CTest did not produce JUnit XML: $junit_file"
+          fi
+
+          exit "$test_status"
+
+      - name: Publish Ubuntu CPU JUnit XML
+        if: always() && steps.test.outputs.junit_file != ''
+        uses: ./.github/actions/llamango-upload-release-asset
+        with:
+          release-tag: ${{ inputs.release_tag }}
+          asset-path: ${{ steps.test.outputs.junit_file }}
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          publish-release: 'false'
+
+
+      - name: Fail job when CPU tests fail
+        if: always() && steps.test.outcome == 'failure'
+        shell: bash
+        run: exit 1
