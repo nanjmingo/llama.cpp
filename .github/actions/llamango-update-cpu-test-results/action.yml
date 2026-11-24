@@ -1,0 +1,41 @@
+name: Update Llamango CPU test results
+
+description: Aggregate CPU JUnit results and update the prerelease notes.
+
+inputs:
+  release-tag:
+    description: Existing prerelease tag.
+    required: true
+  repository:
+    description: Repository in owner/name format.
+    required: true
+  token:
+    description: "GitHub token with contents: write permission."
+    required: true
+  ubuntu-x64-job-result:
+    description: Result of the Ubuntu x64 CPU build job.
+    required: true
+  ubuntu-arm64-job-result:
+    description: Result of the Ubuntu ARM64 CPU build job.
+    required: true
+  windows-x64-job-result:
+    description: Result of the Windows x64 CPU build job.
+    required: true
+  windows-arm64-job-result:
+    description: Result of the Windows ARM64 CPU build job.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Aggregate CPU JUnit results and update prerelease
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        GH_REPO: ${{ inputs.repository }}
+        RELEASE_TAG: ${{ inputs.release-tag }}
+        UBUNTU_X64_JOB_RESULT: ${{ inputs.ubuntu-x64-job-result }}
+        UBUNTU_ARM64_JOB_RESULT: ${{ inputs.ubuntu-arm64-job-result }}
+        WINDOWS_X64_JOB_RESULT: ${{ inputs.windows-x64-job-result }}
+        WINDOWS_ARM64_JOB_RESULT: ${{ inputs.windows-arm64-job-result }}
+      run: bash "$GITHUB_ACTION_PATH/update-cpu-test-results.sh"
