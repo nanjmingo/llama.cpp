@@ -74,6 +74,7 @@ int main(int argc, char ** argv) {
         /*get_opt_pars_ud =*/&params.lr,
         /*optimizer_type  =*/params.optimizer,
         GGML_TYPE_F32,
+        /*fused_linear_cross_entropy =*/false,
     };
     llama_opt_init(ctx, model, lopt_params);
 
