@@ -8,9 +8,17 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <cinttypes>
+#include <locale>
 #include <map>
 #include <random>
+#include <sstream>
+#include <string>
+#include <type_traits>
+#include <utility>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 struct ggml_opt_dataset {
@@ -18,11 +26,13 @@ struct ggml_opt_dataset {
     ggml_backend_buffer_t   buf    = nullptr;
     struct ggml_tensor    * data   = nullptr;
     struct ggml_tensor    * labels = nullptr;
+    struct ggml_tensor    * weights = nullptr;
 
     int64_t ndata       = -1;
     int64_t ndata_shard = -1;
     size_t  nbs_data    = -1;
     size_t  nbs_labels  = -1;
+    size_t  nbs_weights = -1;
 
     std::vector<int64_t> permutation;
 };
@@ -45,10 +55,13 @@ struct ggml_opt_context {
     struct ggml_tensor * inputs  = nullptr;
     struct ggml_tensor * outputs = nullptr;
     struct ggml_tensor * labels  = nullptr;
+    struct ggml_tensor * labels_sparse = nullptr;
+    struct ggml_tensor * label_weights = nullptr;
 
     struct ggml_tensor * loss     = nullptr;
     struct ggml_tensor * pred     = nullptr;
     struct ggml_tensor * ncorrect = nullptr;
+    struct ggml_tensor * nvalid   = nullptr;
 
     struct ggml_cgraph * gf      = nullptr;
     struct ggml_cgraph * gb_grad = nullptr;
@@ -56,12 +69,22 @@ struct ggml_opt_context {
     bool static_graphs           = false;
     bool eval_ready              = false;
     std::vector<struct ggml_tensor *> grad_accs;
+    std::vector<std::pair<int32_t, int32_t>> recompute_backend_affinities;
+    std::vector<std::pair<struct ggml_tensor *, ggml_backend_t>> checkpoint_backend_assignments;
+    bool checkpoint_diagnostics_logged = false;
+    bool checkpoint_forward_buffer_logged = false;
+    bool checkpoint_optimizer_buffer_logged = false;
     std::vector<struct ggml_tensor *> grad_m;
     std::vector<struct ggml_tensor *> grad_v;
+    std::vector<ggml_backend_buffer_t> bufs_grad_accs;
+    std::vector<struct ggml_context *> ctxs_grad_accs;
+    std::vector<ggml_backend_buffer_t> bufs_momenta;
+    std::vector<struct ggml_context *> ctxs_momenta;
 
     int64_t iter               = 1;
     int32_t opt_period         = 1;
     int32_t opt_i              = 0;
+    float   loss_normalizer    = 0.0f;
     bool    loss_per_datapoint = false;
 
     ggml_opt_get_optimizer_params get_opt_pars    = nullptr;
@@ -69,6 +92,10 @@ struct ggml_opt_context {
     struct ggml_tensor *          opt_step_params = nullptr; // Stores output of get_opt_pars.
 
     enum ggml_opt_optimizer_type optimizer = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
+    enum ggml_type optimizer_state_type = GGML_TYPE_F32;
+    bool activation_checkpointing = false;
+    bool optimizer_state_ready = false;
+    std::vector<uint8_t> pending_optimizer_state;
 };
 
 struct ggml_opt_result {
@@ -76,10 +103,557 @@ struct ggml_opt_result {
     std::vector<float>   loss;
     std::vector<int32_t> pred;
     int64_t              ncorrect = 0;
+    int64_t              naccuracy_data = 0;
 
-    int64_t opt_period         = -1;
-    bool    loss_per_datapoint = false;
+    std::vector<int32_t> opt_periods;
+    bool                  loss_per_datapoint = false;
+    double                loss_sum = 0.0;
+    double                loss_squared_sum = 0.0;
 };
+
+namespace {
+    bool ggml_opt_apply_pending_state(ggml_opt_context_t opt_ctx);
+
+    struct ggml_opt_recompute_state {
+        std::unordered_set<ggml_tensor *> forward;
+        std::unordered_set<ggml_tensor *> keep;
+        std::unordered_map<ggml_tensor *, ggml_tensor *> clones;
+    };
+
+    static ggml_tensor * ggml_opt_recompute_clone(
+            ggml_context * ctx,
+            ggml_tensor * tensor,
+            ggml_opt_recompute_state & state) {
+        if (!tensor || state.forward.find(tensor) == state.forward.end() ||
+                state.keep.find(tensor) != state.keep.end() || tensor->type == GGML_TYPE_I32) {
+            return tensor;
+        }
+
+        const auto found = state.clones.find(tensor);
+        if (found != state.clones.end()) {
+            return found->second;
+        }
+
+        ggml_tensor * clone = ggml_dup_tensor(ctx, tensor);
+        state.clones.emplace(tensor, clone);
+        clone->op = tensor->op;
+        memcpy(clone->nb, tensor->nb, sizeof(tensor->nb));
+        memcpy(clone->op_params, tensor->op_params, sizeof(tensor->op_params));
+        clone->flags = tensor->flags & ~(GGML_TENSOR_FLAG_PARAM | GGML_TENSOR_FLAG_INPUT |
+                                         GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_LOSS);
+        ggml_format_name(clone, "%.48s (recompute)", tensor->name);
+        clone->view_offs = tensor->view_offs;
+        clone->view_src = ggml_opt_recompute_clone(ctx, tensor->view_src, state);
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            clone->src[i] = ggml_opt_recompute_clone(ctx, tensor->src[i], state);
+        }
+
+        return clone;
+    }
+
+    static void ggml_opt_recompute_checkpoints(ggml_opt_context_t opt_ctx) {
+        opt_ctx->recompute_backend_affinities.clear();
+        if (!opt_ctx->activation_checkpointing || opt_ctx->static_graphs ||
+                opt_ctx->build_type == GGML_OPT_BUILD_TYPE_FORWARD || opt_ctx->gf->n_nodes == 0) {
+            return;
+        }
+
+        ggml_cgraph * graph = opt_ctx->gb_grad;
+        const int n_forward = opt_ctx->gf->n_nodes;
+        GGML_ASSERT(graph && n_forward <= graph->n_nodes);
+
+        ggml_opt_recompute_state state;
+        state.forward.reserve(static_cast<size_t>(n_forward));
+        state.keep.reserve(static_cast<size_t>(n_forward));
+
+        for (int i = 0; i < n_forward; ++i) {
+            state.forward.insert(graph->nodes[i]);
+        }
+
+        for (int i = 0; i < n_forward; ++i) {
+            ggml_tensor * node = graph->nodes[i];
+            bool keep = node->op == GGML_OP_GET_ROWS ||
+                (node->flags & (GGML_TENSOR_FLAG_PARAM | GGML_TENSOR_FLAG_INPUT |
+                                GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_LOSS)) != 0;
+
+            for (int j = 0; j < GGML_MAX_SRC && !keep && node->view_src == nullptr; ++j) {
+                ggml_tensor * src = node->src[j];
+                if (!src) {
+                    continue;
+                }
+                ggml_tensor * base = src;
+                while (base->view_src) {
+                    base = base->view_src;
+                }
+                keep = state.forward.find(base) == state.forward.end() && base->buffer &&
+                    ggml_backend_buffer_get_usage(base->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+            }
+
+            if (keep) {
+                state.keep.insert(node);
+            }
+        }
+
+        for (int i = 0; i < n_forward; ++i) {
+            ggml_tensor * node = opt_ctx->gf->nodes[i];
+            if (std::strncmp(node->name, "l_out-", 6) == 0) {
+                state.keep.insert(graph->nodes[i]);
+            }
+        }
+
+        for (int i = n_forward; i < graph->n_nodes; ++i) {
+            ggml_tensor * node = graph->nodes[i];
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                node->src[j] = ggml_opt_recompute_clone(opt_ctx->ctx_compute, node->src[j], state);
+            }
+            if (node->view_src) {
+                node->view_src = ggml_opt_recompute_clone(opt_ctx->ctx_compute, node->view_src, state);
+            }
+        }
+
+        if (state.clones.empty()) {
+            return;
+        }
+
+        ggml_cgraph * reordered = ggml_new_graph_custom(opt_ctx->ctx_compute, graph->size, graph->grads != nullptr);
+        GGML_ASSERT(reordered && "failed to allocate activation checkpoint graph");
+        reordered->separate_backward_target_copies = graph->separate_backward_target_copies;
+        for (int i = 0; i < n_forward; ++i) {
+            ggml_build_forward_expand(reordered, graph->nodes[i]);
+        }
+        for (int i = n_forward; i < graph->n_nodes; ++i) {
+            ggml_build_forward_expand(reordered, graph->nodes[i]);
+        }
+
+        if (graph->grads) {
+            for (size_t i = 0; i < graph->visited_hash_set.size; ++i) {
+                if (!ggml_bitset_get(graph->visited_hash_set.used, i)) {
+                    continue;
+                }
+                ggml_tensor * key = graph->visited_hash_set.keys[i];
+                const size_t new_index = ggml_hash_find(&reordered->visited_hash_set, key);
+                if (new_index == GGML_HASHSET_FULL ||
+                        !ggml_bitset_get(reordered->visited_hash_set.used, new_index)) {
+                    continue;
+                }
+                reordered->grads[new_index] = graph->grads[i];
+                reordered->grad_accs[new_index] = graph->grad_accs[i];
+            }
+        }
+
+        // Remember where each recomputed activation came from. The scheduler
+        // otherwise sees all recompute nodes after the forward graph and may
+        // extend the final forward backend across the entire recompute section.
+        std::unordered_map<ggml_tensor *, int32_t> forward_indices;
+        std::unordered_map<ggml_tensor *, int32_t> reordered_indices;
+        forward_indices.reserve(static_cast<size_t>(n_forward));
+        reordered_indices.reserve(static_cast<size_t>(reordered->n_nodes));
+        for (int i = 0; i < n_forward; ++i) {
+            forward_indices.emplace(graph->nodes[i], i);
+        }
+        for (int i = 0; i < reordered->n_nodes; ++i) {
+            reordered_indices.emplace(reordered->nodes[i], i);
+        }
+        for (const auto & entry : state.clones) {
+            const auto source = forward_indices.find(entry.first);
+            const auto clone = reordered_indices.find(entry.second);
+            GGML_ASSERT(source != forward_indices.end());
+            GGML_ASSERT(clone != reordered_indices.end());
+            opt_ctx->recompute_backend_affinities.emplace_back(source->second, clone->second);
+        }
+
+        // The reordered graph inserts checkpoint clones between the original
+        // forward nodes and backward nodes. Preserve the forward op that
+        // generated each backward node across this reorder.
+        for (int i = n_forward; i < graph->n_nodes; ++i) {
+            ggml_tensor * source = graph->backward_sources ? graph->backward_sources[i] : nullptr;
+            ggml_tensor * target = graph->backward_targets ? graph->backward_targets[i] : nullptr;
+            if (!source && !target) {
+                continue;
+            }
+            const auto node = reordered_indices.find(graph->nodes[i]);
+            GGML_ASSERT(node != reordered_indices.end());
+            reordered->backward_sources[node->second] = source;
+            reordered->backward_targets[node->second] = target;
+        }
+
+        ggml_graph_clear(graph);
+        ggml_graph_cpy(reordered, graph);
+    }
+
+    static ggml_tensor * ggml_opt_clone_tensor_for_sched(
+            ggml_context * ctx,
+            ggml_tensor * tensor,
+            std::unordered_map<ggml_tensor *, ggml_tensor *> & clones) {
+        if (!tensor) {
+            return nullptr;
+        }
+
+        const auto found = clones.find(tensor);
+        if (found != clones.end()) {
+            return found->second;
+        }
+
+        ggml_tensor * clone = ggml_dup_tensor(ctx, tensor);
+        clones.emplace(tensor, clone);
+
+        // The forward placement probe must retain real preallocated leaves
+        // (weights and explicit inputs), but not buffers attached to computed
+        // nodes by a previous graph allocation. Such output buffers are stale
+        // placement hints: the actual training graph must be free to schedule
+        // those activations from their weight/input dependencies.
+        const bool preallocated_leaf = tensor->op == GGML_OP_NONE && tensor->buffer;
+        if (preallocated_leaf) {
+            clone->buffer = tensor->buffer;
+            clone->data   = tensor->data;
+            clone->extra  = tensor->extra;
+        }
+        clone->op     = tensor->op;
+        clone->flags  = tensor->flags;
+        clone->view_offs = tensor->view_offs;
+        memcpy(clone->nb, tensor->nb, sizeof(tensor->nb));
+        memcpy(clone->op_params, tensor->op_params, sizeof(tensor->op_params));
+        ggml_set_name(clone, tensor->name);
+
+        clone->view_src = ggml_opt_clone_tensor_for_sched(ctx, tensor->view_src, clones);
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            clone->src[i] = ggml_opt_clone_tensor_for_sched(ctx, tensor->src[i], clones);
+        }
+
+        return clone;
+    }
+
+    static ggml_cgraph * ggml_opt_clone_graph_for_sched(
+            ggml_context * ctx,
+            ggml_cgraph * graph,
+            std::unordered_map<ggml_tensor *, ggml_tensor *> & clones) {
+        ggml_cgraph * clone = ggml_new_graph_custom(ctx, graph->size, /* grads = */ false);
+        // Preserve standalone graph leaves as well as node dependencies. Some
+        // graphs intentionally retain inputs that are not consumed by any node
+        // (for example, to keep scheduler graph inputs stable across batches).
+        // Cloning nodes alone would omit those leaves from the probe graph and
+        // leave them without an entry in the tensor clone map.
+        for (int i = 0; i < graph->n_leafs; ++i) {
+            ggml_tensor * leaf = ggml_opt_clone_tensor_for_sched(ctx, graph->leafs[i], clones);
+            ggml_build_forward_expand(clone, leaf);
+        }
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            ggml_tensor * node = ggml_opt_clone_tensor_for_sched(ctx, graph->nodes[i], clones);
+            ggml_build_forward_expand(clone, node);
+        }
+
+        GGML_ASSERT(clone->n_leafs == graph->n_leafs);
+        GGML_ASSERT(clone->n_nodes == graph->n_nodes);
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            GGML_ASSERT(clone->nodes[i] == clones.at(graph->nodes[i]));
+        }
+        return clone;
+    }
+
+    static void ggml_opt_log_sched_buffers(ggml_opt_context_t opt_ctx, const char * graph_name) {
+        if (!opt_ctx->activation_checkpointing) {
+            return;
+        }
+        bool & logged = strcmp(graph_name, "optimizer-update") == 0
+            ? opt_ctx->checkpoint_optimizer_buffer_logged
+            : opt_ctx->checkpoint_forward_buffer_logged;
+        if (logged) return;
+        for (int i = 0; i < ggml_backend_sched_get_n_backends(opt_ctx->backend_sched); ++i) {
+            ggml_backend_t backend = ggml_backend_sched_get_backend(opt_ctx->backend_sched, i);
+            const size_t size = ggml_backend_sched_get_buffer_size(opt_ctx->backend_sched, backend);
+            GGML_LOG_WARN("%s: AC-DIAG graph=%s backend[%d]=%s scheduler_buffer=%zu MiB\n",
+                __func__, graph_name, i, ggml_backend_name(backend), size / (1024 * 1024));
+        }
+        logged = true;
+    }
+
+    static void ggml_opt_log_checkpoint_placement(ggml_opt_context_t opt_ctx, ggml_cgraph * graph) {
+        if (!opt_ctx->activation_checkpointing ||
+                opt_ctx->checkpoint_diagnostics_logged || graph != opt_ctx->gb_grad) {
+            return;
+        }
+
+        struct backend_stats {
+            size_t forward_nodes = 0;
+            size_t forward_bytes = 0;
+            size_t recompute_nodes = 0;
+            size_t recompute_bytes = 0;
+            size_t backward_nodes = 0;
+            size_t backward_bytes = 0;
+            size_t parameter_tensors = 0;
+            size_t parameter_bytes = 0;
+            size_t incoming_copy_tensors = 0;
+            size_t incoming_copy_bytes = 0;
+            size_t target_gradient_outputs = 0;
+            size_t target_gradient_bytes = 0;
+        };
+        const int n_backends = ggml_backend_sched_get_n_backends(opt_ctx->backend_sched);
+        std::vector<backend_stats> stats(static_cast<size_t>(n_backends));
+        auto backend_index = [&](ggml_tensor * tensor) -> int {
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(opt_ctx->backend_sched, tensor);
+            if (!backend) return -1;
+            for (int i = 0; i < n_backends; ++i) {
+                if (ggml_backend_sched_get_backend(opt_ctx->backend_sched, i) == backend) return i;
+            }
+            return -1;
+        };
+
+        for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
+            ggml_tensor * tensor = opt_ctx->gf->nodes[i];
+            const int b = backend_index(tensor);
+            if (b >= 0) {
+                stats[b].forward_nodes++;
+                if (tensor->op != GGML_OP_VIEW && tensor->op != GGML_OP_RESHAPE &&
+                        tensor->op != GGML_OP_PERMUTE && tensor->op != GGML_OP_TRANSPOSE) {
+                    stats[b].forward_bytes += ggml_nbytes(tensor);
+                }
+            }
+        }
+
+        std::unordered_set<int32_t> recompute_indices;
+        recompute_indices.reserve(opt_ctx->recompute_backend_affinities.size());
+        for (const auto & affinity : opt_ctx->recompute_backend_affinities) {
+            if (affinity.second < 0 || affinity.second >= graph->n_nodes) continue;
+            recompute_indices.insert(affinity.second);
+            ggml_tensor * tensor = graph->nodes[affinity.second];
+            const int b = backend_index(tensor);
+            if (b >= 0) {
+                stats[b].recompute_nodes++;
+                if (tensor->op != GGML_OP_VIEW && tensor->op != GGML_OP_RESHAPE &&
+                        tensor->op != GGML_OP_PERMUTE && tensor->op != GGML_OP_TRANSPOSE) {
+                    stats[b].recompute_bytes += ggml_nbytes(tensor);
+                }
+            }
+        }
+
+        // The previous diagnostic only counted the original forward nodes and
+        // their checkpoint clones. The remainder of gb_grad contains the actual
+        // backward/gradient-accumulation work. This is a
+        // substantial part of the graph and must be reported separately.
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            if (i < opt_ctx->gf->n_nodes || recompute_indices.count(i) != 0) {
+                continue;
+            }
+            ggml_tensor * tensor = graph->nodes[i];
+            const int b = backend_index(tensor);
+            if (b >= 0) {
+                stats[b].backward_nodes++;
+                if (tensor->op != GGML_OP_VIEW && tensor->op != GGML_OP_RESHAPE &&
+                        tensor->op != GGML_OP_PERMUTE && tensor->op != GGML_OP_TRANSPOSE) {
+                    stats[b].backward_bytes += ggml_nbytes(tensor);
+                }
+            }
+        }
+
+        // Count gradient roots and explicit gradient-transfer nodes placed
+        // on the backend owning the forward tensor they differentiate.
+        for (int i = opt_ctx->gf->n_nodes; i < graph->n_nodes; ++i) {
+            ggml_tensor * node = graph->nodes[i];
+            ggml_tensor * target = graph->backward_targets ? graph->backward_targets[i] : nullptr;
+            if (!target) {
+                continue;
+            }
+            const bool is_gradient_root = ggml_graph_get_grad(graph, target) == node;
+            const bool is_gradient_transfer = node->op == GGML_OP_CONT;
+            const bool is_gradient_accumulation = is_gradient_root &&
+                (node->op == GGML_OP_ADD ||
+                 node->op == GGML_OP_ACC || node->op == GGML_OP_SUB || node->op == GGML_OP_SCALE);
+            if (!is_gradient_transfer && !is_gradient_accumulation) {
+                continue;
+            }
+            const int b = backend_index(node);
+            if (b >= 0) {
+                stats[b].target_gradient_outputs++;
+                stats[b].target_gradient_bytes += ggml_nbytes(node);
+            }
+        }
+
+        // ggml_backend_sched_split_graph() inserts copy tensors into src[] at
+        // backend boundaries. These copies are not graph nodes, but they do
+        // consume memory in the receiving backend's scheduler buffer.
+        // Count unique inserted copies by their destination backend.
+        std::unordered_set<ggml_tensor *> graph_tensors;
+        graph_tensors.reserve(static_cast<size_t>(graph->n_nodes + graph->n_leafs));
+        for (int i = 0; i < graph->n_nodes; ++i) graph_tensors.insert(graph->nodes[i]);
+        for (int i = 0; i < graph->n_leafs; ++i) graph_tensors.insert(graph->leafs[i]);
+        std::unordered_set<ggml_tensor *> counted_copies;
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            ggml_tensor * node = graph->nodes[i];
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                ggml_tensor * src = node->src[j];
+                if (!src || graph_tensors.count(src) != 0 || !counted_copies.insert(src).second) {
+                    continue;
+                }
+                const int b = backend_index(src);
+                if (b >= 0) {
+                    stats[b].incoming_copy_tensors++;
+                    stats[b].incoming_copy_bytes += ggml_nbytes(src);
+                }
+            }
+        }
+
+        auto add_parameter = [&](ggml_tensor * tensor) {
+            if (!(tensor->flags & GGML_TENSOR_FLAG_PARAM)) return;
+            const int b = backend_index(tensor);
+            if (b >= 0) {
+                stats[b].parameter_tensors++;
+                stats[b].parameter_bytes += ggml_nbytes(tensor);
+            }
+        };
+        for (int i = 0; i < opt_ctx->gf->n_leafs; ++i) add_parameter(opt_ctx->gf->leafs[i]);
+        for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) add_parameter(opt_ctx->gf->nodes[i]);
+
+        GGML_LOG_WARN("%s: AC-DIAG placement summary opt_period=%d graph_nodes=%d forward_nodes=%d recompute_pairs=%zu backward_other_nodes=%d scheduler_splits=%d\n",
+            __func__, opt_ctx->opt_period, graph->n_nodes, opt_ctx->gf->n_nodes,
+            opt_ctx->recompute_backend_affinities.size(),
+            graph->n_nodes - opt_ctx->gf->n_nodes - static_cast<int>(recompute_indices.size()),
+            ggml_backend_sched_get_n_splits(opt_ctx->backend_sched));
+        for (int i = 0; i < n_backends; ++i) {
+            ggml_backend_t backend = ggml_backend_sched_get_backend(opt_ctx->backend_sched, i);
+            const size_t sched_size = ggml_backend_sched_get_buffer_size(opt_ctx->backend_sched, backend);
+            GGML_LOG_WARN("%s: AC-DIAG backend[%d]=%s forward_ops=%zu/%zuMiB recompute_ops=%zu/%zuMiB backward_ops=%zu/%zuMiB grad_outputs=%zu/%zuMiB params=%zu/%zuMiB incoming_copies=%zu/%zuMiB scheduler_buffer=%zuMiB\n",
+                __func__, i, ggml_backend_name(backend),
+                stats[i].forward_nodes, stats[i].forward_bytes / (1024 * 1024),
+                stats[i].recompute_nodes, stats[i].recompute_bytes / (1024 * 1024),
+                stats[i].backward_nodes, stats[i].backward_bytes / (1024 * 1024),
+                stats[i].target_gradient_outputs, stats[i].target_gradient_bytes / (1024 * 1024),
+                stats[i].parameter_tensors, stats[i].parameter_bytes / (1024 * 1024),
+                stats[i].incoming_copy_tensors, stats[i].incoming_copy_bytes / (1024 * 1024),
+                sched_size / (1024 * 1024));
+        }
+
+        size_t mismatches = 0;
+        for (const auto & assignment : opt_ctx->checkpoint_backend_assignments) {
+            if (ggml_backend_sched_get_tensor_backend(opt_ctx->backend_sched, assignment.first) != assignment.second) {
+                ++mismatches;
+            }
+        }
+        GGML_LOG_WARN("%s: AC-DIAG pinned_tensors=%zu backend_mismatches=%zu\n",
+            __func__, opt_ctx->checkpoint_backend_assignments.size(), mismatches);
+        opt_ctx->checkpoint_diagnostics_logged = true;
+    }
+
+    static void ggml_opt_set_recompute_backend_affinities(
+            ggml_opt_context_t opt_ctx,
+            ggml_cgraph * graph) {
+        opt_ctx->checkpoint_backend_assignments.clear();
+        if (opt_ctx->static_graphs || graph != opt_ctx->gb_grad ||
+                !opt_ctx->activation_checkpointing) {
+            return;
+        }
+
+        // Determine the model's normal layer placement from the forward graph
+        // alone. Probing gb_grad is not suitable: it contains the entire
+        // backward graph and persistent gradient-accumulator
+        // leaves. Because the scheduler expands assignments across adjacent
+        // nodes, those extra nodes can shift the original forward placement and
+        // the appended recompute section together onto one GPU.
+        //
+        // Clone gf before splitting it. ggml_backend_sched_split_graph mutates
+        // node->src[] when inserting cross-backend copies, while gf and gb_grad
+        // share their tensor objects.
+        const size_t n_tensors = opt_ctx->gf->visited_hash_set.size + 8;
+        const size_t mem_size = n_tensors * ggml_tensor_overhead() +
+            ggml_graph_overhead_custom(opt_ctx->gf->size, /* grads = */ false) + 1024;
+        ggml_init_params params = { mem_size, nullptr, true };
+        ggml_context * ctx_probe = ggml_init(params);
+        GGML_ASSERT(ctx_probe != nullptr);
+
+        std::unordered_map<ggml_tensor *, ggml_tensor *> probe_tensors;
+        probe_tensors.reserve(opt_ctx->gf->visited_hash_set.size);
+        ggml_cgraph * graph_probe = ggml_opt_clone_graph_for_sched(ctx_probe, opt_ctx->gf, probe_tensors);
+
+        ggml_backend_sched_split_graph(opt_ctx->backend_sched, graph_probe);
+
+        auto record_forward_assignment = [&](ggml_tensor * tensor) {
+            const auto it = probe_tensors.find(tensor);
+            GGML_ASSERT(it != probe_tensors.end());
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(opt_ctx->backend_sched, it->second);
+            GGML_ASSERT(backend != nullptr && "scheduler did not assign a backend to a forward tensor");
+            opt_ctx->checkpoint_backend_assignments.emplace_back(tensor, backend);
+        };
+
+        // Pin every original forward node and leaf to the placement selected
+        // for the ordinary forward graph. This prevents backward-graph nodes
+        // and accumulated-gradient leaves from changing the model's layer
+        // distribution when the full graph is scheduled.
+        for (int i = 0; i < opt_ctx->gf->n_leafs; ++i) {
+            record_forward_assignment(opt_ctx->gf->leafs[i]);
+        }
+        for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
+            record_forward_assignment(opt_ctx->gf->nodes[i]);
+        }
+
+        // Keep each backward operation beside the forward operation whose
+        // derivative it computes. Otherwise the scheduler has no layer-level
+        // affinity for backward nodes and can cluster their temporary buffers
+        // on a different GPU from the corresponding forward layer.
+        for (int i = opt_ctx->gf->n_nodes; i < graph->n_nodes; ++i) {
+            ggml_tensor * node = graph->nodes[i];
+            ggml_tensor * target = graph->backward_targets ? graph->backward_targets[i] : nullptr;
+
+            // MUL_MAT_ID backward computes the activation gradient next to the
+            // expert weights. Its final CONT node transfers that gradient to
+            // the backend that owns the preceding layer's activation.
+            const bool is_gradient_root = target && ggml_graph_get_grad(graph, target) == node;
+            const bool is_gradient_transfer = target && node->op == GGML_OP_CONT;
+            const bool is_gradient_accumulation = is_gradient_root &&
+                (node->op == GGML_OP_ADD ||
+                 node->op == GGML_OP_ACC || node->op == GGML_OP_SUB || node->op == GGML_OP_SCALE);
+            if (is_gradient_transfer || is_gradient_accumulation) {
+                const auto it_target = probe_tensors.find(target);
+                if (it_target != probe_tensors.end()) {
+                    ggml_backend_t target_backend = ggml_backend_sched_get_tensor_backend(opt_ctx->backend_sched, it_target->second);
+                    if (target_backend && ggml_backend_supports_op(target_backend, node)) {
+                        opt_ctx->checkpoint_backend_assignments.emplace_back(node, target_backend);
+                        continue;
+                    }
+                }
+            }
+
+            // Keep derivative computation beside the forward op whose
+            // derivative it computes. This keeps weight-dependent work near
+            // the expert weights while the CONT output is placed separately.
+            ggml_tensor * source = graph->backward_sources ? graph->backward_sources[i] : nullptr;
+            if (!source) {
+                continue;
+            }
+            const auto it = probe_tensors.find(source);
+            if (it == probe_tensors.end()) {
+                continue;
+            }
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(opt_ctx->backend_sched, it->second);
+            if (backend && ggml_backend_supports_op(backend, node)) {
+                opt_ctx->checkpoint_backend_assignments.emplace_back(node, backend);
+            }
+        }
+
+        // Each checkpoint recomputation must run on the same backend as the
+        // original forward operation which produced its activation.
+        for (const auto & affinity : opt_ctx->recompute_backend_affinities) {
+            GGML_ASSERT(affinity.first >= 0 && affinity.first < opt_ctx->gf->n_nodes);
+            GGML_ASSERT(affinity.second >= opt_ctx->gf->n_nodes && affinity.second < graph->n_nodes);
+            ggml_tensor * source_node = opt_ctx->gf->nodes[affinity.first];
+            const auto it = probe_tensors.find(source_node);
+            GGML_ASSERT(it != probe_tensors.end());
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(opt_ctx->backend_sched, it->second);
+            GGML_ASSERT(backend != nullptr);
+            opt_ctx->checkpoint_backend_assignments.emplace_back(graph->nodes[affinity.second], backend);
+        }
+
+        // Clear probe state and apply the forward, backward, and recompute
+        // affinities to the real graph. Backward ops unsupported by their
+        // forward backend are left to the scheduler.
+        ggml_backend_sched_reset(opt_ctx->backend_sched);
+        for (const auto & assignment : opt_ctx->checkpoint_backend_assignments) {
+            ggml_backend_sched_set_tensor_backend(
+                opt_ctx->backend_sched, assignment.first, assignment.second);
+        }
+        ggml_free(ctx_probe);
+    }
+
+
+}
 
 // ====== Dataset ======
 
@@ -119,6 +693,61 @@ ggml_opt_dataset_t ggml_opt_dataset_init(
         result->nbs_labels = 0;
     }
 
+    result->weights = nullptr;
+    result->nbs_weights = 0;
+
+    result->buf = ggml_backend_alloc_ctx_tensors_from_buft(result->ctx, ggml_backend_cpu_buffer_type());
+
+    const int64_t nshards = ndata/ndata_shard;
+    result->permutation.resize(nshards);
+    for (int64_t i = 0; i < nshards; ++i) {
+        result->permutation[i] = i;
+    }
+    return result;
+}
+
+ggml_opt_dataset_t ggml_opt_dataset_init_with_weights(
+        enum ggml_type type_data,
+        enum ggml_type type_label,
+        enum ggml_type type_weights,
+        int64_t        ne_datapoint,
+        int64_t        ne_label,
+        int64_t        ne_weights,
+        int64_t        ndata,
+        int64_t        ndata_shard) {
+    GGML_ASSERT(ne_datapoint >  0);
+    GGML_ASSERT(ne_label     >= 0);
+    GGML_ASSERT(ne_weights   >  0);
+    GGML_ASSERT(ndata        >  0);
+    GGML_ASSERT(ndata_shard  >  0);
+
+    ggml_opt_dataset_t result = new ggml_opt_dataset;
+    result->ndata       = ndata;
+    result->ndata_shard = ndata_shard;
+
+    {
+        struct ggml_init_params params = {
+             3*ggml_tensor_overhead(),
+             nullptr,
+             true,
+        };
+        result->ctx = ggml_init(params);
+    }
+
+    result->data = ggml_new_tensor_2d(result->ctx, type_data, ne_datapoint, ndata);
+    result->nbs_data = ggml_nbytes(result->data) * ndata_shard/ndata;
+
+    if (ne_label > 0) {
+        result->labels = ggml_new_tensor_2d(result->ctx, type_label, ne_label, ndata);
+        result->nbs_labels = ggml_nbytes(result->labels) * ndata_shard/ndata;
+    } else {
+        result->labels = nullptr;
+        result->nbs_labels = 0;
+    }
+
+    result->weights = ggml_new_tensor_2d(result->ctx, type_weights, ne_weights, ndata);
+    result->nbs_weights = ggml_nbytes(result->weights) * ndata_shard/ndata;
+
     result->buf = ggml_backend_alloc_ctx_tensors_from_buft(result->ctx, ggml_backend_cpu_buffer_type());
 
     const int64_t nshards = ndata/ndata_shard;
@@ -139,12 +768,44 @@ int64_t ggml_opt_dataset_ndata(ggml_opt_dataset_t dataset) {
     return dataset->ndata;
 }
 
+int64_t ggml_opt_dataset_permutation_size(ggml_opt_dataset_t dataset) {
+    return static_cast<int64_t>(dataset->permutation.size());
+}
+
+bool ggml_opt_dataset_get_permutation(ggml_opt_dataset_t dataset, int64_t * permutation, int64_t size) {
+    if (!dataset || !permutation || size != static_cast<int64_t>(dataset->permutation.size())) {
+        return false;
+    }
+    std::copy(dataset->permutation.begin(), dataset->permutation.end(), permutation);
+    return true;
+}
+
+bool ggml_opt_dataset_set_permutation(ggml_opt_dataset_t dataset, const int64_t * permutation, int64_t size) {
+    if (!dataset || !permutation || size != static_cast<int64_t>(dataset->permutation.size())) {
+        return false;
+    }
+    std::vector<bool> seen(static_cast<size_t>(size), false);
+    for (int64_t i = 0; i < size; ++i) {
+        const int64_t value = permutation[i];
+        if (value < 0 || value >= size || seen[static_cast<size_t>(value)]) {
+            return false;
+        }
+        seen[static_cast<size_t>(value)] = true;
+    }
+    std::copy(permutation, permutation + size, dataset->permutation.begin());
+    return true;
+}
+
 struct ggml_tensor * ggml_opt_dataset_data(ggml_opt_dataset_t dataset) {
     return dataset->data;
 }
 
 struct ggml_tensor * ggml_opt_dataset_labels(ggml_opt_dataset_t dataset) {
     return dataset->labels;
+}
+
+struct ggml_tensor * ggml_opt_dataset_weights(ggml_opt_dataset_t dataset) {
+    return dataset->weights;
 }
 
 void ggml_opt_dataset_shuffle(ggml_opt_context_t opt_ctx, ggml_opt_dataset_t dataset, int64_t idata) {
@@ -218,6 +879,57 @@ void ggml_opt_dataset_get_batch_host(ggml_opt_dataset_t dataset, void * data_bat
     }
 }
 
+static void ggml_opt_dataset_get_weights_batch(
+        ggml_opt_dataset_t dataset,
+        struct ggml_tensor * data_batch,
+        struct ggml_tensor * weights_batch,
+        int64_t ibatch) {
+    GGML_ASSERT(dataset->weights != nullptr);
+    GGML_ASSERT(data_batch && ggml_is_contiguous(data_batch));
+    GGML_ASSERT(weights_batch && ggml_is_contiguous(weights_batch));
+    GGML_ASSERT(dataset->weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(dataset->weights->ne[0] == 1 && dataset->weights->ne[1] == dataset->ndata &&
+        "sparse cross entropy expects one weight per datapoint");
+    GGML_ASSERT(weights_batch->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_nelements(weights_batch) > 0);
+
+    const size_t nb_data_batch = ggml_nbytes(data_batch);
+    GGML_ASSERT(nb_data_batch % dataset->nbs_data == 0);
+    const int64_t shards_per_batch = nb_data_batch / dataset->nbs_data;
+    GGML_ASSERT(ggml_nbytes(weights_batch) == (size_t) shards_per_batch * dataset->nbs_weights);
+    GGML_ASSERT((ibatch + 1) * shards_per_batch <= (int64_t) dataset->permutation.size());
+
+    for (int64_t i = 0; i < shards_per_batch; ++i) {
+        const int64_t shard = dataset->permutation[ibatch * shards_per_batch + i];
+        const char * src = (const char *) dataset->weights->data + shard * dataset->nbs_weights;
+        ggml_backend_tensor_set(weights_batch, src, i * dataset->nbs_weights, dataset->nbs_weights);
+    }
+}
+
+void ggml_opt_dataset_get_batch_host_with_weights(
+        ggml_opt_dataset_t dataset,
+        void * data_batch,
+        size_t nb_data_batch,
+        void * labels_batch,
+        void * weights_batch,
+        size_t nb_weights_batch,
+        int64_t ibatch) {
+    GGML_ASSERT(dataset->weights != nullptr);
+    GGML_ASSERT(weights_batch != nullptr);
+    GGML_ASSERT(nb_data_batch % dataset->nbs_data == 0);
+
+    ggml_opt_dataset_get_batch_host(dataset, data_batch, nb_data_batch, labels_batch, ibatch);
+
+    const int64_t shards_per_batch = nb_data_batch / dataset->nbs_data;
+    GGML_ASSERT(nb_weights_batch == shards_per_batch*dataset->nbs_weights);
+    for (int64_t ishard_batch = 0; ishard_batch < shards_per_batch; ++ishard_batch) {
+        const int64_t ishard = dataset->permutation[ibatch*shards_per_batch + ishard_batch];
+        const char * ptr_weights = (const char *) dataset->weights->data + ishard*dataset->nbs_weights;
+        char * ptr_weights_batch = (char *) weights_batch + ishard_batch*dataset->nbs_weights;
+        memcpy(ptr_weights_batch, ptr_weights, dataset->nbs_weights);
+    }
+}
+
 // ====== Model / Context ======
 
 struct ggml_opt_optimizer_params ggml_opt_get_default_optimizer_params(void * userdata) {
@@ -225,7 +937,7 @@ struct ggml_opt_optimizer_params ggml_opt_get_default_optimizer_params(void * us
 
     ggml_opt_optimizer_params result;
 
-    result.adamw.alpha = 0.001f;
+    result.adamw.alpha = 5e-5f;
     result.adamw.beta1 = 0.9f;
     result.adamw.beta2 = 0.999f;
     result.adamw.eps   = 1e-8f;
@@ -256,6 +968,7 @@ struct ggml_opt_params ggml_opt_default_params(
         /*get_opt_pars    =*/ ggml_opt_get_default_optimizer_params,
         /*get_opt_pars_ud =*/ nullptr,
         /*optimizer       =*/ GGML_OPT_OPTIMIZER_TYPE_ADAMW,
+         GGML_TYPE_F32,
     };
 }
 
@@ -294,6 +1007,7 @@ static ggml_cgraph * dup_graph(ggml_context * ctx, ggml_cgraph * src) {
     std::map<ggml_tensor *, ggml_tensor *> tensor_map;
 
     ggml_cgraph * dst = ggml_new_graph_custom(ctx, src->size, /*grads =*/ true);
+    dst->separate_backward_target_copies = src->separate_backward_target_copies;
 
     for (int i = 0; i < src->n_leafs; i++) {
         ggml_build_forward_expand(dst, map_tensor(tensor_map, ctx, src->leafs[i]));
@@ -303,6 +1017,10 @@ static ggml_cgraph * dup_graph(ggml_context * ctx, ggml_cgraph * src) {
         ggml_build_forward_expand(dst, map_tensor(tensor_map, ctx, src->nodes[i]));
     }
     GGML_ASSERT(dst->n_nodes == src->n_nodes);
+    for (int i = 0; i < src->n_nodes; ++i) {
+        dst->backward_sources[i] = src->backward_sources ? src->backward_sources[i] : nullptr;
+        dst->backward_targets[i] = src->backward_targets ? src->backward_targets[i] : nullptr;
+    }
     for (int i = 0; i < src->n_nodes; ++i) {
         const size_t igrad_src = ggml_hash_find(&src->visited_hash_set, src->nodes[i]);
         const size_t igrad_dst = ggml_hash_find(&dst->visited_hash_set, dst->nodes[i]);
@@ -325,8 +1043,12 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
 
     const enum ggml_opt_optimizer_type optimizer = opt_ctx->optimizer;
 
-    const bool accumulate = opt_ctx->build_type_alloc >= GGML_OPT_BUILD_TYPE_GRAD &&
-        !(opt_ctx->static_graphs && opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT && opt_ctx->opt_period == 1);
+    // With activation checkpointing, keep the optimizer update in a separate
+    // graph even for opt_period == 1. Otherwise all parameter gradients remain
+    // live while the optimizer nodes are appended to the backward graph,
+    // increasing the peak scheduler buffer for the checkpointed graph.
+    const bool use_grad_accumulators = opt_ctx->build_type_alloc >= GGML_OPT_BUILD_TYPE_GRAD &&
+        (opt_ctx->opt_period > 1 || (!opt_ctx->static_graphs && opt_ctx->activation_checkpointing));
 
     const bool need_momenta = opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT &&
         opt_ctx->optimizer == GGML_OPT_OPTIMIZER_TYPE_ADAMW;
@@ -334,27 +1056,23 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     ggml_set_input(opt_ctx->inputs);
     ggml_set_output(opt_ctx->outputs);
 
-    int n_param = 0;
     for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
         const struct ggml_tensor * node = opt_ctx->gf->nodes[i];
-        if (node->flags & GGML_TENSOR_FLAG_PARAM) {
-            n_param++;
-        }
         GGML_ASSERT(!(node->flags & GGML_TENSOR_FLAG_LOSS) && "support for extra loss terms not implemented");
     }
 
     if (!opt_ctx->ctx_static) {
         // The static context is used for:
-        //   - gradients (1 per loss, 1 tensor per param if using gradient accumulation)
-        //   - optimizer momenta (2 tensors per param)
+        //   - the loss gradient accumulator
         //   - labels (if using static graphs)
         //   - loss (if using static graphs, up to 5 tensors)
         //   - pred (if using static graphs)
         //   - ncorrect (if using static graphs, 2 tensors).
         constexpr size_t n_loss = 1;
-        const size_t tensors_per_param = (accumulate ? 1 : 0) + (need_momenta ? 2 : 0);
-        const size_t tensors_const = opt_ctx->static_graphs ? 9 : 0;
-        const size_t size_meta = (n_loss + tensors_per_param*n_param + tensors_const) * ggml_tensor_overhead();
+        const size_t tensors_const = opt_ctx->static_graphs ?
+            9 + (opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY ? 11 :
+                 opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_SPARSE_CROSS_ENTROPY ? 13 : 0) : 0;
+        const size_t size_meta = (n_loss + tensors_const) * ggml_tensor_overhead();
         struct ggml_init_params params = {
             /*.mem_size   =*/ size_meta,
             /*.mem_buffer =*/ nullptr,
@@ -412,6 +1130,26 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             opt_ctx->loss_per_datapoint = true;
             break;
         }
+        case GGML_OPT_LOSS_TYPE_SPARSE_CROSS_ENTROPY: {
+            const int64_t nrows = ggml_nrows(opt_ctx->outputs);
+            opt_ctx->labels_sparse = ggml_new_tensor_1d(ctx_results, GGML_TYPE_I32, nrows);
+            ggml_set_input(opt_ctx->labels_sparse);
+            ggml_set_name(opt_ctx->labels_sparse, "labels_sparse");
+
+            opt_ctx->label_weights = ggml_new_tensor_1d(ctx_results, GGML_TYPE_F32, nrows);
+            ggml_set_input(opt_ctx->label_weights);
+            ggml_set_name(opt_ctx->label_weights, "label_weights");
+
+            opt_ctx->loss = ggml_cross_entropy_loss_sparse(
+                ctx_results, opt_ctx->outputs, opt_ctx->labels_sparse, opt_ctx->label_weights);
+            ggml_set_name(opt_ctx->loss, "loss_cross_entropy_sparse");
+            if (opt_ctx->opt_period > 1) {
+                opt_ctx->loss = ggml_scale(ctx_results, opt_ctx->loss, 1.0f / opt_ctx->opt_period);
+                ggml_set_name(opt_ctx->loss, "loss_cross_entropy_sparse_scaled");
+            }
+            opt_ctx->loss_per_datapoint = true;
+            break;
+        }
         case GGML_OPT_LOSS_TYPE_MEAN_SQUARED_ERROR: {
             opt_ctx->labels = ggml_dup_tensor(ctx_results, opt_ctx->outputs);
             ggml_set_input(opt_ctx->labels);
@@ -433,16 +1171,49 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     ggml_set_loss(opt_ctx->loss);
     ggml_build_forward_expand(opt_ctx->gf, opt_ctx->loss);
 
-    if (opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY) {
+    if (opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY ||
+            opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_SPARSE_CROSS_ENTROPY) {
         opt_ctx->pred = ggml_argmax(ctx_results, opt_ctx->outputs);
         ggml_set_name(opt_ctx->pred, "pred");
         ggml_set_output(opt_ctx->pred);
         ggml_build_forward_expand(opt_ctx->gf, opt_ctx->pred);
 
-        opt_ctx->ncorrect = ggml_count_equal(ctx_results, opt_ctx->pred, ggml_argmax(ctx_results, opt_ctx->labels));
+        ggml_tensor * labels_valid;
+        ggml_tensor * label_ids;
+        if (opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY) {
+            ggml_tensor * labels_sum = ggml_sum_rows(ctx_results, opt_ctx->labels);
+            labels_valid = ggml_step(ctx_results, ggml_abs(ctx_results, labels_sum));
+            labels_valid = ggml_reshape_1d(ctx_results, labels_valid, ggml_nelements(opt_ctx->pred));
+            label_ids = ggml_argmax(ctx_results, opt_ctx->labels);
+        } else {
+            // A sparse row contributes to accuracy only when it has a valid class ID
+            // and a positive weight. Adding one maps the -1 ignore marker to zero.
+            ggml_tensor * label_ids_f32 = ggml_cast(ctx_results, opt_ctx->labels_sparse, GGML_TYPE_F32);
+            ggml_tensor * label_present = ggml_sgn(ctx_results,
+                ggml_scale_bias(ctx_results, label_ids_f32, 1.0f, 1.0f));
+            ggml_tensor * weight_present = ggml_sgn(ctx_results, opt_ctx->label_weights);
+            labels_valid = ggml_mul(ctx_results, label_present, weight_present);
+            labels_valid = ggml_reshape_1d(ctx_results, labels_valid, ggml_nelements(opt_ctx->pred));
+            label_ids = opt_ctx->labels_sparse;
+        }
+
+        ggml_tensor * labels_invalid = ggml_scale_bias(ctx_results, labels_valid, -1.0f, 1.0f);
+
+        ggml_tensor * pred_masked = ggml_mul(ctx_results,
+            ggml_cast(ctx_results, opt_ctx->pred, GGML_TYPE_F32), labels_valid);
+        pred_masked = ggml_add(ctx_results, pred_masked,
+            ggml_scale(ctx_results, labels_invalid, (float) opt_ctx->outputs->ne[0]));
+        pred_masked = ggml_cast(ctx_results, pred_masked, GGML_TYPE_I32);
+
+        opt_ctx->ncorrect = ggml_count_equal(ctx_results, pred_masked, label_ids);
         ggml_set_name(opt_ctx->ncorrect, "ncorrect");
         ggml_set_output(opt_ctx->ncorrect);
         ggml_build_forward_expand(opt_ctx->gf, opt_ctx->ncorrect);
+
+        opt_ctx->nvalid = ggml_sum(ctx_results, labels_valid);
+        ggml_set_name(opt_ctx->nvalid, "nvalid");
+        ggml_set_output(opt_ctx->nvalid);
+        ggml_build_forward_expand(opt_ctx->gf, opt_ctx->nvalid);
     }
 
     if (opt_ctx->buf_static) {
@@ -460,13 +1231,68 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
 
         const int n_nodes = opt_ctx->gf->n_nodes;
         opt_ctx->grad_accs.resize(n_nodes);
+
+        // Keep the loss accumulator in the static buffer, but allocate parameter
+        // accumulators on the same buffer type as their corresponding parameters.
+        // Group tensors by buffer type to avoid creating one backend allocation per
+        // parameter while preserving the parameter-to-device placement.
+        std::map<ggml_backend_buffer_type_t, std::vector<int>> grad_acc_indices;
+        std::map<std::string, std::pair<size_t, size_t>> param_buffer_stats;
+        auto record_param_buffer = [&](ggml_tensor * tensor) {
+            if (!(tensor->flags & GGML_TENSOR_FLAG_PARAM)) return;
+            const char * name = tensor->buffer ? ggml_backend_buffer_name(tensor->buffer) : "unallocated";
+            auto & stat = param_buffer_stats[name];
+            stat.first++;
+            stat.second += ggml_nbytes(tensor);
+        };
+        for (int i = 0; i < opt_ctx->gf->n_leafs; ++i) record_param_buffer(opt_ctx->gf->leafs[i]);
         for (int i = 0; i < n_nodes; ++i) {
             ggml_tensor * node = opt_ctx->gf->nodes[i];
-            if ((accumulate && (node->flags & GGML_TENSOR_FLAG_PARAM)) || (node->flags & GGML_TENSOR_FLAG_LOSS)) {
-                opt_ctx->grad_accs[i] = ggml_new_tensor(opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
+            record_param_buffer(node);
+            if (node->flags & GGML_TENSOR_FLAG_LOSS) {
+                opt_ctx->grad_accs[i] = ggml_new_tensor(
+                    opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
+            } else if (use_grad_accumulators && (node->flags & GGML_TENSOR_FLAG_PARAM)) {
+                const ggml_backend_buffer_type_t param_buft = node->buffer
+                    ? ggml_backend_buffer_get_type(node->buffer)
+                    : ggml_backend_cpu_buffer_type();
+                grad_acc_indices[param_buft].push_back(i);
+                opt_ctx->grad_accs[i] = nullptr;
             } else {
                 opt_ctx->grad_accs[i] = nullptr;
             }
+        }
+
+        for (const auto & stat : param_buffer_stats) {
+            GGML_LOG_WARN("%s: AC-DIAG trainable_param_buffer=%s tensors=%zu tensor_bytes=%zu MiB\n",
+                __func__, stat.first.c_str(), stat.second.first, stat.second.second / (1024 * 1024));
+        }
+
+        for (const auto & entry : grad_acc_indices) {
+            const ggml_backend_buffer_type_t param_buft = entry.first;
+            const std::vector<int> & indices = entry.second;
+            const size_t size_meta = indices.size() * ggml_tensor_overhead();
+            struct ggml_init_params gparams = { size_meta, nullptr, true };
+            struct ggml_context * gctx = ggml_init(gparams);
+            GGML_ASSERT(gctx != nullptr);
+
+            for (int i : indices) {
+                ggml_tensor * node = opt_ctx->gf->nodes[i];
+                opt_ctx->grad_accs[i] = ggml_new_tensor(
+                    gctx, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
+                ggml_format_name(opt_ctx->grad_accs[i], "grad_acc for %s", node->name);
+            }
+
+            ggml_backend_buffer_t gbuf = ggml_backend_alloc_ctx_tensors_from_buft(gctx, param_buft);
+            GGML_ASSERT(gbuf != nullptr);
+            ggml_backend_buffer_clear(gbuf, 0);
+            size_t tensor_bytes = 0;
+            for (int i : indices) tensor_bytes += ggml_nbytes(opt_ctx->grad_accs[i]);
+            GGML_LOG_WARN("%s: AC-DIAG grad_acc_buffer=%s tensors=%zu tensor_bytes=%zu MiB allocation=%zu MiB\n",
+                __func__, ggml_backend_buffer_name(gbuf), indices.size(),
+                tensor_bytes / (1024 * 1024), ggml_backend_buffer_get_size(gbuf) / (1024 * 1024));
+            opt_ctx->bufs_grad_accs.push_back(gbuf);
+            opt_ctx->ctxs_grad_accs.push_back(gctx);
         }
 
         if (need_momenta && opt_ctx->build_type_alloc >= GGML_OPT_BUILD_TYPE_OPT) {
@@ -475,8 +1301,19 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             for (int i = 0; i < n_nodes; ++i) {
                 ggml_tensor * node = opt_ctx->gf->nodes[i];
                 if (node->flags & GGML_TENSOR_FLAG_PARAM) {
-                    opt_ctx->grad_m[i] = ggml_new_tensor(opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
-                    opt_ctx->grad_v[i] = ggml_new_tensor(opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
+                    ggml_backend_buffer_type_t param_buft = node->buffer
+                        ? ggml_backend_buffer_get_type(node->buffer)
+                        : ggml_backend_cpu_buffer_type();
+
+                    const size_t sz = 2 * ggml_tensor_overhead();
+                    struct ggml_init_params mip = { sz, nullptr, true };
+                    struct ggml_context * mctx = ggml_init(mip);
+                    opt_ctx->grad_m[i] = ggml_new_tensor(mctx, opt_ctx->optimizer_state_type, GGML_MAX_DIMS, node->ne);
+                    opt_ctx->grad_v[i] = ggml_new_tensor(mctx, opt_ctx->optimizer_state_type, GGML_MAX_DIMS, node->ne);
+                    ggml_backend_buffer_t mbuf = ggml_backend_alloc_ctx_tensors_from_buft(mctx, param_buft);
+                    ggml_backend_buffer_clear(mbuf, 0);
+                    opt_ctx->bufs_momenta.push_back(mbuf);
+                    opt_ctx->ctxs_momenta.push_back(mctx);
                 } else {
                     opt_ctx->grad_m[i] = nullptr;
                     opt_ctx->grad_v[i] = nullptr;
@@ -487,7 +1324,10 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
 
     // gb_grad == graph backward gradients, forward pass, then backward pass to calculate gradients.
     opt_ctx->gb_grad = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gf, /*force_grads =*/ true);
+    opt_ctx->gb_grad->separate_backward_target_copies =
+        opt_ctx->activation_checkpointing && !opt_ctx->static_graphs;
     ggml_build_backward_expand(opt_ctx->ctx_compute, opt_ctx->gb_grad, opt_ctx->grad_accs.data());
+    ggml_opt_recompute_checkpoints(opt_ctx);
 
     if (opt_ctx->buf_static) {
         if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_GRAD) {
@@ -500,19 +1340,46 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
 
     GGML_ASSERT(opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT);
 
-    // gb_opt == graph backward optimize, forward pass, then backward pass to calculate gradients, then optimizer step.
-    opt_ctx->gb_opt = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gb_grad, /*force_grads =*/ true);
+    // Static graphs keep a duplicated graph with the optimizer update.
+    // Dynamic graphs with persistent gradient accumulators run the update in
+    // a separate graph. Activation checkpointing also uses this path for a
+    // single microbatch to keep optimizer temporaries out of the large
+    // forward/recompute/backward scheduler allocation.
+    if (opt_ctx->static_graphs) {
+        opt_ctx->gb_opt = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gb_grad, /*force_grads =*/ true);
+    } else if (!use_grad_accumulators) {
+        opt_ctx->gb_opt = nullptr;
+    } else {
+        const int graph_size = std::max(16, 2 * opt_ctx->gf->n_nodes + 16);
+        opt_ctx->gb_opt = ggml_new_graph_custom(opt_ctx->ctx_compute, graph_size, /*grads =*/ false);
+        GGML_ASSERT(opt_ctx->gb_opt && "failed to allocate optimizer update graph");
+    }
 
     opt_ctx->opt_step_params = ggml_new_tensor_1d(opt_ctx->ctx_cpu, GGML_TYPE_F32, need_momenta ? 7 : 2);
     ggml_tensor * adamw_params = opt_ctx->opt_step_params;
     ggml_set_input(adamw_params);
     const char * optimizer_name = ggml_opt_optimizer_name(opt_ctx->optimizer);
     ggml_format_name(adamw_params, "%s_params", optimizer_name);
-    for (int i = opt_ctx->gf->n_nodes-1; i >= 0; --i) {
-        struct ggml_tensor * node = opt_ctx->gb_opt->nodes[i];
-        struct ggml_tensor * grad = ggml_graph_get_grad(opt_ctx->gb_opt, node);
+    ggml_cgraph * optimizer_graph = opt_ctx->static_graphs || use_grad_accumulators
+        ? opt_ctx->gb_opt : opt_ctx->gb_grad;
+    for (int i = opt_ctx->gf->n_nodes - 1; i >= 0; --i) {
+        struct ggml_tensor * node = opt_ctx->static_graphs
+            ? opt_ctx->gb_opt->nodes[i]
+            : opt_ctx->gb_grad->nodes[i];
+        struct ggml_tensor * grad = opt_ctx->static_graphs
+            ? ggml_graph_get_grad(opt_ctx->gb_opt, node)
+            : (use_grad_accumulators
+                ? ggml_graph_get_grad_acc(opt_ctx->gb_grad, node)
+                : ggml_graph_get_grad(opt_ctx->gb_grad, node));
 
         if (grad && (node->flags & GGML_TENSOR_FLAG_PARAM)) {
+            if (opt_ctx->loss_normalizer > 0.0f) {
+                GGML_ASSERT(opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY ||
+                    opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_SPARSE_CROSS_ENTROPY);
+                const float scale = static_cast<float>(
+                    ggml_nrows(opt_ctx->outputs) * opt_ctx->opt_period) / opt_ctx->loss_normalizer;
+                grad = ggml_scale(opt_ctx->ctx_compute, grad, scale);
+            }
             struct ggml_tensor * m = nullptr;
             struct ggml_tensor * v = nullptr;
             if (need_momenta) {
@@ -533,17 +1400,22 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
                     GGML_ABORT("fatal error");
             }
             ggml_format_name(opt_step, "%s step for %s", optimizer_name, node->name);
-            ggml_build_forward_expand(opt_ctx->gb_opt, opt_step);
+            ggml_build_forward_expand(optimizer_graph, opt_step);
         }
     }
 
     if (!opt_ctx->buf_static) {
         opt_ctx->buf_static = ggml_backend_alloc_ctx_tensors(
             opt_ctx->ctx_static, ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0));
-        ggml_graph_reset(opt_ctx->gb_opt);
+        // In dynamic mode the persistent parameter gradient accumulators belong
+        // to gb_grad. Optimizer updates may share that graph when neither gradient
+        // accumulation nor activation checkpointing requires a separate update.
+        ggml_graph_reset(opt_ctx->static_graphs ? opt_ctx->gb_opt : opt_ctx->gb_grad);
     }
 
     opt_ctx->buf_cpu = ggml_backend_alloc_ctx_tensors_from_buft(opt_ctx->ctx_cpu, ggml_backend_cpu_buffer_type());
+    opt_ctx->optimizer_state_ready = true;
+    GGML_ASSERT(ggml_opt_apply_pending_state(opt_ctx) && "failed to restore optimizer state");
 }
 
 ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
@@ -559,6 +1431,10 @@ ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
     result->get_opt_pars     = params.get_opt_pars;
     result->get_opt_pars_ud  = params.get_opt_pars_ud;
     result->optimizer        = params.optimizer;
+    result->optimizer_state_type = params.optimizer_state_type;
+    GGML_ASSERT(result->optimizer_state_type == GGML_TYPE_F32 ||
+                result->optimizer_state_type == GGML_TYPE_F16 ||
+                result->optimizer_state_type == GGML_TYPE_BF16);
 
     GGML_ASSERT(result->opt_period >= 1);
 
@@ -581,12 +1457,460 @@ ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
     return result;
 }
 
+namespace {
+
+struct ggml_opt_state_tensor {
+    std::string name;
+    enum ggml_type type = GGML_TYPE_COUNT;
+    int64_t ne[GGML_MAX_DIMS] = {};
+    std::vector<uint8_t> data;
+};
+
+struct ggml_opt_state_data {
+    uint32_t version = 0;
+    enum ggml_opt_optimizer_type optimizer = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
+    enum ggml_type optimizer_state_type = GGML_TYPE_F32;
+    uint64_t iter = 1;
+    std::string rng;
+    std::vector<ggml_opt_state_tensor> tensors;
+};
+
+constexpr char GGML_OPT_STATE_MAGIC[8] = {'G', 'G', 'O', 'P', 'T', 'S', 'T', '1'};
+constexpr uint32_t GGML_OPT_STATE_VERSION = 2;
+
+struct opt_state_reader {
+    const uint8_t * data = nullptr;
+    size_t size = 0;
+    size_t pos = 0;
+
+    template<typename T>
+    bool read_int(T & value) {
+        static_assert(std::is_integral<T>::value, "integer type required");
+        if (pos > size || size - pos < sizeof(T)) return false;
+        uint64_t result = 0;
+        for (size_t i = 0; i < sizeof(T); ++i) {
+            result |= static_cast<uint64_t>(data[pos++]) << (i * 8);
+        }
+        value = static_cast<T>(result);
+        return true;
+    }
+
+    bool read_string(std::string & value, size_t len) {
+        if (pos > size || size - pos < len) return false;
+        value.assign(reinterpret_cast<const char *>(data + pos), len);
+        pos += len;
+        return true;
+    }
+
+    bool read_view(const uint8_t *& value, size_t len) {
+        if (pos > size || size - pos < len) return false;
+        value = data + pos;
+        pos += len;
+        return true;
+    }
+
+    bool skip_bytes(size_t len) {
+        if (pos > size || size - pos < len) return false;
+        pos += len;
+        return true;
+    }
+
+    bool read_bytes(std::vector<uint8_t> & value, size_t len) {
+        const uint8_t * bytes = nullptr;
+        if (!read_view(bytes, len)) return false;
+        value.assign(bytes, bytes + len);
+        return true;
+    }
+};
+
+bool ggml_opt_state_parse(const void * data, size_t size, ggml_opt_state_data & state) {
+    if (!data || size < sizeof(GGML_OPT_STATE_MAGIC)) return false;
+    opt_state_reader reader{static_cast<const uint8_t *>(data), size, 0};
+    std::string magic;
+    if (!reader.read_string(magic, sizeof(GGML_OPT_STATE_MAGIC)) ||
+        magic.compare(0, sizeof(GGML_OPT_STATE_MAGIC), GGML_OPT_STATE_MAGIC, sizeof(GGML_OPT_STATE_MAGIC)) != 0 ||
+        !reader.read_int(state.version) || (state.version != 1 && state.version != GGML_OPT_STATE_VERSION)) {
+        return false;
+    }
+    uint32_t optimizer = 0;
+    uint32_t optimizer_state_type = GGML_TYPE_F32;
+    uint64_t rng_size = 0;
+    uint32_t tensor_count = 0;
+    if (!reader.read_int(optimizer) || optimizer >= GGML_OPT_OPTIMIZER_TYPE_COUNT ||
+        (state.version >= 2 && (!reader.read_int(optimizer_state_type) || optimizer_state_type >= GGML_TYPE_COUNT)) ||
+        !reader.read_int(state.iter) || state.iter < 1 ||
+        !reader.read_int(rng_size) || rng_size > size ||
+        !reader.read_string(state.rng, static_cast<size_t>(rng_size)) ||
+        !reader.read_int(tensor_count) || tensor_count > size / 16) {
+        return false;
+    }
+    state.optimizer = static_cast<ggml_opt_optimizer_type>(optimizer);
+    state.optimizer_state_type = static_cast<ggml_type>(optimizer_state_type);
+    state.tensors.clear();
+    state.tensors.reserve(tensor_count);
+    for (uint32_t i = 0; i < tensor_count; ++i) {
+        ggml_opt_state_tensor tensor;
+        uint32_t name_size = 0;
+        uint32_t type = 0;
+        uint32_t n_dims = 0;
+        uint64_t nbytes = 0;
+        if (!reader.read_int(name_size) || name_size == 0 || name_size > GGML_MAX_NAME ||
+            !reader.read_string(tensor.name, name_size) ||
+            !reader.read_int(type) || type >= GGML_TYPE_COUNT ||
+            !reader.read_int(n_dims) || n_dims > GGML_MAX_DIMS) {
+            return false;
+        }
+        tensor.type = static_cast<ggml_type>(type);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            uint64_t ne = 0;
+            if (!reader.read_int(ne) || ne == 0 || ne > static_cast<uint64_t>(INT64_MAX)) return false;
+            tensor.ne[d] = static_cast<int64_t>(ne);
+            if (d >= static_cast<int>(n_dims) && tensor.ne[d] != 1) return false;
+        }
+        if (!reader.read_int(nbytes) || nbytes > size || nbytes > SIZE_MAX ||
+            !reader.read_bytes(tensor.data, static_cast<size_t>(nbytes))) {
+            return false;
+        }
+        state.tensors.push_back(std::move(tensor));
+    }
+    return reader.pos == reader.size;
+}
+
+std::vector<ggml_tensor *> ggml_opt_moment_tensors(ggml_opt_context_t opt_ctx) {
+    std::vector<ggml_tensor *> result;
+    for (ggml_tensor * t : opt_ctx->grad_m) if (t) result.push_back(t);
+    for (ggml_tensor * t : opt_ctx->grad_v) if (t) result.push_back(t);
+    return result;
+}
+
+bool ggml_opt_state_check_tensor_data(const uint8_t * data, size_t size, ggml_type type,
+                                      const int64_t ne[GGML_MAX_DIMS], float * values,
+                                      size_t value_capacity, void * aligned_data) {
+    if (!data || (type != GGML_TYPE_F32 && type != GGML_TYPE_F16 && type != GGML_TYPE_BF16)) return false;
+
+    size_t element_count = 1;
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        if (ne[d] <= 0 || static_cast<uint64_t>(ne[d]) > SIZE_MAX / element_count) return false;
+        element_count *= static_cast<size_t>(ne[d]);
+    }
+
+    const size_t element_size = ggml_type_size(type);
+    if (element_size == 0 || element_count > SIZE_MAX / element_size || element_count * element_size != size) {
+        return false;
+    }
+
+    const ggml_type_traits * traits = ggml_get_type_traits(type);
+    if (type != GGML_TYPE_F32 && (!traits || !traits->to_float)) return false;
+
+    if (!values || value_capacity == 0 || (type != GGML_TYPE_F32 && !aligned_data)) return false;
+    for (size_t offset = 0; offset < element_count;) {
+        const size_t count = std::min(element_count - offset, value_capacity);
+        const uint8_t * chunk = data + offset * element_size;
+        if (type == GGML_TYPE_F32) {
+            std::memcpy(values, chunk, count * sizeof(float));
+        } else {
+            std::memcpy(aligned_data, chunk, count * element_size);
+            traits->to_float(aligned_data, values, static_cast<int64_t>(count));
+        }
+        if (!std::all_of(values, values + count,
+                         [](float value) { return std::isfinite(value); })) {
+            return false;
+        }
+        offset += count;
+    }
+    return true;
+}
+
+bool ggml_opt_apply_pending_state(ggml_opt_context_t opt_ctx) {
+    if (opt_ctx->pending_optimizer_state.empty()) return true;
+    if (!opt_ctx->optimizer_state_ready) return true;
+
+    ggml_opt_state_data state;
+    if (!ggml_opt_state_parse(opt_ctx->pending_optimizer_state.data(), opt_ctx->pending_optimizer_state.size(), state) ||
+        state.optimizer != opt_ctx->optimizer || state.optimizer_state_type != opt_ctx->optimizer_state_type ||
+        state.tensors.size() != ggml_opt_moment_tensors(opt_ctx).size()) {
+        return false;
+    }
+    std::unordered_map<std::string, ggml_tensor *> current;
+    for (ggml_tensor * t : ggml_opt_moment_tensors(opt_ctx)) {
+        if (!t || t->name[0] == '\0' || !current.emplace(t->name, t).second) return false;
+    }
+    for (const ggml_opt_state_tensor & entry : state.tensors) {
+        const auto it = current.find(entry.name);
+        if (it == current.end()) return false;
+        ggml_tensor * tensor = it->second;
+        if (tensor->type != entry.type || ggml_nbytes(tensor) != entry.data.size()) return false;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (tensor->ne[d] != entry.ne[d]) return false;
+        }
+        ggml_backend_tensor_set(tensor, entry.data.data(), 0, entry.data.size());
+        current.erase(it);
+    }
+    if (!current.empty()) return false;
+    opt_ctx->pending_optimizer_state.clear();
+    return true;
+}
+
+struct ggml_opt_state_layout {
+    std::string rng;
+    std::vector<ggml_tensor *> tensors;
+    size_t size = 0;
+};
+
+bool opt_state_size_add(size_t & size, size_t value) {
+    if (value > SIZE_MAX - size) return false;
+    size += value;
+    return true;
+}
+
+bool ggml_opt_state_make_layout(ggml_opt_context_t opt_ctx, ggml_opt_state_layout & layout) {
+    if (!opt_ctx || !opt_ctx->optimizer_state_ready || opt_ctx->eval_ready || opt_ctx->opt_i != 0 ||
+        !opt_ctx->pending_optimizer_state.empty()) {
+        return false;
+    }
+
+    std::ostringstream rng_stream;
+    rng_stream.imbue(std::locale::classic());
+    rng_stream << opt_ctx->rng;
+    if (!rng_stream) return false;
+    layout.rng = rng_stream.str();
+    layout.tensors = ggml_opt_moment_tensors(opt_ctx);
+    if (layout.tensors.size() > UINT32_MAX || layout.rng.size() > UINT64_MAX) return false;
+
+    layout.size = 0;
+    if (!opt_state_size_add(layout.size, sizeof(GGML_OPT_STATE_MAGIC)) ||
+        !opt_state_size_add(layout.size, sizeof(uint32_t) * 3) ||
+        !opt_state_size_add(layout.size, sizeof(uint64_t) * 2) ||
+        !opt_state_size_add(layout.size, layout.rng.size()) ||
+        !opt_state_size_add(layout.size, sizeof(uint32_t))) {
+        return false;
+    }
+
+    for (const ggml_tensor * tensor : layout.tensors) {
+        if (!tensor || tensor->name[0] == '\0') return false;
+        const size_t name_size = std::strlen(tensor->name);
+        const int n_dims = ggml_n_dims(tensor);
+        if (name_size == 0 || name_size > GGML_MAX_NAME || n_dims < 1 || n_dims > GGML_MAX_DIMS ||
+            tensor->type != opt_ctx->optimizer_state_type) {
+            return false;
+        }
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (tensor->ne[d] <= 0) return false;
+        }
+        if (!opt_state_size_add(layout.size, sizeof(uint32_t)) ||
+            !opt_state_size_add(layout.size, name_size) ||
+            !opt_state_size_add(layout.size, sizeof(uint32_t) * 2) ||
+            !opt_state_size_add(layout.size, sizeof(uint64_t) * GGML_MAX_DIMS) ||
+            !opt_state_size_add(layout.size, sizeof(uint64_t)) ||
+            !opt_state_size_add(layout.size, ggml_nbytes(tensor))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+struct opt_state_writer {
+    uint8_t * data;
+    size_t size;
+    size_t pos = 0;
+
+    template<typename T>
+    bool write_int(T value) {
+        static_assert(std::is_integral<T>::value, "integer type required");
+        if (pos > size || size - pos < sizeof(T)) return false;
+        for (size_t i = 0; i < sizeof(T); ++i) {
+            data[pos++] = static_cast<uint8_t>((static_cast<uint64_t>(value) >> (i * 8)) & 0xff);
+        }
+        return true;
+    }
+
+    bool write_bytes(const void * source, size_t count) {
+        if (pos > size || count > size - pos) return false;
+        if (count != 0) std::memcpy(data + pos, source, count);
+        pos += count;
+        return true;
+    }
+};
+
+}
+
+size_t ggml_opt_state_size(ggml_opt_context_t opt_ctx) {
+    ggml_opt_state_layout layout;
+    return ggml_opt_state_make_layout(opt_ctx, layout) ? layout.size : 0;
+}
+
+bool ggml_opt_state_export(ggml_opt_context_t opt_ctx, void * data, size_t size) {
+    if (!data) return false;
+    ggml_opt_state_layout layout;
+    if (!ggml_opt_state_make_layout(opt_ctx, layout) || layout.size != size) return false;
+
+    opt_state_writer writer{static_cast<uint8_t *>(data), size, 0};
+    if (!writer.write_bytes(GGML_OPT_STATE_MAGIC, sizeof(GGML_OPT_STATE_MAGIC)) ||
+        !writer.write_int<uint32_t>(GGML_OPT_STATE_VERSION) ||
+        !writer.write_int<uint32_t>(static_cast<uint32_t>(opt_ctx->optimizer)) ||
+        !writer.write_int<uint32_t>(static_cast<uint32_t>(opt_ctx->optimizer_state_type)) ||
+        !writer.write_int<uint64_t>(opt_ctx->iter) ||
+        !writer.write_int<uint64_t>(static_cast<uint64_t>(layout.rng.size())) ||
+        !writer.write_bytes(layout.rng.data(), layout.rng.size()) ||
+        !writer.write_int<uint32_t>(static_cast<uint32_t>(layout.tensors.size()))) {
+        return false;
+    }
+
+    for (const ggml_tensor * tensor : layout.tensors) {
+        const size_t name_size = std::strlen(tensor->name);
+        const size_t nbytes = ggml_nbytes(tensor);
+        if (!writer.write_int<uint32_t>(static_cast<uint32_t>(name_size)) ||
+            !writer.write_bytes(tensor->name, name_size) ||
+            !writer.write_int<uint32_t>(static_cast<uint32_t>(tensor->type)) ||
+            !writer.write_int<uint32_t>(static_cast<uint32_t>(ggml_n_dims(tensor)))) {
+            return false;
+        }
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (!writer.write_int<uint64_t>(static_cast<uint64_t>(tensor->ne[d]))) return false;
+        }
+        if (!writer.write_int<uint64_t>(static_cast<uint64_t>(nbytes)) ||
+            writer.pos > writer.size || writer.size - writer.pos < nbytes) {
+            return false;
+        }
+        ggml_backend_tensor_get(tensor, writer.data + writer.pos, 0, nbytes);
+        writer.pos += nbytes;
+    }
+    return writer.pos == writer.size;
+}
+
+bool ggml_opt_state_data_is_finite(const void * data, size_t size) {
+    if (!data || size < sizeof(GGML_OPT_STATE_MAGIC)) return false;
+
+    opt_state_reader reader{static_cast<const uint8_t *>(data), size, 0};
+    const uint8_t * magic = nullptr;
+    uint32_t version = 0;
+    uint32_t optimizer = 0;
+    uint32_t optimizer_state_type = GGML_TYPE_F32;
+    uint64_t iter = 0;
+    uint64_t rng_size = 0;
+    uint32_t tensor_count = 0;
+    if (!reader.read_view(magic, sizeof(GGML_OPT_STATE_MAGIC)) ||
+        std::memcmp(magic, GGML_OPT_STATE_MAGIC, sizeof(GGML_OPT_STATE_MAGIC)) != 0 ||
+        !reader.read_int(version) || (version != 1 && version != GGML_OPT_STATE_VERSION) ||
+        !reader.read_int(optimizer) || optimizer >= GGML_OPT_OPTIMIZER_TYPE_COUNT ||
+        (version >= 2 && (!reader.read_int(optimizer_state_type) || optimizer_state_type >= GGML_TYPE_COUNT)) ||
+        !reader.read_int(iter) || iter < 1 ||
+        !reader.read_int(rng_size) || rng_size > SIZE_MAX ||
+        !reader.skip_bytes(static_cast<size_t>(rng_size)) ||
+        !reader.read_int(tensor_count) || tensor_count > size / 16 ||
+        (optimizer_state_type != GGML_TYPE_F32 && optimizer_state_type != GGML_TYPE_F16 &&
+         optimizer_state_type != GGML_TYPE_BF16)) {
+        return false;
+    }
+
+    std::vector<float> values(tensor_count == 0 ? 0 : 4096);
+    std::vector<uint64_t> aligned_data(
+        tensor_count == 0 || optimizer_state_type == GGML_TYPE_F32 ? 0 : 1024);
+    for (uint32_t i = 0; i < tensor_count; ++i) {
+        uint32_t name_size = 0;
+        uint32_t type_value = 0;
+        uint32_t n_dims = 0;
+        uint64_t nbytes = 0;
+        const uint8_t * unused = nullptr;
+        int64_t ne[GGML_MAX_DIMS] = {};
+        if (!reader.read_int(name_size) || name_size == 0 || name_size > GGML_MAX_NAME ||
+            !reader.read_view(unused, name_size) ||
+            !reader.read_int(type_value) || type_value >= GGML_TYPE_COUNT ||
+            !reader.read_int(n_dims) || n_dims < 1 || n_dims > GGML_MAX_DIMS) {
+            return false;
+        }
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            uint64_t dimension = 0;
+            if (!reader.read_int(dimension) || dimension == 0 || dimension > static_cast<uint64_t>(INT64_MAX) ||
+                (d >= static_cast<int>(n_dims) && dimension != 1)) {
+                return false;
+            }
+            ne[d] = static_cast<int64_t>(dimension);
+        }
+        if (!reader.read_int(nbytes) || nbytes > SIZE_MAX) return false;
+        const uint8_t * tensor_data = nullptr;
+        if (!reader.read_view(tensor_data, static_cast<size_t>(nbytes)) ||
+            type_value != optimizer_state_type ||
+            !ggml_opt_state_check_tensor_data(tensor_data, static_cast<size_t>(nbytes),
+                                              static_cast<ggml_type>(type_value), ne,
+                                              values.data(), values.size(), aligned_data.data())) {
+            return false;
+        }
+    }
+    return reader.pos == reader.size;
+}
+
+bool ggml_opt_state_import(ggml_opt_context_t opt_ctx, const void * data, size_t size) {
+    if (!opt_ctx || !data || size == 0 || opt_ctx->eval_ready || opt_ctx->opt_i != 0) return false;
+    ggml_opt_state_data state;
+    if (!ggml_opt_state_parse(data, size, state) || state.optimizer != opt_ctx->optimizer ||
+        state.optimizer_state_type != opt_ctx->optimizer_state_type) return false;
+    std::istringstream rng_stream(state.rng);
+    rng_stream.imbue(std::locale::classic());
+    rng_stream >> opt_ctx->rng;
+    if (!rng_stream) return false;
+    opt_ctx->iter = state.iter;
+    opt_ctx->pending_optimizer_state.assign(static_cast<const uint8_t *>(data),
+                                            static_cast<const uint8_t *>(data) + size);
+    return ggml_opt_apply_pending_state(opt_ctx);
+}
+
+void ggml_opt_set_opt_period(ggml_opt_context_t opt_ctx, int32_t opt_period) {
+    GGML_ASSERT(opt_ctx != nullptr);
+    GGML_ASSERT(opt_period >= 1);
+    GGML_ASSERT(!opt_ctx->static_graphs && "accumulation period can only change for dynamic graphs");
+    GGML_ASSERT(!opt_ctx->eval_ready);
+    GGML_ASSERT(opt_ctx->opt_i == 0 && "accumulation period can only change between optimizer steps");
+    GGML_ASSERT(opt_ctx->loss_normalizer == 0.0f && "accumulation period cannot change after setting the loss normalizer");
+    opt_ctx->opt_period = opt_period;
+}
+
+void ggml_opt_set_activation_checkpointing(ggml_opt_context_t opt_ctx, bool enabled) {
+    GGML_ASSERT(opt_ctx != nullptr);
+    GGML_ASSERT(!opt_ctx->static_graphs && "activation checkpointing requires dynamic graphs");
+    GGML_ASSERT(!opt_ctx->eval_ready);
+    GGML_ASSERT(opt_ctx->opt_i == 0);
+    opt_ctx->activation_checkpointing = enabled;
+}
+
+void ggml_opt_set_seed(ggml_opt_context_t opt_ctx, uint32_t seed) {
+    GGML_ASSERT(opt_ctx != nullptr);
+    GGML_ASSERT(!opt_ctx->eval_ready);
+    GGML_ASSERT(opt_ctx->opt_i == 0);
+    GGML_ASSERT(opt_ctx->iter == 1);
+    opt_ctx->rng.seed(seed);
+}
+
+void ggml_opt_set_loss_normalizer(ggml_opt_context_t opt_ctx, float loss_normalizer) {
+    GGML_ASSERT(opt_ctx != nullptr);
+    GGML_ASSERT(std::isfinite(loss_normalizer) && loss_normalizer > 0.0f);
+    GGML_ASSERT(opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY ||
+        opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_SPARSE_CROSS_ENTROPY);
+    GGML_ASSERT(!opt_ctx->static_graphs && "loss normalization is only supported for dynamic graphs");
+    GGML_ASSERT(!opt_ctx->eval_ready);
+    GGML_ASSERT(opt_ctx->opt_i == 0 && "loss normalizer can only change between optimizer steps");
+    GGML_ASSERT(opt_ctx->loss_normalizer == 0.0f && "loss normalizer is already set for this accumulation group");
+    opt_ctx->loss_normalizer = loss_normalizer;
+}
+
 void ggml_opt_free(ggml_opt_context_t opt_ctx) {
     if (opt_ctx == nullptr) {
         return;
     }
     ggml_backend_buffer_free(opt_ctx->buf_static);
     ggml_backend_buffer_free(opt_ctx->buf_cpu);
+    for (ggml_backend_buffer_t buf : opt_ctx->bufs_grad_accs) {
+        ggml_backend_buffer_free(buf);
+    }
+    for (struct ggml_context * ctx : opt_ctx->ctxs_grad_accs) {
+        ggml_free(ctx);
+    }
+    for (ggml_backend_buffer_t buf : opt_ctx->bufs_momenta) {
+        ggml_backend_buffer_free(buf);
+    }
+    for (struct ggml_context * ctx : opt_ctx->ctxs_momenta) {
+        ggml_free(ctx);
+    }
     ggml_free(opt_ctx->ctx_static);
     ggml_free(opt_ctx->ctx_cpu);
     ggml_free(opt_ctx->ctx_copy);
@@ -594,8 +1918,12 @@ void ggml_opt_free(ggml_opt_context_t opt_ctx) {
 }
 
 void ggml_opt_reset(ggml_opt_context_t opt_ctx, bool optimizer) {
+    opt_ctx->loss_normalizer = 0.0f;
     if (optimizer) {
-        ggml_graph_reset(opt_ctx->gb_opt);
+        ggml_graph_reset(opt_ctx->static_graphs ? opt_ctx->gb_opt : opt_ctx->gb_grad);
+        for (ggml_backend_buffer_t buf : opt_ctx->bufs_momenta) {
+            ggml_backend_buffer_clear(buf, 0);
+        }
         opt_ctx->iter = 1;
     } else {
         ggml_graph_reset(opt_ctx->gb_grad);
@@ -618,6 +1946,14 @@ struct ggml_tensor * ggml_opt_labels(ggml_opt_context_t opt_ctx) {
     return opt_ctx->labels;
 }
 
+struct ggml_tensor * ggml_opt_sparse_labels(ggml_opt_context_t opt_ctx) {
+    return opt_ctx->labels_sparse;
+}
+
+struct ggml_tensor * ggml_opt_sparse_label_weights(ggml_opt_context_t opt_ctx) {
+    return opt_ctx->label_weights;
+}
+
 struct ggml_tensor * ggml_opt_loss(ggml_opt_context_t opt_ctx) {
     return opt_ctx->loss;
 }
@@ -631,7 +1967,18 @@ struct ggml_tensor * ggml_opt_ncorrect(ggml_opt_context_t opt_ctx) {
 }
 
 struct ggml_tensor * ggml_opt_grad_acc(ggml_opt_context_t opt_ctx, struct ggml_tensor * node) {
-    return ggml_graph_get_grad_acc(opt_ctx->gb_opt, node);
+    const ggml_cgraph * graph = opt_ctx->static_graphs ? opt_ctx->gb_opt : opt_ctx->gb_grad;
+    return ggml_graph_get_grad_acc(graph, node);
+}
+
+bool ggml_opt_has_grad(ggml_opt_context_t opt_ctx, const struct ggml_tensor * node) {
+    if (!opt_ctx || !opt_ctx->allocated_graph || !node || !opt_ctx->allocated_graph->grads) {
+        return false;
+    }
+
+    const struct ggml_cgraph * graph = opt_ctx->allocated_graph;
+    const struct ggml_tensor * grad = ggml_graph_get_grad(graph, node);
+    return grad && grad != ggml_graph_get_grad_acc(graph, node);
 }
 
 // ====== Optimization Result ======
@@ -647,8 +1994,12 @@ void ggml_opt_result_free(ggml_opt_result_t result) {
 void ggml_opt_result_reset(ggml_opt_result_t result) {
     result->ndata = 0;
     result->loss.clear();
+    result->opt_periods.clear();
     result->pred.clear();
     result->ncorrect = 0;
+    result->naccuracy_data = 0;
+    result->loss_sum = 0.0;
+    result->loss_squared_sum = 0.0;
 }
 
 void ggml_opt_result_ndata(ggml_opt_result_t result, int64_t * ndata) {
@@ -664,16 +2015,9 @@ void ggml_opt_result_loss(ggml_opt_result_t result, double * loss, double * unc)
         return;
     }
 
-    double sum         = 0.0;
-    double sum_squared = 0.0;
-
-    for (const float & loss : result->loss) {
-        // If the loss is per datapoint it was scaled by 1.0f/opt_period for each physical batch.
-        const float loss_scaled = result->loss_per_datapoint ? loss*result->opt_period : loss;
-        sum         += loss_scaled;
-        sum_squared += loss_scaled*loss_scaled;
-    }
-
+    GGML_ASSERT(result->opt_periods.size() == result->loss.size());
+    const double sum = result->loss_sum;
+    const double sum_squared = result->loss_squared_sum;
     const double mean = sum/nbatches;
     *loss = result->loss_per_datapoint ? mean : sum;
 
@@ -690,6 +2034,18 @@ void ggml_opt_result_loss(ggml_opt_result_t result, double * loss, double * unc)
     *unc = result->loss_per_datapoint ? sqrt(var_sum / (nbatches - 1)) : sqrt(var_sum * nbatches/(nbatches - 1));
 }
 
+void ggml_opt_result_last_loss(ggml_opt_result_t result, double * loss) {
+    if (result->loss.empty()) {
+        *loss = 0.0;
+        return;
+    }
+
+    GGML_ASSERT(result->opt_periods.size() == result->loss.size());
+    const size_t last = result->loss.size() - 1;
+    *loss = result->loss_per_datapoint ?
+        double(result->loss[last]) * result->opt_periods[last] : result->loss[last];
+}
+
 void ggml_opt_result_pred(ggml_opt_result_t result, int32_t * pred) {
     for (size_t i = 0; i < result->pred.size(); ++i) {
         pred[i] = result->pred[i];
@@ -697,14 +2053,15 @@ void ggml_opt_result_pred(ggml_opt_result_t result, int32_t * pred) {
 }
 
 void ggml_opt_result_accuracy(ggml_opt_result_t result, double * accuracy, double * unc) {
-    *accuracy = result->ncorrect >= 0 ? double(result->ncorrect) / double(result->ndata) : NAN;
+    *accuracy = result->ncorrect >= 0 && result->naccuracy_data > 0 ?
+        double(result->ncorrect) / double(result->naccuracy_data) : NAN;
 
     if (!unc) {
         return;
     }
 
-    *unc = result->ncorrect >= 0 && result->ndata >= 2 ?
-        sqrt((*accuracy) * (1.0 - (*accuracy)) / double(result->ndata - 1)) : NAN;
+    *unc = result->ncorrect >= 0 && result->naccuracy_data >= 2 ?
+        sqrt((*accuracy) * (1.0 - (*accuracy)) / double(result->naccuracy_data - 1)) : NAN;
 }
 
 // ====== Computation ======
@@ -736,6 +2093,10 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
 
     if (!opt_ctx->static_graphs) {
         ggml_opt_build(opt_ctx);
+
+        if (opt_ctx->gb_grad && opt_ctx->opt_i == 0) {
+            ggml_graph_reset(opt_ctx->gb_grad);
+        }
     }
 
     struct ggml_cgraph * graph = nullptr;
@@ -747,7 +2108,7 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
             graph = opt_ctx->gb_grad;
         } break;
         case GGML_OPT_BUILD_TYPE_OPT: {
-            graph = opt_ctx->gb_opt;
+            graph = opt_ctx->static_graphs ? opt_ctx->gb_opt : opt_ctx->gb_grad;
         } break;
     }
     GGML_ASSERT(graph);
@@ -758,6 +2119,7 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     }
 
     ggml_backend_sched_reset(opt_ctx->backend_sched); // clear allocation of previous graph
+    ggml_opt_set_recompute_backend_affinities(opt_ctx, graph);
 
     if (opt_ctx->static_graphs) {
         ggml_init_params params = {
@@ -774,14 +2136,88 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     }
 
     ggml_backend_sched_alloc_graph(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
+
+    if (!opt_ctx->checkpoint_backend_assignments.empty()) {
+        size_t mismatches = 0;
+        for (const auto & assignment : opt_ctx->checkpoint_backend_assignments) {
+            if (ggml_backend_sched_get_tensor_backend(opt_ctx->backend_sched, assignment.first) != assignment.second) {
+                ++mismatches;
+            }
+        }
+        if (mismatches != 0) {
+            GGML_LOG_WARN("%s: activation-checkpoint backend pinning mismatch: %zu/%zu tensors were reassigned\n",
+                __func__, mismatches, opt_ctx->checkpoint_backend_assignments.size());
+        } else {
+            GGML_LOG_DEBUG("%s: activation-checkpoint pinned %zu forward/backward/recompute tensors\n",
+                __func__, opt_ctx->checkpoint_backend_assignments.size());
+        }
+    }
+    ggml_opt_log_checkpoint_placement(opt_ctx, graph);
+    ggml_opt_log_sched_buffers(opt_ctx, "forward+backward");
     opt_ctx->allocated_graph = graph;
 
     opt_ctx->eval_ready = true;
 }
 
+static void ggml_opt_result_add(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
+    if (!result) {
+        return;
+    }
+
+    if (result->ndata == 0) {
+        result->loss_per_datapoint = opt_ctx->loss_per_datapoint;
+    } else {
+        GGML_ASSERT(result->loss_per_datapoint == opt_ctx->loss_per_datapoint);
+    }
+
+    const int64_t ndata = opt_ctx->outputs->ne[1];
+    GGML_ASSERT(result->ndata == ndata*int64_t(result->loss.size()) && "varying batch size not supported");
+    result->ndata += ndata;
+
+    GGML_ASSERT(ggml_is_scalar(opt_ctx->loss));
+    GGML_ASSERT(opt_ctx->loss->type == GGML_TYPE_F32);
+    float loss;
+    ggml_backend_tensor_get(opt_ctx->loss, &loss, 0, ggml_nbytes(opt_ctx->loss));
+    result->loss.push_back(loss);
+    result->opt_periods.push_back(opt_ctx->opt_period);
+    const float loss_scaled = result->loss_per_datapoint ? loss * opt_ctx->opt_period : loss;
+    result->loss_sum += loss_scaled;
+    result->loss_squared_sum += loss_scaled * loss_scaled;
+
+    if (opt_ctx->pred) {
+        GGML_ASSERT(opt_ctx->pred->type == GGML_TYPE_I32);
+        std::vector<int32_t> pred(ndata);
+        ggml_backend_tensor_get(opt_ctx->pred, pred.data(), 0, ggml_nbytes(opt_ctx->pred));
+        result->pred.insert(result->pred.end(), pred.begin(), pred.end());
+    }
+
+    if (!opt_ctx->ncorrect || result->ncorrect < 0) {
+        result->ncorrect = -1;
+        return;
+    }
+
+    GGML_ASSERT(ggml_is_scalar(opt_ctx->ncorrect));
+    GGML_ASSERT(opt_ctx->ncorrect->type == GGML_TYPE_I64);
+    GGML_ASSERT(ggml_is_scalar(opt_ctx->nvalid));
+    GGML_ASSERT(opt_ctx->nvalid->type == GGML_TYPE_F32);
+    int64_t ncorrect;
+    float nvalid;
+    ggml_backend_tensor_get(opt_ctx->ncorrect, &ncorrect, 0, ggml_nbytes(opt_ctx->ncorrect));
+    ggml_backend_tensor_get(opt_ctx->nvalid, &nvalid, 0, ggml_nbytes(opt_ctx->nvalid));
+    result->ncorrect += ncorrect;
+    result->naccuracy_data += (int64_t) std::llround(nvalid);
+}
+
 void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     GGML_ASSERT(opt_ctx->eval_ready);
-    if (opt_ctx->allocated_graph == opt_ctx->gb_opt) {
+
+    const bool optimizer_step = opt_ctx->static_graphs
+        ? opt_ctx->allocated_graph == opt_ctx->gb_opt
+        : opt_ctx->build_type == GGML_OPT_BUILD_TYPE_OPT;
+    const bool separate_optimizer_graph = optimizer_step && !opt_ctx->static_graphs &&
+        (opt_ctx->opt_period > 1 || opt_ctx->activation_checkpointing);
+
+    if (optimizer_step) {
         const ggml_opt_optimizer_params & opt_pars = opt_ctx->get_opt_pars(opt_ctx->get_opt_pars_ud);
 
         switch (opt_ctx->optimizer) {
@@ -821,9 +2257,25 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
         }
     }
 
+    // The selected graph may include the optimizer update, or only
+    // forward/backward work when using a separate optimizer graph.
+    // Copy metrics before the scheduler allocation is reused for that update.
     ggml_backend_sched_graph_compute(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
-    opt_ctx->iter += opt_ctx->allocated_graph == opt_ctx->gb_opt;
+    ggml_opt_result_add(opt_ctx, result);
+
+    if (separate_optimizer_graph) {
+        ggml_backend_sched_reset(opt_ctx->backend_sched);
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(opt_ctx->backend_sched, opt_ctx->gb_opt) &&
+            "failed to allocate optimizer update graph");
+        ggml_opt_log_sched_buffers(opt_ctx, "optimizer-update");
+        ggml_backend_sched_graph_compute(opt_ctx->backend_sched, opt_ctx->gb_opt);
+    }
+
+    opt_ctx->iter += optimizer_step;
     opt_ctx->opt_i = (opt_ctx->opt_i + 1) % opt_ctx->opt_period;
+    if (optimizer_step) {
+        opt_ctx->loss_normalizer = 0.0f;
+    }
 
     if (!opt_ctx->static_graphs) {
         opt_ctx->gf                   = nullptr;
@@ -831,49 +2283,11 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
         opt_ctx->gb_opt               = nullptr;
         opt_ctx->allocated_graph      = nullptr;
         opt_ctx->allocated_graph_copy = nullptr;
+        opt_ctx->recompute_backend_affinities.clear();
+        opt_ctx->checkpoint_backend_assignments.clear();
     }
 
     opt_ctx->eval_ready = false;
-
-    if (!result) {
-        return;
-    }
-
-    if (result->ndata == 0) {
-        result->loss_per_datapoint = opt_ctx->loss_per_datapoint;
-        result->opt_period         = opt_ctx->opt_period;
-    } else {
-        GGML_ASSERT(result->loss_per_datapoint == opt_ctx->loss_per_datapoint);
-        GGML_ASSERT(result->opt_period         == opt_ctx->opt_period);
-    }
-
-    const int64_t ndata = opt_ctx->outputs->ne[1];
-    GGML_ASSERT(result->ndata == ndata*int64_t(result->loss.size()) && "varying batch size not supported");
-    result->ndata += ndata;
-
-    GGML_ASSERT(ggml_is_scalar(opt_ctx->loss));
-    GGML_ASSERT(opt_ctx->loss->type == GGML_TYPE_F32);
-    float loss;
-    ggml_backend_tensor_get(opt_ctx->loss, &loss, 0, ggml_nbytes(opt_ctx->loss));
-    result->loss.push_back(loss);
-
-    if (opt_ctx->pred) {
-        GGML_ASSERT(opt_ctx->pred->type == GGML_TYPE_I32);
-        std::vector<int32_t> pred(ndata);
-        ggml_backend_tensor_get(opt_ctx->pred, pred.data(), 0, ggml_nbytes(opt_ctx->pred));
-        result->pred.insert(result->pred.end(), pred.begin(), pred.end());
-    }
-
-    if (!opt_ctx->ncorrect || result->ncorrect < 0) {
-        result->ncorrect = -1;
-        return;
-    }
-
-    GGML_ASSERT(ggml_is_scalar(opt_ctx->ncorrect));
-    GGML_ASSERT(opt_ctx->ncorrect->type == GGML_TYPE_I64);
-    int64_t ncorrect;
-    ggml_backend_tensor_get(opt_ctx->ncorrect, &ncorrect, 0, ggml_nbytes(opt_ctx->ncorrect));
-    result->ncorrect += ncorrect;
 }
 
 // ====== High-Level Functions ======
@@ -888,9 +2302,19 @@ void ggml_opt_epoch(
         ggml_opt_epoch_callback callback_eval) {
     GGML_ASSERT(ggml_opt_static_graphs(opt_ctx) && "ggml_opt_epoch requires static graphs");
     struct ggml_tensor * inputs = ggml_opt_inputs(opt_ctx);
-    struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
+    const bool sparse_cross_entropy = opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_SPARSE_CROSS_ENTROPY;
+    struct ggml_tensor * labels = sparse_cross_entropy
+        ? ggml_opt_sparse_labels(opt_ctx) : ggml_opt_labels(opt_ctx);
+    struct ggml_tensor * weights = sparse_cross_entropy
+        ? ggml_opt_sparse_label_weights(opt_ctx) : nullptr;
     struct ggml_tensor * data   = ggml_opt_dataset_data(dataset);
     GGML_ASSERT(data->ne[0] == inputs->ne[0]);
+    if (sparse_cross_entropy) {
+        GGML_ASSERT(dataset->labels && dataset->labels->type == GGML_TYPE_I32);
+        GGML_ASSERT(dataset->labels->ne[0] == 1 && dataset->labels->ne[1] == dataset->ndata);
+        GGML_ASSERT(dataset->weights && dataset->weights->type == GGML_TYPE_F32);
+        GGML_ASSERT(dataset->weights->ne[0] == 1 && dataset->weights->ne[1] == dataset->ndata);
+    }
 
     const int64_t ndata       =   data->ne[1];
     const int64_t ndata_batch = inputs->ne[1];
@@ -907,6 +2331,9 @@ void ggml_opt_epoch(
     for (; ibatch < ibatch_split; ++ibatch) {
         ggml_opt_alloc(opt_ctx, /*backward =*/ true);
         ggml_opt_dataset_get_batch(dataset, inputs, labels, ibatch);
+        if (sparse_cross_entropy) {
+            ggml_opt_dataset_get_weights_batch(dataset, inputs, weights, ibatch);
+        }
         ggml_opt_eval(opt_ctx, result_train);
         if (callback_train) {
             callback_train(true, opt_ctx, dataset, result_train, ibatch+1, ibatch_split, t_loop_start);
@@ -916,6 +2343,9 @@ void ggml_opt_epoch(
     for (; ibatch < nbatches; ++ibatch) {
         ggml_opt_alloc(opt_ctx, /*backward =*/ false);
         ggml_opt_dataset_get_batch(dataset, inputs, labels, ibatch);
+        if (sparse_cross_entropy) {
+            ggml_opt_dataset_get_weights_batch(dataset, inputs, weights, ibatch);
+        }
         ggml_opt_eval(opt_ctx, result_eval);
         if (callback_eval) {
             callback_eval(false, opt_ctx, dataset, result_eval, ibatch+1-ibatch_split, nbatches-ibatch_split, t_loop_start);
