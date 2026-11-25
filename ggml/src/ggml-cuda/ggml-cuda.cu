@@ -2824,7 +2824,7 @@ static void ggml_cuda_fused_linear_cross_entropy(ggml_backend_cuda_context & ctx
     const int64_t n_tokens = input->ne[1];
     const int64_t chunk_tokens = ggml_cuda_fused_linear_ce_chunk_tokens(n_vocab);
     float logit_softcap = 0.0f;
-    memcpy(&logit_softcap, dst->op_params + sizeof(int32_t) * 8, sizeof(logit_softcap));
+    memcpy(&logit_softcap, &dst->op_params[8], sizeof(logit_softcap));
 
     ggml_cuda_pool_alloc<float> logits(ctx.pool());
     logits.alloc((size_t) n_vocab * (size_t) chunk_tokens);
@@ -2877,7 +2877,7 @@ static void ggml_cuda_fused_linear_cross_entropy_back(ggml_backend_cuda_context 
     const int64_t n_tokens = input->ne[1];
     const int64_t chunk_tokens = ggml_cuda_fused_linear_ce_chunk_tokens(n_vocab);
     float logit_softcap = 0.0f;
-    memcpy(&logit_softcap, dst->op_params + sizeof(int32_t) * 8, sizeof(logit_softcap));
+    memcpy(&logit_softcap, &dst->op_params[8], sizeof(logit_softcap));
 
     ggml_cuda_pool_alloc<float> logits(ctx.pool());
     logits.alloc((size_t) n_vocab * (size_t) chunk_tokens);

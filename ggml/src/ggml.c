@@ -6468,7 +6468,7 @@ struct ggml_tensor * ggml_fused_linear_cross_entropy(
 
     struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
     result->op     = GGML_OP_EXT_FUSED_LINEAR_CROSS_ENTROPY;
-    memcpy(result->op_params + sizeof(int32_t) * 8, &logit_softcap, sizeof(logit_softcap));
+    memcpy(&result->op_params[8], &logit_softcap, sizeof(logit_softcap));
     result->src[0] = weight;
     result->src[1] = input;
     result->src[2] = labels;

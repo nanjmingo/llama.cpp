@@ -300,6 +300,11 @@ static bool test_fused_linear_cross_entropy_dense_equivalence(ggml_backend_t bac
     ggml_backend_tensor_set(weights, weights_data, 0, sizeof(weights_data));
     const float scale_data = 0.73f;
     ggml_backend_tensor_set(scale, &scale_data, 0, sizeof(scale_data));
+    // Seed the scalar loss gradient explicitly. The standalone graph does not
+    // initialize this accumulator automatically.
+    ggml_tensor * loss_grad = ggml_graph_get_grad(graph, difference);
+    const float unit_loss_grad = 1.0f;
+    ggml_backend_tensor_set(loss_grad, &unit_loss_grad, 0, sizeof(unit_loss_grad));
 
     const ggml_status status = ggml_backend_graph_compute(backend, graph);
     float reference_value = NAN;

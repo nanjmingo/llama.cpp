@@ -12843,7 +12843,7 @@ void ggml_compute_forward_fused_linear_cross_entropy(
     const int64_t n_vocab  = weight->ne[1];
     const int64_t n_tokens = input->ne[1];
     float logit_softcap = 0.0f;
-    memcpy(&logit_softcap, dst->op_params + sizeof(int32_t) * 8, sizeof(logit_softcap));
+    memcpy(&logit_softcap, &dst->op_params[8], sizeof(logit_softcap));
     GGML_ASSERT(input->type == GGML_TYPE_F32 && ggml_is_contiguous(input));
     GGML_ASSERT(ggml_is_contiguous(weight));
     GGML_ASSERT(labels->type == GGML_TYPE_I32 && ggml_is_contiguous(labels));
@@ -12852,7 +12852,14 @@ void ggml_compute_forward_fused_linear_cross_entropy(
     GGML_ASSERT(weight->ne[2] == 1 && weight->ne[3] == 1);
 
     const ggml_type_traits * traits = ggml_get_type_traits(weight->type);
-    GGML_ASSERT(traits && traits->to_float);
+    GGML_ASSERT(traits && (weight->type == GGML_TYPE_F32 || traits->to_float));
+    const auto to_float = [weight, traits, n_embd](const void * src, float * dst) {
+        if (weight->type == GGML_TYPE_F32) {
+            memcpy(dst, src, (size_t) n_embd * sizeof(float));
+        } else {
+            traits->to_float(src, dst, n_embd);
+        }
+    };
     const int32_t * label_data = (const int32_t *) labels->data;
     const float * weight_data = (const float *) weights->data;
     const float * input_data = (const float *) input->data;
@@ -12880,7 +12887,7 @@ void ggml_compute_forward_fused_linear_cross_entropy(
         float target_logit = 0.0f;
         for (int64_t vocab = 0; vocab < n_vocab; ++vocab) {
             const void * row = (const char *) weight->data + vocab * weight->nb[1];
-            traits->to_float(row, weight_row.data(), n_embd);
+            to_float(row, weight_row.data());
             float dot = 0.0f;
             for (int64_t i = 0; i < n_embd; ++i) {
                 dot += weight_row[(size_t) i] * x[i];
@@ -12922,7 +12929,7 @@ void ggml_compute_forward_fused_linear_cross_entropy_back(
     const int64_t n_vocab  = weight->ne[1];
     const int64_t n_tokens = input->ne[1];
     float logit_softcap = 0.0f;
-    memcpy(&logit_softcap, dst->op_params + sizeof(int32_t) * 8, sizeof(logit_softcap));
+    memcpy(&logit_softcap, &dst->op_params[8], sizeof(logit_softcap));
     GGML_ASSERT(ggml_is_scalar(grad) && grad->type == GGML_TYPE_F32);
     GGML_ASSERT(input->type == GGML_TYPE_F32 && ggml_is_contiguous(input));
     GGML_ASSERT(ggml_is_contiguous(weight));
@@ -12931,7 +12938,14 @@ void ggml_compute_forward_fused_linear_cross_entropy_back(
     GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_are_same_shape(dst, input));
 
     const ggml_type_traits * traits = ggml_get_type_traits(weight->type);
-    GGML_ASSERT(traits && traits->to_float);
+    GGML_ASSERT(traits && (weight->type == GGML_TYPE_F32 || traits->to_float));
+    const auto to_float = [weight, traits, n_embd](const void * src, float * dst) {
+        if (weight->type == GGML_TYPE_F32) {
+            memcpy(dst, src, (size_t) n_embd * sizeof(float));
+        } else {
+            traits->to_float(src, dst, n_embd);
+        }
+    };
     const int32_t * label_data = (const int32_t *) labels->data;
     const float * weight_data = (const float *) weights->data;
     const float * input_data = (const float *) input->data;
@@ -12959,7 +12973,7 @@ void ggml_compute_forward_fused_linear_cross_entropy_back(
         float max_logit = -INFINITY;
         for (int64_t vocab = 0; vocab < n_vocab; ++vocab) {
             const void * row = (const char *) weight->data + vocab * weight->nb[1];
-            traits->to_float(row, weight_row.data(), n_embd);
+            to_float(row, weight_row.data());
             float dot = 0.0f;
             for (int64_t i = 0; i < n_embd; ++i) dot += weight_row[(size_t) i] * x[i];
             const float effective_logit = logit_softcap > 0.0f
@@ -12978,7 +12992,7 @@ void ggml_compute_forward_fused_linear_cross_entropy_back(
             float dlogit = (std::exp(logits[(size_t) vocab] - max_logit) * inv_sum -
                 (vocab == label ? 1.0f : 0.0f)) * row_scale;
             const void * row = (const char *) weight->data + vocab * weight->nb[1];
-            traits->to_float(row, weight_row.data(), n_embd);
+            to_float(row, weight_row.data());
             if (logit_softcap > 0.0f) {
                 float raw_logit = 0.0f;
                 for (int64_t i = 0; i < n_embd; ++i) raw_logit += weight_row[(size_t) i] * x[i];

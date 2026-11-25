@@ -1230,7 +1230,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
                 // Preserve the output projection's precision policy. The fused CUDA
                 // kernel reuses these parameters for each temporary chunked matmul.
                 memcpy(opt_ctx->loss->op_params, linear_output->op_params, sizeof(linear_output->op_params));
-                memcpy(opt_ctx->loss->op_params + sizeof(int32_t) * 8, &logit_softcap, sizeof(logit_softcap));
+                memcpy(&opt_ctx->loss->op_params[8], &logit_softcap, sizeof(logit_softcap));
                 opt_ctx->uses_fused_linear_cross_entropy = true;
                 ggml_set_name(opt_ctx->loss, "loss_fused_linear_cross_entropy");
             } else {
