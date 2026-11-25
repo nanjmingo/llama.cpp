@@ -946,6 +946,51 @@ static std::pair<int, int> test_dynamic_activation_checkpointing(
     return std::make_pair(npass, ntest);
 }
 
+static bool test_graph_reset_gradients_preserves_optimizer_state(ggml_backend_t backend) {
+    ggml_init_params params = { 1024 * 1024, nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+    ggml_tensor * weights = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    ggml_set_param(weights);
+    ggml_tensor * grad = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    ggml_tensor * moment_m = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    ggml_tensor * moment_v = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    ggml_tensor * optimizer_params = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 7);
+    ggml_tensor * updated = ggml_opt_step_adamw(ctx, weights, grad, moment_m, moment_v, optimizer_params);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 16, /* grads = */ true);
+    ggml_build_forward_expand(graph, updated);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    GGML_ASSERT(buffer != nullptr);
+
+    const float initial_m[4] = { 1.0f, 2.0f, 3.0f, 4.0f };
+    const float initial_v[4] = { 4.0f, 3.0f, 2.0f, 1.0f };
+    float actual_m[4] = {};
+    float actual_v[4] = {};
+    ggml_backend_tensor_set(moment_m, initial_m, 0, sizeof(initial_m));
+    ggml_backend_tensor_set(moment_v, initial_v, 0, sizeof(initial_v));
+
+    // Resetting the gradient graph between training steps must not clear
+    // AdamW's persistent momenta, even when the update node is in this graph.
+    ggml_graph_reset_gradients(graph);
+    ggml_backend_tensor_get(moment_m, actual_m, 0, sizeof(actual_m));
+    ggml_backend_tensor_get(moment_v, actual_v, 0, sizeof(actual_v));
+    bool ok = std::memcmp(initial_m, actual_m, sizeof(initial_m)) == 0 &&
+        std::memcmp(initial_v, actual_v, sizeof(initial_v)) == 0;
+
+    // The full reset keeps its original contract and does clear optimizer state.
+    ggml_graph_reset(graph);
+    ggml_backend_tensor_get(moment_m, actual_m, 0, sizeof(actual_m));
+    ggml_backend_tensor_get(moment_v, actual_v, 0, sizeof(actual_v));
+    for (int i = 0; i < 4; ++i) {
+        ok = ok && actual_m[i] == 0.0f && actual_v[i] == 0.0f;
+    }
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return ok;
+}
+
+
 static void helper_after_test_gradient_accumulation(
         enum ggml_opt_optimizer_type optim,
         const char * func, const int nbatch_physical, const enum ggml_opt_loss_type loss_type, const int epoch,
@@ -1221,6 +1266,10 @@ static std::pair<int, int> test_backend(
     }
     bool const adamw = optim == GGML_OPT_OPTIMIZER_TYPE_ADAMW;
     if (adamw) {
+        {
+            const bool reset_ok = test_graph_reset_gradients_preserves_optimizer_state(backend);
+            print_ok("test_graph_reset_gradients_preserves_optimizer_state", reset_ok, npass, ntest);
+        }
         {
             std::pair<int, int> partial = test_dynamic_activation_checkpointing(backend_sched, backend);
             npass += partial.first;

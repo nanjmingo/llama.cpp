@@ -1434,7 +1434,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         }
     } else if (opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_GRAD) {
         opt_ctx->buf_static = ggml_backend_alloc_ctx_tensors(opt_ctx->ctx_static, ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0));
-        ggml_graph_reset(opt_ctx->gb_grad);
+        ggml_graph_reset_gradients(opt_ctx->gb_grad);
     }
 
     GGML_ASSERT(opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT);
@@ -1507,10 +1507,10 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     if (!opt_ctx->buf_static) {
         opt_ctx->buf_static = ggml_backend_alloc_ctx_tensors(
             opt_ctx->ctx_static, ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0));
-        // In dynamic mode the persistent parameter gradient accumulators belong
-        // to gb_grad. Optimizer updates may share that graph when neither gradient
-        // accumulation nor activation checkpointing requires a separate update.
-        ggml_graph_reset(opt_ctx->static_graphs ? opt_ctx->gb_opt : opt_ctx->gb_grad);
+        // Reset gradient accumulators without clearing AdamW state. In the
+        // single-microbatch dynamic path, optimizer nodes share gb_grad, but
+        // their momenta must persist across optimizer steps.
+        ggml_graph_reset_gradients(opt_ctx->static_graphs ? opt_ctx->gb_opt : opt_ctx->gb_grad);
     }
 
     opt_ctx->buf_cpu = ggml_backend_alloc_ctx_tensors_from_buft(opt_ctx->ctx_cpu, ggml_backend_cpu_buffer_type());
@@ -2027,7 +2027,7 @@ void ggml_opt_reset(ggml_opt_context_t opt_ctx, bool optimizer) {
         }
         opt_ctx->iter = 1;
     } else {
-        ggml_graph_reset(opt_ctx->gb_grad);
+        ggml_graph_reset_gradients(opt_ctx->gb_grad);
     }
 }
 
@@ -2183,7 +2183,7 @@ void ggml_opt_prepare_alloc(
 void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     GGML_ASSERT(!opt_ctx->eval_ready);
     if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_OPT && opt_ctx->opt_period > 1 && opt_ctx->opt_i == 0) {
-        ggml_graph_reset(opt_ctx->gb_grad);
+        ggml_graph_reset_gradients(opt_ctx->gb_grad);
     }
     if (backward) {
         const int32_t opt_i_next = (opt_ctx->opt_i + 1) % opt_ctx->opt_period;
@@ -2196,7 +2196,9 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
         ggml_opt_build(opt_ctx);
 
         if (opt_ctx->gb_grad && opt_ctx->opt_i == 0) {
-            ggml_graph_reset(opt_ctx->gb_grad);
+            // Keep optimizer state in-place; only gradient buffers are reset
+            // between steps, even when optimizer nodes are part of gb_grad.
+            ggml_graph_reset_gradients(opt_ctx->gb_grad);
         }
     }
 

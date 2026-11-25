@@ -8337,7 +8337,7 @@ struct ggml_tensor * ggml_set_zero(struct ggml_tensor * tensor) {
     return tensor;
 }
 
-void ggml_graph_reset(struct ggml_cgraph * cgraph) {
+static void ggml_graph_reset_impl(struct ggml_cgraph * cgraph, bool reset_optimizer_state) {
     if (!cgraph) {
         return;
     }
@@ -8347,7 +8347,7 @@ void ggml_graph_reset(struct ggml_cgraph * cgraph) {
         struct ggml_tensor * node     = cgraph->nodes[i];
         struct ggml_tensor * grad_acc = ggml_graph_get_grad_acc(cgraph, node);
 
-        if (node->op == GGML_OP_OPT_STEP_ADAMW) {
+        if (reset_optimizer_state && node->op == GGML_OP_OPT_STEP_ADAMW) {
             // clear momenta
             ggml_set_zero(node->src[2]);
             ggml_set_zero(node->src[3]);
@@ -8371,6 +8371,14 @@ void ggml_graph_reset(struct ggml_cgraph * cgraph) {
             }
         }
     }
+}
+
+void ggml_graph_reset(struct ggml_cgraph * cgraph) {
+    ggml_graph_reset_impl(cgraph, /*reset_optimizer_state =*/ true);
+}
+
+void ggml_graph_reset_gradients(struct ggml_cgraph * cgraph) {
+    ggml_graph_reset_impl(cgraph, /*reset_optimizer_state =*/ false);
 }
 
 void ggml_graph_clear(struct ggml_cgraph * cgraph) {
