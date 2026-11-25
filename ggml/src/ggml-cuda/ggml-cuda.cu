@@ -2872,7 +2872,6 @@ static void ggml_cuda_fused_linear_cross_entropy_back(ggml_backend_cuda_context 
     const ggml_tensor * input = dst->src[2];
     const ggml_tensor * labels = dst->src[3];
     const ggml_tensor * weights = dst->src[4];
-    const int64_t n_embd = weight->ne[0];
     const int64_t n_vocab = weight->ne[1];
     const int64_t n_tokens = input->ne[1];
     const int64_t chunk_tokens = ggml_cuda_fused_linear_ce_chunk_tokens(n_vocab);
