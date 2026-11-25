@@ -4281,6 +4281,11 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
         LLAMA_LOG_WARN("%s: n_ubatch (%u) != n_ctx (%u), the K and V projections will not receive gradients\n", __func__, n_ubatch, cparams.n_ctx);
     }
 
+    // Tensor/row-split output matrices are sharded across devices. The fused
+    // vocabulary reduction currently requires the complete output matrix on one backend.
+    cparams.fused_linear_cross_entropy = lopt_params.fused_linear_cross_entropy && cparams.training &&
+        model->split_mode() != LLAMA_SPLIT_MODE_ROW && model->split_mode() != LLAMA_SPLIT_MODE_TENSOR;
+
     // the training graph is different, need to reserve again
     sched_need_reserve = true;
     sched_reserve();
@@ -4322,7 +4327,10 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
         sched_need_reserve = false;
     }
 
-    ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), GGML_OPT_LOSS_TYPE_SPARSE_CROSS_ENTROPY);
+    const enum ggml_opt_loss_type loss_type = cparams.fused_linear_cross_entropy
+        ? GGML_OPT_LOSS_TYPE_FUSED_LINEAR_CROSS_ENTROPY
+        : GGML_OPT_LOSS_TYPE_SPARSE_CROSS_ENTROPY;
+    ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), loss_type);
     opt_params.opt_period      = n_batch / n_ubatch;
     opt_params.get_opt_pars    = lopt_params.get_opt_pars;
     opt_params.get_opt_pars_ud = lopt_params.get_opt_pars_ud;

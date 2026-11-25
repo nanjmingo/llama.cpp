@@ -1757,6 +1757,10 @@ extern "C" {
 
         enum ggml_opt_optimizer_type optimizer_type;
         enum ggml_type optimizer_state_type;
+
+        // Use a vocabulary-tiled fused output projection + sparse cross entropy.
+        // Intended for QLoRA with a frozen, directly applied output matrix.
+        bool fused_linear_cross_entropy;
     };
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);

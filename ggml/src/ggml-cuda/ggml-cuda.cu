@@ -2684,6 +2684,303 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
 
+static constexpr int GGML_CUDA_FUSED_LINEAR_CE_THREADS = 256;
+
+static __global__ void ggml_cuda_fused_linear_ce_init_kernel(
+        float * running_max, float * running_sum, float * target_logit, int64_t n_tokens) {
+    const int64_t token = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (token < n_tokens) {
+        running_max[token] = -INFINITY;
+        running_sum[token] = 0.0f;
+        target_logit[token] = 0.0f;
+    }
+}
+
+// Merge the current [vocab_tile, token] logits into per-token online LSE state.
+static __global__ void ggml_cuda_fused_linear_ce_lse_update_kernel(
+        const float * logits,
+        const int32_t * labels,
+        const float * weights,
+        float * running_max,
+        float * running_sum,
+        float * target_logit,
+        int64_t n_vocab_tile,
+        int64_t n_tokens,
+        int64_t vocab_start) {
+    const int64_t token = blockIdx.x;
+    if (token >= n_tokens || labels[token] < 0 || weights[token] == 0.0f) {
+        return;
+    }
+
+    __shared__ float shared[GGML_CUDA_FUSED_LINEAR_CE_THREADS];
+    const float * row = logits + token * n_vocab_tile;
+    float local_max = -INFINITY;
+    for (int64_t v = threadIdx.x; v < n_vocab_tile; v += blockDim.x) {
+        local_max = fmaxf(local_max, row[v]);
+    }
+    shared[threadIdx.x] = local_max;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            shared[threadIdx.x] = fmaxf(shared[threadIdx.x], shared[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    const float tile_max = shared[0];
+
+    float local_sum = 0.0f;
+    for (int64_t v = threadIdx.x; v < n_vocab_tile; v += blockDim.x) {
+        local_sum += expf(row[v] - tile_max);
+    }
+    shared[threadIdx.x] = local_sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            shared[threadIdx.x] += shared[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    const float tile_sum = shared[0];
+
+    if (threadIdx.x == 0) {
+        const float old_max = running_max[token];
+        const float new_max = fmaxf(old_max, tile_max);
+        running_sum[token] = running_sum[token] * expf(old_max - new_max) +
+            tile_sum * expf(tile_max - new_max);
+        running_max[token] = new_max;
+
+        const int64_t label = labels[token];
+        if (label >= vocab_start && label < vocab_start + n_vocab_tile) {
+            target_logit[token] = row[label - vocab_start];
+        }
+    }
+}
+
+static __global__ void ggml_cuda_fused_linear_ce_finish_kernel(
+        const int32_t * labels,
+        const float * weights,
+        const float * running_max,
+        const float * running_sum,
+        const float * target_logit,
+        float * stats,
+        int64_t n_tokens,
+        int64_t n_vocab) {
+    const int64_t token = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (token >= n_tokens) return;
+    const int32_t label = labels[token];
+    const float row_weight = weights[token];
+    if (label == -1 || row_weight == 0.0f) {
+        stats[token] = 0.0f;
+        stats[n_tokens + token] = 0.0f;
+        return;
+    }
+    if (label < 0 || label >= n_vocab || !isfinite(row_weight) || row_weight < 0.0f) {
+        stats[token] = NAN;
+        stats[n_tokens + token] = NAN;
+        return;
+    }
+    const float lse = running_max[token] + logf(running_sum[token]);
+    stats[token] = row_weight * (lse - target_logit[token]);
+    stats[n_tokens + token] = lse;
+}
+
+static __global__ void ggml_cuda_fused_linear_ce_logits_to_grad_kernel(
+        float * logits,
+        const int32_t * labels,
+        const float * weights,
+        const float * token_grad,
+        const float * lse,
+        int64_t n_vocab_tile,
+        int64_t n_tokens,
+        int64_t vocab_start,
+        int64_t n_vocab,
+        float softcap) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t n = n_vocab_tile * n_tokens;
+    if (i >= n) return;
+    const int64_t token = i / n_vocab_tile;
+    const int64_t vocab = vocab_start + i % n_vocab_tile;
+    const int32_t label = labels[token];
+    const float row_weight = weights[token];
+    if (label < 0 || label >= n_vocab || row_weight == 0.0f || token_grad[token] == 0.0f) {
+        logits[i] = 0.0f;
+        return;
+    }
+
+    const float raw_logit = logits[i];
+    float logit = raw_logit;
+    float derivative = 1.0f;
+    if (softcap > 0.0f) {
+        const float tanh_logit = tanhf(raw_logit / softcap);
+        logit = softcap * tanh_logit;
+        derivative = 1.0f - tanh_logit * tanh_logit;
+    }
+    const float probability = expf(logit - lse[token]);
+    logits[i] = (probability - (vocab == label ? 1.0f : 0.0f)) *
+        row_weight * token_grad[token] * derivative;
+}
+
+static __global__ void ggml_cuda_fused_linear_ce_accumulate_kernel(
+        const float * partial,
+        float * total,
+        int64_t n_elements) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_elements) total[i] += partial[i];
+}
+
+static void ggml_cuda_fused_linear_cross_entropy(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * weight  = dst->src[0];
+    const ggml_tensor * input   = dst->src[1];
+    const ggml_tensor * labels  = dst->src[2];
+    const ggml_tensor * weights = dst->src[3];
+    const int64_t n_embd   = weight->ne[0];
+    const int64_t n_vocab  = weight->ne[1];
+    const int64_t n_tokens = input->ne[1];
+    const int64_t vocab_chunk = std::min<int64_t>(
+        n_vocab, ggml_get_op_params_i32(dst, 13));
+    float softcap = 0.0f;
+    memcpy(&softcap, dst->op_params + 12 * sizeof(int32_t), sizeof(softcap));
+    GGML_ASSERT(vocab_chunk > 0);
+
+    ggml_cuda_pool_alloc<float> logits(ctx.pool(), (size_t) vocab_chunk * (size_t) n_tokens);
+    ggml_cuda_pool_alloc<float> running_max(ctx.pool(), (size_t) n_tokens);
+    ggml_cuda_pool_alloc<float> running_sum(ctx.pool(), (size_t) n_tokens);
+    ggml_cuda_pool_alloc<float> target_logit(ctx.pool(), (size_t) n_tokens);
+    const cudaStream_t stream = ctx.stream();
+
+    const int init_blocks = (int) ((n_tokens + GGML_CUDA_FUSED_LINEAR_CE_THREADS - 1) /
+        GGML_CUDA_FUSED_LINEAR_CE_THREADS);
+    ggml_cuda_fused_linear_ce_init_kernel<<<init_blocks, GGML_CUDA_FUSED_LINEAR_CE_THREADS, 0, stream>>>(
+        running_max.ptr, running_sum.ptr, target_logit.ptr, n_tokens);
+    CUDA_CHECK(cudaGetLastError());
+
+    for (int64_t vocab_start = 0; vocab_start < n_vocab; vocab_start += vocab_chunk) {
+        const int64_t n_vocab_tile = std::min(vocab_chunk, n_vocab - vocab_start);
+
+        ggml_tensor weight_tile = *weight;
+        weight_tile.ne[1] = n_vocab_tile;
+        weight_tile.ne[2] = 1;
+        weight_tile.ne[3] = 1;
+        weight_tile.data = (char *) weight->data + vocab_start * weight->nb[1];
+        weight_tile.view_src = const_cast<ggml_tensor *>(weight);
+        weight_tile.view_offs = (size_t) vocab_start * weight->nb[1];
+
+        ggml_tensor logits_tile = {};
+        logits_tile.type = GGML_TYPE_F32;
+        logits_tile.op = GGML_OP_MUL_MAT;
+        logits_tile.src[0] = &weight_tile;
+        logits_tile.src[1] = const_cast<ggml_tensor *>(input);
+        memcpy(logits_tile.op_params, dst->op_params, sizeof(logits_tile.op_params));
+        logits_tile.ne[0] = n_vocab_tile;
+        logits_tile.ne[1] = n_tokens;
+        logits_tile.ne[2] = 1;
+        logits_tile.ne[3] = 1;
+        logits_tile.nb[0] = sizeof(float);
+        logits_tile.nb[1] = (size_t) n_vocab_tile * sizeof(float);
+        logits_tile.nb[2] = logits_tile.nb[1] * (size_t) n_tokens;
+        logits_tile.nb[3] = logits_tile.nb[2];
+        logits_tile.data = logits.ptr;
+
+        ggml_cuda_mul_mat(ctx, &weight_tile, input, &logits_tile);
+        const int blocks = (int) n_tokens;
+        ggml_cuda_fused_linear_ce_lse_update_kernel<<<blocks, GGML_CUDA_FUSED_LINEAR_CE_THREADS, 0, stream>>>(
+            logits.ptr, (const int32_t *) labels->data, (const float *) weights->data,
+            running_max.ptr, running_sum.ptr, target_logit.ptr,
+            n_vocab_tile, n_tokens, vocab_start);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    const int finish_blocks = (int) ((n_tokens + GGML_CUDA_FUSED_LINEAR_CE_THREADS - 1) /
+        GGML_CUDA_FUSED_LINEAR_CE_THREADS);
+    ggml_cuda_fused_linear_ce_finish_kernel<<<finish_blocks, GGML_CUDA_FUSED_LINEAR_CE_THREADS, 0, stream>>>(
+        (const int32_t *) labels->data, (const float *) weights->data,
+        running_max.ptr, running_sum.ptr, target_logit.ptr, (float *) dst->data,
+        n_tokens, n_vocab);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static void ggml_cuda_fused_linear_cross_entropy_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * grad = dst->src[0];
+    const ggml_tensor * weight = dst->src[1];
+    const ggml_tensor * input = dst->src[2];
+    const ggml_tensor * labels = dst->src[3];
+    const ggml_tensor * weights = dst->src[4];
+    const ggml_tensor * stats = dst->src[5];
+    const int64_t n_embd = weight->ne[0];
+    const int64_t n_vocab = weight->ne[1];
+    const int64_t n_tokens = input->ne[1];
+    const int64_t vocab_chunk = std::min<int64_t>(
+        n_vocab, ggml_get_op_params_i32(dst, 13));
+    float softcap = 0.0f;
+    memcpy(&softcap, dst->op_params + 12 * sizeof(int32_t), sizeof(softcap));
+    GGML_ASSERT(vocab_chunk > 0);
+
+    ggml_cuda_pool_alloc<float> logits(ctx.pool(), (size_t) vocab_chunk * (size_t) n_tokens);
+    ggml_cuda_pool_alloc<float> grad_input_tile(ctx.pool(), (size_t) n_embd * (size_t) n_tokens);
+    const cudaStream_t stream = ctx.stream();
+    CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
+
+    for (int64_t vocab_start = 0; vocab_start < n_vocab; vocab_start += vocab_chunk) {
+        const int64_t n_vocab_tile = std::min(vocab_chunk, n_vocab - vocab_start);
+
+        ggml_tensor weight_tile = *weight;
+        weight_tile.ne[1] = n_vocab_tile;
+        weight_tile.ne[2] = 1;
+        weight_tile.ne[3] = 1;
+        weight_tile.data = (char *) weight->data + vocab_start * weight->nb[1];
+        weight_tile.view_src = const_cast<ggml_tensor *>(weight);
+        weight_tile.view_offs = (size_t) vocab_start * weight->nb[1];
+
+        ggml_tensor logits_tile = {};
+        logits_tile.type = GGML_TYPE_F32;
+        logits_tile.op = GGML_OP_MUL_MAT;
+        logits_tile.src[0] = &weight_tile;
+        logits_tile.src[1] = const_cast<ggml_tensor *>(input);
+        memcpy(logits_tile.op_params, dst->op_params, sizeof(logits_tile.op_params));
+        logits_tile.ne[0] = n_vocab_tile;
+        logits_tile.ne[1] = n_tokens;
+        logits_tile.ne[2] = 1;
+        logits_tile.ne[3] = 1;
+        logits_tile.nb[0] = sizeof(float);
+        logits_tile.nb[1] = (size_t) n_vocab_tile * sizeof(float);
+        logits_tile.nb[2] = logits_tile.nb[1] * (size_t) n_tokens;
+        logits_tile.nb[3] = logits_tile.nb[2];
+        logits_tile.data = logits.ptr;
+
+        ggml_cuda_mul_mat(ctx, &weight_tile, input, &logits_tile);
+        const int64_t n_logits = n_vocab_tile * n_tokens;
+        const int grad_blocks = (int) ((n_logits + 255) / 256);
+        ggml_cuda_fused_linear_ce_logits_to_grad_kernel<<<grad_blocks, 256, 0, stream>>>(
+            logits.ptr, (const int32_t *) labels->data, (const float *) weights->data,
+            (const float *) grad->data, (const float *) stats->data + n_tokens,
+            n_vocab_tile, n_tokens, vocab_start, n_vocab, softcap);
+        CUDA_CHECK(cudaGetLastError());
+
+        ggml_tensor grad_input_desc = {};
+        grad_input_desc.type = GGML_TYPE_F32;
+        grad_input_desc.op = GGML_OP_MUL_MAT;
+        grad_input_desc.src[0] = &weight_tile;
+        grad_input_desc.src[1] = &logits_tile;
+        memcpy(grad_input_desc.op_params, dst->op_params, sizeof(grad_input_desc.op_params));
+        grad_input_desc.ne[0] = n_embd;
+        grad_input_desc.ne[1] = n_tokens;
+        grad_input_desc.ne[2] = 1;
+        grad_input_desc.ne[3] = 1;
+        grad_input_desc.nb[0] = sizeof(float);
+        grad_input_desc.nb[1] = (size_t) n_embd * sizeof(float);
+        grad_input_desc.nb[2] = grad_input_desc.nb[1] * (size_t) n_tokens;
+        grad_input_desc.nb[3] = grad_input_desc.nb[2];
+        grad_input_desc.data = grad_input_tile.ptr;
+
+        ggml_cuda_mul_mat(ctx, &weight_tile, &logits_tile, &grad_input_desc);
+        const int64_t n_input_grad = n_embd * n_tokens;
+        const int accum_blocks = (int) ((n_input_grad + 255) / 256);
+        ggml_cuda_fused_linear_ce_accumulate_kernel<<<accum_blocks, 256, 0, stream>>>(
+            grad_input_tile.ptr, (float *) dst->data, n_input_grad);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
 // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
@@ -3303,6 +3600,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_EXT_CROSS_ENTROPY_LOSS_SPARSE:
             ggml_cuda_cross_entropy_loss_sparse(ctx, dst);
             break;
+        case GGML_OP_EXT_FUSED_LINEAR_CROSS_ENTROPY:
+            ggml_cuda_fused_linear_cross_entropy(ctx, dst);
+            break;
         case GGML_OP_TRI:
             ggml_cuda_op_tri(ctx, dst);
             break;
@@ -3335,6 +3635,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_EXT_CROSS_ENTROPY_LOSS_SPARSE_BACK:
             ggml_cuda_cross_entropy_loss_sparse_back(ctx, dst);
+            break;
+        case GGML_OP_EXT_FUSED_LINEAR_CROSS_ENTROPY_BACK:
+            ggml_cuda_fused_linear_cross_entropy_back(ctx, dst);
             break;
         case GGML_OP_OPT_STEP_ADAMW:
             ggml_cuda_opt_step_adamw(ctx, dst);
@@ -7195,6 +7498,13 @@ static bool ggml_backend_cuda_device_supports_op_impl(ggml_backend_dev_t dev, co
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_EXT_CROSS_ENTROPY_LOSS_SPARSE:
         case GGML_OP_EXT_CROSS_ENTROPY_LOSS_SPARSE_BACK:
+            return true;
+        case GGML_OP_EXT_FUSED_LINEAR_CROSS_ENTROPY:
+            return op->src[0] && op->src[1] && op->src[1]->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
+        case GGML_OP_EXT_FUSED_LINEAR_CROSS_ENTROPY_BACK:
+            return op->src[1] && op->src[2] && op->src[2]->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op->src[2]);
         case GGML_OP_OPT_STEP_SGD:
         case GGML_OP_FILL:
         case GGML_OP_CUMSUM:

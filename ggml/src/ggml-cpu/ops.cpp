@@ -12829,6 +12829,199 @@ void ggml_compute_forward_cross_entropy_loss_sparse_back(
     }
 }
 
+static void ggml_fused_linear_cross_entropy_get_weight_row_f32(
+        const ggml_tensor * weight,
+        int64_t vocab_row,
+        float * output) {
+    const int64_t n_embd = weight->ne[0];
+    const void * row = (const char *) weight->data + vocab_row * weight->nb[1];
+    if (weight->type == GGML_TYPE_F32) {
+        memcpy(output, row, (size_t) n_embd * sizeof(float));
+        return;
+    }
+    const ggml_type_traits * traits = ggml_get_type_traits(weight->type);
+    GGML_ASSERT(traits && traits->to_float);
+    traits->to_float(row, output, n_embd);
+}
+
+// Fused linear projection + sparse cross entropy with vocabulary-axis tiling.
+// Each quantized weight row is converted once per forward pass and is reused
+// across every token in the batch. Only per-token LSE/loss statistics persist.
+void ggml_compute_forward_fused_linear_cross_entropy(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    GGML_UNUSED(params);
+    const ggml_tensor * weight  = dst->src[0];
+    const ggml_tensor * input   = dst->src[1];
+    const ggml_tensor * labels  = dst->src[2];
+    const ggml_tensor * weights = dst->src[3];
+    const int64_t n_embd   = weight->ne[0];
+    const int64_t n_vocab  = weight->ne[1];
+    const int64_t n_tokens = input->ne[1];
+    const int64_t vocab_chunk = std::min<int64_t>(
+        n_vocab, ggml_get_op_params_i32(dst, 13));
+    float softcap = 0.0f;
+    memcpy(&softcap, dst->op_params + 12 * sizeof(int32_t), sizeof(softcap));
+
+    GGML_ASSERT(input->type == GGML_TYPE_F32 && ggml_is_contiguous(input));
+    GGML_ASSERT(ggml_is_contiguous(weight));
+    GGML_ASSERT(labels->type == GGML_TYPE_I32 && ggml_is_contiguous(labels));
+    GGML_ASSERT(weights->type == GGML_TYPE_F32 && ggml_is_contiguous(weights));
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_nelements(dst) == 2 * n_tokens);
+    GGML_ASSERT(vocab_chunk > 0);
+
+    const int32_t * label_data = (const int32_t *) labels->data;
+    const float * row_weights = (const float *) weights->data;
+    const float * input_data = (const float *) input->data;
+    float * stats = (float *) dst->data;
+    for (int64_t token = 0; token < n_tokens; ++token) {
+        GGML_ASSERT(label_data[token] == -1 || (label_data[token] >= 0 && label_data[token] < n_vocab));
+        GGML_ASSERT(std::isfinite(row_weights[token]) && row_weights[token] >= 0.0f);
+    }
+
+    std::vector<float> weight_row((size_t) n_embd);
+    std::vector<float> tile_logits((size_t) vocab_chunk * (size_t) n_tokens);
+    std::vector<float> running_max((size_t) n_tokens, -INFINITY);
+    std::vector<double> running_sum((size_t) n_tokens, 0.0);
+    std::vector<float> target_logit((size_t) n_tokens, 0.0f);
+
+    for (int64_t vocab_start = 0; vocab_start < n_vocab; vocab_start += vocab_chunk) {
+        const int64_t n_vocab_tile = std::min(vocab_chunk, n_vocab - vocab_start);
+
+        // One dequantization per vocabulary row, reused for all input tokens.
+        for (int64_t v = 0; v < n_vocab_tile; ++v) {
+            const int64_t vocab = vocab_start + v;
+            ggml_fused_linear_cross_entropy_get_weight_row_f32(weight, vocab, weight_row.data());
+            for (int64_t token = 0; token < n_tokens; ++token) {
+                if (label_data[token] < 0 || row_weights[token] == 0.0f) {
+                    tile_logits[(size_t) v * n_tokens + token] = -INFINITY;
+                    continue;
+                }
+                const float * x = input_data + token * n_embd;
+                float logit = 0.0f;
+                for (int64_t i = 0; i < n_embd; ++i) {
+                    logit += weight_row[(size_t) i] * x[i];
+                }
+                if (softcap > 0.0f) {
+                    logit = softcap * std::tanh(logit / softcap);
+                }
+                tile_logits[(size_t) v * n_tokens + token] = logit;
+                if (label_data[token] == vocab) {
+                    target_logit[(size_t) token] = logit;
+                }
+            }
+        }
+
+        // Merge each vocabulary tile into the running log-sum-exp in a stable way.
+        for (int64_t token = 0; token < n_tokens; ++token) {
+            if (label_data[token] < 0 || row_weights[token] == 0.0f) {
+                continue;
+            }
+            float tile_max = -INFINITY;
+            for (int64_t v = 0; v < n_vocab_tile; ++v) {
+                tile_max = std::max(tile_max, tile_logits[(size_t) v * n_tokens + token]);
+            }
+            double tile_sum = 0.0;
+            for (int64_t v = 0; v < n_vocab_tile; ++v) {
+                tile_sum += std::exp((double) (tile_logits[(size_t) v * n_tokens + token] - tile_max));
+            }
+            const float new_max = std::max(running_max[(size_t) token], tile_max);
+            running_sum[(size_t) token] =
+                running_sum[(size_t) token] * std::exp((double) (running_max[(size_t) token] - new_max)) +
+                tile_sum * std::exp((double) (tile_max - new_max));
+            running_max[(size_t) token] = new_max;
+        }
+    }
+
+    for (int64_t token = 0; token < n_tokens; ++token) {
+        if (label_data[token] < 0 || row_weights[token] == 0.0f) {
+            stats[token] = 0.0f;
+            stats[n_tokens + token] = 0.0f;
+            continue;
+        }
+        GGML_ASSERT(std::isfinite(row_weights[token]) && row_weights[token] >= 0.0f);
+        GGML_ASSERT(label_data[token] < n_vocab);
+        const float lse = running_max[(size_t) token] +
+            std::log((float) running_sum[(size_t) token]);
+        stats[token] = row_weights[token] * (lse - target_logit[(size_t) token]);
+        stats[n_tokens + token] = lse;
+    }
+}
+
+// Backward reuses the forward LSE and dequantizes each output row exactly once.
+// The resulting gradient is accumulated directly into [n_embd, n_tokens].
+void ggml_compute_forward_fused_linear_cross_entropy_back(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    GGML_UNUSED(params);
+    const ggml_tensor * grad   = dst->src[0];
+    const ggml_tensor * weight = dst->src[1];
+    const ggml_tensor * input  = dst->src[2];
+    const ggml_tensor * labels = dst->src[3];
+    const ggml_tensor * weights = dst->src[4];
+    const ggml_tensor * stats  = dst->src[5];
+    const int64_t n_embd   = weight->ne[0];
+    const int64_t n_vocab  = weight->ne[1];
+    const int64_t n_tokens = input->ne[1];
+    float softcap = 0.0f;
+    memcpy(&softcap, dst->op_params + 12 * sizeof(int32_t), sizeof(softcap));
+
+    GGML_ASSERT(ggml_nelements(grad) == 2 * n_tokens);
+    GGML_ASSERT(input->type == GGML_TYPE_F32 && ggml_is_contiguous(input));
+    GGML_ASSERT(ggml_is_contiguous(weight));
+    GGML_ASSERT(labels->type == GGML_TYPE_I32 && ggml_is_contiguous(labels));
+    GGML_ASSERT(weights->type == GGML_TYPE_F32 && ggml_is_contiguous(weights));
+    GGML_ASSERT(ggml_nelements(stats) == 2 * n_tokens);
+    GGML_ASSERT(ggml_are_same_shape(dst, input));
+
+    const int32_t * label_data = (const int32_t *) labels->data;
+    const float * row_weights = (const float *) weights->data;
+    const float * input_data = (const float *) input->data;
+    const float * token_grad = (const float *) grad->data;
+    const float * lse = (const float *) stats->data + n_tokens;
+    float * input_grad = (float *) dst->data;
+    std::fill(input_grad, input_grad + n_embd * n_tokens, 0.0f);
+    for (int64_t token = 0; token < n_tokens; ++token) {
+        GGML_ASSERT(label_data[token] == -1 || (label_data[token] >= 0 && label_data[token] < n_vocab));
+        GGML_ASSERT(std::isfinite(row_weights[token]) && row_weights[token] >= 0.0f);
+    }
+
+    std::vector<float> weight_row((size_t) n_embd);
+    for (int64_t vocab = 0; vocab < n_vocab; ++vocab) {
+        ggml_fused_linear_cross_entropy_get_weight_row_f32(weight, vocab, weight_row.data());
+        for (int64_t token = 0; token < n_tokens; ++token) {
+            const int32_t label = label_data[token];
+            const float row_weight = row_weights[token];
+            if (label < 0 || row_weight == 0.0f || token_grad[token] == 0.0f) {
+                continue;
+            }
+            GGML_ASSERT(label < n_vocab);
+            float raw_logit = 0.0f;
+            const float * x = input_data + token * n_embd;
+            for (int64_t i = 0; i < n_embd; ++i) {
+                raw_logit += weight_row[(size_t) i] * x[i];
+            }
+            float logit = raw_logit;
+            float derivative = 1.0f;
+            if (softcap > 0.0f) {
+                const float tanh_logit = std::tanh(raw_logit / softcap);
+                logit = softcap * tanh_logit;
+                derivative = 1.0f - tanh_logit * tanh_logit;
+            }
+            const float probability = std::exp(logit - lse[token]);
+            const float dlogit = (probability - (vocab == label ? 1.0f : 0.0f)) *
+                row_weight * token_grad[token] * derivative;
+            if (dlogit == 0.0f) {
+                continue;
+            }
+            float * dx = input_grad + token * n_embd;
+            for (int64_t i = 0; i < n_embd; ++i) {
+                dx[i] += weight_row[(size_t) i] * dlogit;
+            }
+        }
+    }
+}
+
 static void ggml_compute_forward_opt_step_adamw_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {

@@ -252,6 +252,85 @@ static bool test_sparse_cross_entropy_dense_equivalence(ggml_backend_t backend) 
     return true;
 }
 
+static bool test_fused_linear_cross_entropy_vocab_tiling(ggml_backend_t backend, enum ggml_type weight_type) {
+    constexpr int64_t n_embd = 32;
+    constexpr int64_t n_vocab = 37;
+    constexpr int64_t n_tokens = 5;
+    constexpr int32_t vocab_chunk = 8;
+    constexpr float softcap = 2.75f;
+    const int32_t labels_data[n_tokens] = { 36, 7, -1, 19, 0 };
+    const float weights_data[n_tokens] = { 0.3f, 1.0f, 0.0f, 0.5f, 0.9f };
+
+    ggml_init_params init_params = { 4 * 1024 * 1024, nullptr, true };
+    ggml_context * ctx = ggml_init(init_params);
+    ggml_tensor * weight = ggml_new_tensor_2d(ctx, weight_type, n_embd, n_vocab);
+    ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_set_param(input);
+    ggml_tensor * labels = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_tensor * weights = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_tokens);
+
+    ggml_tensor * logits = ggml_mul_mat(ctx, weight, input);
+    ggml_tensor * capped_logits = ggml_scale(ctx,
+        ggml_tanh(ctx, ggml_scale(ctx, logits, 1.0f / softcap)), softcap);
+    ggml_tensor * reference_loss = ggml_cross_entropy_loss_sparse(ctx, capped_logits, labels, weights);
+
+    ggml_tensor * fused_stats = ggml_fused_linear_cross_entropy(
+        ctx, weight, input, labels, weights, softcap, vocab_chunk);
+    ggml_tensor * fused_loss_tokens = ggml_view_1d(ctx, fused_stats, n_tokens, 0);
+    ggml_tensor * fused_loss = ggml_scale(ctx, ggml_sum(ctx, fused_loss_tokens), 1.0f / n_tokens);
+    ggml_tensor * difference = ggml_sub(ctx, fused_loss, reference_loss);
+    ggml_set_loss(difference);
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 512, true);
+    ggml_build_forward_expand(graph, difference);
+    ggml_build_backward_expand(ctx, graph, nullptr);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    GGML_ASSERT(buffer != nullptr);
+
+    std::vector<float> weight_data(n_embd * n_vocab);
+    std::vector<float> input_data(n_embd * n_tokens);
+    for (size_t i = 0; i < weight_data.size(); ++i) {
+        weight_data[i] = (float) ((int) (i * 17 % 43) - 21) * 0.013f;
+    }
+    for (size_t i = 0; i < input_data.size(); ++i) {
+        input_data[i] = (float) ((int) (i * 11 % 29) - 14) * 0.021f;
+    }
+    if (weight_type == GGML_TYPE_F32) {
+        ggml_backend_tensor_set(weight, weight_data.data(), 0, ggml_nbytes(weight));
+    } else {
+        std::vector<uint8_t> quantized_weight_data(ggml_nbytes(weight));
+        ggml_quantize_chunk(weight_type, weight_data.data(), quantized_weight_data.data(),
+            0, n_vocab, n_embd, nullptr);
+        ggml_backend_tensor_set(weight, quantized_weight_data.data(), 0, ggml_nbytes(weight));
+    }
+    ggml_backend_tensor_set(input, input_data.data(), 0, ggml_nbytes(input));
+    ggml_backend_tensor_set(labels, labels_data, 0, sizeof(labels_data));
+    ggml_backend_tensor_set(weights, weights_data, 0, sizeof(weights_data));
+
+    const ggml_status status = ggml_backend_graph_compute(backend, graph);
+    float difference_value = NAN;
+    ggml_backend_tensor_get(difference, &difference_value, 0, sizeof(difference_value));
+
+    ggml_tensor * input_grad = ggml_graph_get_grad(graph, input);
+    std::vector<float> grad(ggml_nelements(input_grad));
+    ggml_backend_tensor_get(input_grad, grad.data(), 0, ggml_nbytes(input_grad));
+    float max_grad = 0.0f;
+    for (float value : grad) max_grad = std::max(max_grad, std::fabs(value));
+
+    const float tolerance = weight_type == GGML_TYPE_F32 ? 2e-6f : 1e-4f;
+    const bool ok = status == GGML_STATUS_SUCCESS && std::isfinite(difference_value) &&
+        std::fabs(difference_value) < tolerance && max_grad < tolerance;
+    if (!ok) {
+        fprintf(stderr, "vocabulary-tiled fused CE mismatch: weight_type=%s status=%d loss_diff=%g max_grad=%g\n",
+                ggml_type_name(weight_type), (int) status, difference_value, max_grad);
+    }
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return ok;
+}
+
 static std::pair<int, int> test_sparse_cross_entropy(
         enum ggml_opt_optimizer_type optimizer,
         ggml_backend_sched_t backend_sched,
@@ -867,6 +946,51 @@ static std::pair<int, int> test_dynamic_activation_checkpointing(
     return std::make_pair(npass, ntest);
 }
 
+static bool test_graph_reset_gradients_preserves_optimizer_state(ggml_backend_t backend) {
+    ggml_init_params params = { 1024 * 1024, nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+    ggml_tensor * weights = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    ggml_set_param(weights);
+    ggml_tensor * grad = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    ggml_tensor * moment_m = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    ggml_tensor * moment_v = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    ggml_tensor * optimizer_params = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 7);
+    ggml_tensor * updated = ggml_opt_step_adamw(ctx, weights, grad, moment_m, moment_v, optimizer_params);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 16, /* grads = */ true);
+    ggml_build_forward_expand(graph, updated);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    GGML_ASSERT(buffer != nullptr);
+
+    const float initial_m[4] = { 1.0f, 2.0f, 3.0f, 4.0f };
+    const float initial_v[4] = { 4.0f, 3.0f, 2.0f, 1.0f };
+    float actual_m[4] = {};
+    float actual_v[4] = {};
+    ggml_backend_tensor_set(moment_m, initial_m, 0, sizeof(initial_m));
+    ggml_backend_tensor_set(moment_v, initial_v, 0, sizeof(initial_v));
+
+    // Resetting the gradient graph between training steps must not clear
+    // AdamW's persistent momenta, even when the update node is in this graph.
+    ggml_graph_reset_gradients(graph);
+    ggml_backend_tensor_get(moment_m, actual_m, 0, sizeof(actual_m));
+    ggml_backend_tensor_get(moment_v, actual_v, 0, sizeof(actual_v));
+    bool ok = std::memcmp(initial_m, actual_m, sizeof(initial_m)) == 0 &&
+        std::memcmp(initial_v, actual_v, sizeof(initial_v)) == 0;
+
+    // The full reset keeps its original contract and does clear optimizer state.
+    ggml_graph_reset(graph);
+    ggml_backend_tensor_get(moment_m, actual_m, 0, sizeof(actual_m));
+    ggml_backend_tensor_get(moment_v, actual_v, 0, sizeof(actual_v));
+    for (int i = 0; i < 4; ++i) {
+        ok = ok && actual_m[i] == 0.0f && actual_v[i] == 0.0f;
+    }
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return ok;
+}
+
+
 static void helper_after_test_gradient_accumulation(
         enum ggml_opt_optimizer_type optim,
         const char * func, const int nbatch_physical, const enum ggml_opt_loss_type loss_type, const int epoch,
@@ -1143,6 +1267,10 @@ static std::pair<int, int> test_backend(
     bool const adamw = optim == GGML_OPT_OPTIMIZER_TYPE_ADAMW;
     if (adamw) {
         {
+            const bool reset_ok = test_graph_reset_gradients_preserves_optimizer_state(backend);
+            print_ok("test_graph_reset_gradients_preserves_optimizer_state", reset_ok, npass, ntest);
+        }
+        {
             std::pair<int, int> partial = test_dynamic_activation_checkpointing(backend_sched, backend);
             npass += partial.first;
             ntest += partial.second;
@@ -1245,6 +1373,14 @@ int main(void) {
                 printf("  sparse/dense cross entropy equivalence: ");
                 print_ok(equivalent);
                 GGML_ASSERT(equivalent);
+                const bool fused_tiled_f32 = test_fused_linear_cross_entropy_vocab_tiling(backends[i], GGML_TYPE_F32);
+                printf("  vocabulary-tiled fused linear cross entropy (F32): ");
+                print_ok(fused_tiled_f32);
+                GGML_ASSERT(fused_tiled_f32);
+                const bool fused_tiled_q4 = test_fused_linear_cross_entropy_vocab_tiling(backends[i], GGML_TYPE_Q4_0);
+                printf("  vocabulary-tiled fused linear cross entropy (Q4_0): ");
+                print_ok(fused_tiled_q4);
+                GGML_ASSERT(fused_tiled_q4);
             }
 
             std::pair<int, int> result;

@@ -36,6 +36,9 @@ extern "C" {
         // I32 labels contain class IDs in [0, nclasses); -1 and zero weights ignore a row.
         // Weights must be finite and nonnegative. The loss is averaged over all rows.
         GGML_OPT_LOSS_TYPE_SPARSE_CROSS_ENTROPY,
+        // Fused frozen linear output projection and sparse cross entropy.
+        // The output logits are not materialized; the vocabulary axis is tiled.
+        GGML_OPT_LOSS_TYPE_FUSED_LINEAR_CROSS_ENTROPY,
     };
 
     // ====== Dataset ======

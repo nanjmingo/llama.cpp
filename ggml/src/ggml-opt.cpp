@@ -62,6 +62,7 @@ struct ggml_opt_context {
     struct ggml_tensor * pred     = nullptr;
     struct ggml_tensor * ncorrect = nullptr;
     struct ggml_tensor * nvalid   = nullptr;
+    bool uses_fused_linear_cross_entropy = false;
 
     struct ggml_cgraph * gf      = nullptr;
     struct ggml_cgraph * gb_grad = nullptr;
@@ -1055,6 +1056,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
 
     ggml_set_input(opt_ctx->inputs);
     ggml_set_output(opt_ctx->outputs);
+    opt_ctx->uses_fused_linear_cross_entropy = false;
 
     for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
         const struct ggml_tensor * node = opt_ctx->gf->nodes[i];
@@ -1071,7 +1073,8 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         constexpr size_t n_loss = 1;
         const size_t tensors_const = opt_ctx->static_graphs ?
             9 + (opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY ? 11 :
-                 opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_SPARSE_CROSS_ENTROPY ? 13 : 0) : 0;
+                 opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_SPARSE_CROSS_ENTROPY ? 13 :
+                 opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_FUSED_LINEAR_CROSS_ENTROPY ? 18 : 0) : 0;
         const size_t size_meta = (n_loss + tensors_const) * ggml_tensor_overhead();
         struct ggml_init_params params = {
             /*.mem_size   =*/ size_meta,
@@ -1150,6 +1153,101 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             opt_ctx->loss_per_datapoint = true;
             break;
         }
+        case GGML_OPT_LOSS_TYPE_FUSED_LINEAR_CROSS_ENTROPY: {
+            const int64_t nrows = ggml_nrows(opt_ctx->outputs);
+            opt_ctx->labels_sparse = ggml_new_tensor_1d(ctx_results, GGML_TYPE_I32, nrows);
+            ggml_set_input(opt_ctx->labels_sparse);
+            ggml_set_name(opt_ctx->labels_sparse, "labels_sparse");
+
+            opt_ctx->label_weights = ggml_new_tensor_1d(ctx_results, GGML_TYPE_F32, nrows);
+            ggml_set_input(opt_ctx->label_weights);
+            ggml_set_name(opt_ctx->label_weights, "label_weights");
+
+            const ggml_tensor * linear_output = opt_ctx->outputs;
+            float logit_softcap = 0.0f;
+
+            // Fold Gemma-style cap*tanh(logits/cap) into the fused operator.
+            if (linear_output->op == GGML_OP_SCALE && linear_output->src[0] &&
+                linear_output->src[0]->op == GGML_OP_UNARY &&
+                ggml_get_unary_op(linear_output->src[0]) == GGML_UNARY_OP_TANH &&
+                linear_output->src[0]->src[0] &&
+                linear_output->src[0]->src[0]->op == GGML_OP_SCALE &&
+                linear_output->src[0]->src[0]->src[0]) {
+                float outer_params[2] = {};
+                float inner_params[2] = {};
+                memcpy(outer_params, linear_output->op_params, sizeof(outer_params));
+                memcpy(inner_params, linear_output->src[0]->src[0]->op_params, sizeof(inner_params));
+                const float cap = outer_params[0];
+                if (cap > 0.0f && outer_params[1] == 0.0f && inner_params[1] == 0.0f &&
+                    std::fabs(inner_params[0] * cap - 1.0f) < 1e-5f) {
+                    logit_softcap = cap;
+                    linear_output = linear_output->src[0]->src[0]->src[0];
+                }
+            }
+
+            // Fold an optional scalar output-weight scale into the hidden input.
+            ggml_tensor * linear_input = nullptr;
+            if (linear_output->op == GGML_OP_MUL && linear_output->src[0] && linear_output->src[1]) {
+                const ggml_tensor * matmul = linear_output->src[0]->op == GGML_OP_MUL_MAT ? linear_output->src[0] :
+                    linear_output->src[1]->op == GGML_OP_MUL_MAT ? linear_output->src[1] : nullptr;
+                const ggml_tensor * scale = matmul == linear_output->src[0] ? linear_output->src[1] :
+                    matmul == linear_output->src[1] ? linear_output->src[0] : nullptr;
+                if (matmul && scale && scale->type == GGML_TYPE_F32 && ggml_is_scalar(scale) &&
+                    !(scale->flags & GGML_TENSOR_FLAG_PARAM)) {
+                    linear_output = matmul;
+                    linear_input = ggml_mul(ctx_results, linear_output->src[1], const_cast<ggml_tensor *>(scale));
+                    ggml_set_name(linear_input, "fused_linear_cross_entropy_scaled_input");
+                }
+            }
+            if (!linear_input && linear_output->op == GGML_OP_MUL_MAT) {
+                linear_input = linear_output->src[1];
+            }
+
+            const ggml_type_traits * weight_traits = linear_output->src[0]
+                ? ggml_get_type_traits(linear_output->src[0]->type) : nullptr;
+            const bool direct_linear = linear_output->op == GGML_OP_MUL_MAT &&
+                linear_output->src[0] && linear_input &&
+                !(linear_output->src[0]->flags & GGML_TENSOR_FLAG_PARAM) &&
+                weight_traits && weight_traits->to_float &&
+                linear_input->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(linear_output->src[0]) && ggml_is_contiguous(linear_input) &&
+                linear_output->src[0]->ne[0] == linear_input->ne[0] &&
+                linear_output->src[0]->ne[1] == opt_ctx->outputs->ne[0] &&
+                linear_input->ne[1] == opt_ctx->outputs->ne[1] &&
+                linear_output->src[0]->ne[2] == 1 && linear_output->src[0]->ne[3] == 1 &&
+                linear_input->ne[2] == 1 && linear_input->ne[3] == 1;
+
+            if (direct_linear) {
+                constexpr int32_t vocab_chunk_size = 256;
+                struct ggml_tensor * stats = ggml_fused_linear_cross_entropy(ctx_results,
+                    linear_output->src[0], linear_input, opt_ctx->labels_sparse,
+                    opt_ctx->label_weights, logit_softcap, vocab_chunk_size);
+                // Preserve matmul precision and accumulator policy in the fused op.
+                memcpy(stats->op_params, linear_output->op_params, sizeof(linear_output->op_params));
+                memcpy(stats->op_params + 12 * sizeof(int32_t), &logit_softcap, sizeof(logit_softcap));
+                ggml_set_op_params_i32(stats, 13, vocab_chunk_size);
+                ggml_set_name(stats, "fused_linear_cross_entropy_stats");
+
+                struct ggml_tensor * per_token_loss = ggml_view_1d(ctx_results, stats, nrows, 0);
+                ggml_set_name(per_token_loss, "fused_linear_cross_entropy_per_token_loss");
+                opt_ctx->loss = ggml_sum(ctx_results, per_token_loss);
+                const float loss_scale = 1.0f / (float) (nrows * opt_ctx->opt_period);
+                opt_ctx->loss = ggml_scale(ctx_results, opt_ctx->loss, loss_scale);
+                ggml_set_name(opt_ctx->loss, "loss_fused_linear_cross_entropy");
+                opt_ctx->uses_fused_linear_cross_entropy = true;
+            } else {
+                // Preserve the sparse fallback for trainable heads, adapters,
+                // non-scalar output transforms, and unsupported tensor layouts.
+                opt_ctx->loss = ggml_cross_entropy_loss_sparse(
+                    ctx_results, opt_ctx->outputs, opt_ctx->labels_sparse, opt_ctx->label_weights);
+                if (opt_ctx->opt_period > 1) {
+                    opt_ctx->loss = ggml_scale(ctx_results, opt_ctx->loss, 1.0f / opt_ctx->opt_period);
+                }
+                ggml_set_name(opt_ctx->loss, "loss_cross_entropy_sparse_fallback");
+            }
+            opt_ctx->loss_per_datapoint = true;
+            break;
+        }
         case GGML_OPT_LOSS_TYPE_MEAN_SQUARED_ERROR: {
             opt_ctx->labels = ggml_dup_tensor(ctx_results, opt_ctx->outputs);
             ggml_set_input(opt_ctx->labels);
@@ -1172,7 +1270,9 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     ggml_build_forward_expand(opt_ctx->gf, opt_ctx->loss);
 
     if (opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY ||
-            opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_SPARSE_CROSS_ENTROPY) {
+            opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_SPARSE_CROSS_ENTROPY ||
+            (opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_FUSED_LINEAR_CROSS_ENTROPY &&
+             !opt_ctx->uses_fused_linear_cross_entropy)) {
         opt_ctx->pred = ggml_argmax(ctx_results, opt_ctx->outputs);
         ggml_set_name(opt_ctx->pred, "pred");
         ggml_set_output(opt_ctx->pred);
@@ -1335,7 +1435,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         }
     } else if (opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_GRAD) {
         opt_ctx->buf_static = ggml_backend_alloc_ctx_tensors(opt_ctx->ctx_static, ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0));
-        ggml_graph_reset(opt_ctx->gb_grad);
+        ggml_graph_reset_gradients(opt_ctx->gb_grad);
     }
 
     GGML_ASSERT(opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT);
@@ -1375,7 +1475,8 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         if (grad && (node->flags & GGML_TENSOR_FLAG_PARAM)) {
             if (opt_ctx->loss_normalizer > 0.0f) {
                 GGML_ASSERT(opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY ||
-                    opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_SPARSE_CROSS_ENTROPY);
+                    opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_SPARSE_CROSS_ENTROPY ||
+                    opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_FUSED_LINEAR_CROSS_ENTROPY);
                 const float scale = static_cast<float>(
                     ggml_nrows(opt_ctx->outputs) * opt_ctx->opt_period) / opt_ctx->loss_normalizer;
                 grad = ggml_scale(opt_ctx->ctx_compute, grad, scale);
@@ -1407,10 +1508,10 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     if (!opt_ctx->buf_static) {
         opt_ctx->buf_static = ggml_backend_alloc_ctx_tensors(
             opt_ctx->ctx_static, ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0));
-        // In dynamic mode the persistent parameter gradient accumulators belong
-        // to gb_grad. Optimizer updates may share that graph when neither gradient
-        // accumulation nor activation checkpointing requires a separate update.
-        ggml_graph_reset(opt_ctx->static_graphs ? opt_ctx->gb_opt : opt_ctx->gb_grad);
+        // Reset gradient accumulators without clearing AdamW state. In the
+        // single-microbatch dynamic path, optimizer nodes share gb_grad, but
+        // their momenta must persist across optimizer steps.
+        ggml_graph_reset_gradients(opt_ctx->static_graphs ? opt_ctx->gb_opt : opt_ctx->gb_grad);
     }
 
     opt_ctx->buf_cpu = ggml_backend_alloc_ctx_tensors_from_buft(opt_ctx->ctx_cpu, ggml_backend_cpu_buffer_type());
@@ -1885,7 +1986,8 @@ void ggml_opt_set_loss_normalizer(ggml_opt_context_t opt_ctx, float loss_normali
     GGML_ASSERT(opt_ctx != nullptr);
     GGML_ASSERT(std::isfinite(loss_normalizer) && loss_normalizer > 0.0f);
     GGML_ASSERT(opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY ||
-        opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_SPARSE_CROSS_ENTROPY);
+        opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_SPARSE_CROSS_ENTROPY ||
+        opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_FUSED_LINEAR_CROSS_ENTROPY);
     GGML_ASSERT(!opt_ctx->static_graphs && "loss normalization is only supported for dynamic graphs");
     GGML_ASSERT(!opt_ctx->eval_ready);
     GGML_ASSERT(opt_ctx->opt_i == 0 && "loss normalizer can only change between optimizer steps");
@@ -1926,7 +2028,7 @@ void ggml_opt_reset(ggml_opt_context_t opt_ctx, bool optimizer) {
         }
         opt_ctx->iter = 1;
     } else {
-        ggml_graph_reset(opt_ctx->gb_grad);
+        ggml_graph_reset_gradients(opt_ctx->gb_grad);
     }
 }
 
@@ -2082,7 +2184,7 @@ void ggml_opt_prepare_alloc(
 void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     GGML_ASSERT(!opt_ctx->eval_ready);
     if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_OPT && opt_ctx->opt_period > 1 && opt_ctx->opt_i == 0) {
-        ggml_graph_reset(opt_ctx->gb_grad);
+        ggml_graph_reset_gradients(opt_ctx->gb_grad);
     }
     if (backward) {
         const int32_t opt_i_next = (opt_ctx->opt_i + 1) % opt_ctx->opt_period;
@@ -2095,7 +2197,9 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
         ggml_opt_build(opt_ctx);
 
         if (opt_ctx->gb_grad && opt_ctx->opt_i == 0) {
-            ggml_graph_reset(opt_ctx->gb_grad);
+            // Keep optimizer state in-place; only gradient buffers are reset
+            // between steps, even when optimizer nodes are part of gb_grad.
+            ggml_graph_reset_gradients(opt_ctx->gb_grad);
         }
     }
 
@@ -2302,7 +2406,8 @@ void ggml_opt_epoch(
         ggml_opt_epoch_callback callback_eval) {
     GGML_ASSERT(ggml_opt_static_graphs(opt_ctx) && "ggml_opt_epoch requires static graphs");
     struct ggml_tensor * inputs = ggml_opt_inputs(opt_ctx);
-    const bool sparse_cross_entropy = opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_SPARSE_CROSS_ENTROPY;
+    const bool sparse_cross_entropy = opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_SPARSE_CROSS_ENTROPY ||
+        opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_FUSED_LINEAR_CROSS_ENTROPY;
     struct ggml_tensor * labels = sparse_cross_entropy
         ? ggml_opt_sparse_labels(opt_ctx) : ggml_opt_labels(opt_ctx);
     struct ggml_tensor * weights = sparse_cross_entropy

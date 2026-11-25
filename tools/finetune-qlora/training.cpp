@@ -118,6 +118,7 @@ bool train_adapter(const qlora_params & qparams,
         &schedule,
         params.optimizer,
         qlora_type_from_name(qparams.optimizer_state_type),
+        true,
     };
     const int64_t dataset_windows = ggml_opt_dataset_ndata(dataset.get());
     if (dataset_windows <= 0) {

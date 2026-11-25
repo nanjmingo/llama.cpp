@@ -4683,7 +4683,7 @@ void llm_graph_context::build_logits() const {
     }
 
     // the models declare t_logits without expanding it, so the LM head is computed only when it is expanded here
-    if (res->t_logits != nullptr) {
+    if (res->t_logits != nullptr && !(cparams.training && cparams.fused_linear_cross_entropy)) {
         ggml_build_forward_expand(gf, res->t_logits);
     }
 }

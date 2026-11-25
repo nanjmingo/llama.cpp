@@ -2311,6 +2311,16 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_cross_entropy_loss_sparse_back(params, tensor);
             }
             break;
+        case GGML_OP_EXT_FUSED_LINEAR_CROSS_ENTROPY:
+            {
+                ggml_compute_forward_fused_linear_cross_entropy(params, tensor);
+            }
+            break;
+        case GGML_OP_EXT_FUSED_LINEAR_CROSS_ENTROPY_BACK:
+            {
+                ggml_compute_forward_fused_linear_cross_entropy_back(params, tensor);
+            }
+            break;
         case GGML_OP_OPT_STEP_ADAMW:
             {
                 ggml_compute_forward_opt_step_adamw(params, tensor);
@@ -2671,6 +2681,13 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_OPT_STEP_SGD:
             {
                 n_tasks = n_threads;
+            } break;
+        case GGML_OP_EXT_FUSED_LINEAR_CROSS_ENTROPY:
+        case GGML_OP_EXT_FUSED_LINEAR_CROSS_ENTROPY_BACK:
+            {
+                // The vocabulary loop accumulates into shared per-token statistics
+                // and input gradients. Keep this reference CPU implementation serial.
+                n_tasks = 1;
             } break;
         case GGML_OP_NONE:
             {

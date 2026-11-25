@@ -445,6 +445,8 @@ extern "C" {
         GGML_OP_EXT_MUL_MAT_ID_BACK,
         GGML_OP_EXT_CROSS_ENTROPY_LOSS_SPARSE,
         GGML_OP_EXT_CROSS_ENTROPY_LOSS_SPARSE_BACK,
+        GGML_OP_EXT_FUSED_LINEAR_CROSS_ENTROPY,
+        GGML_OP_EXT_FUSED_LINEAR_CROSS_ENTROPY_BACK,
 
         GGML_OP_EXT_COUNT,
     };
@@ -2707,6 +2709,30 @@ extern "C" {
             struct ggml_tensor  * labels,  // I32 [nrows]
             struct ggml_tensor  * weights); // F32 [nrows]
 
+    // Fused linear projection and sparse cross entropy.
+    // weight: [n_embd, n_vocab], input: F32 [n_embd, n_tokens].
+    // The returned F32 vector has 2*n_tokens elements: weighted per-token
+    // losses followed by per-token log-sum-exp values used by backward.
+    // Vocabulary rows are processed in bounded chunks; no [n_vocab, n_tokens]
+    // logits tensor is materialized.
+    GGML_API struct ggml_tensor * ggml_fused_linear_cross_entropy(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * weight,
+            struct ggml_tensor  * input,
+            struct ggml_tensor  * labels,  // I32 [n_tokens], -1 means ignored
+            struct ggml_tensor  * weights, // F32 [n_tokens]
+            float                 logit_softcap,
+            int32_t               vocab_chunk_size);
+
+    GGML_API struct ggml_tensor * ggml_fused_linear_cross_entropy_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * grad,         // F32 [2*n_tokens], first half has d(loss)/d(loss_i)
+            struct ggml_tensor  * weight,
+            struct ggml_tensor  * input,
+            struct ggml_tensor  * labels,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * forward_stats); // output of ggml_fused_linear_cross_entropy
+
     // AdamW optimizer step
     // Paper: https://arxiv.org/pdf/1711.05101v3.pdf
     // PyTorch: https://pytorch.org/docs/stable/generated/torch.optim.AdamW.html
@@ -2778,6 +2804,7 @@ extern "C" {
     GGML_API struct ggml_cgraph * ggml_graph_dup       (struct ggml_context * ctx, struct ggml_cgraph * cgraph, bool force_grads);
     GGML_API void                 ggml_graph_cpy       (struct ggml_cgraph * src, struct ggml_cgraph * dst);
     GGML_API void                 ggml_graph_reset     (struct ggml_cgraph * cgraph); // set regular grads + optimizer momenta to 0, set loss grad to 1
+    GGML_API void                 ggml_graph_reset_gradients(struct ggml_cgraph * cgraph); // reset gradients only, preserving optimizer state
     GGML_API void                 ggml_graph_clear     (struct ggml_cgraph * cgraph);
 
     GGML_API int                   ggml_graph_size   (struct ggml_cgraph * cgraph);
