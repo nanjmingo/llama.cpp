@@ -445,6 +445,8 @@ extern "C" {
         GGML_OP_EXT_MUL_MAT_ID_BACK,
         GGML_OP_EXT_CROSS_ENTROPY_LOSS_SPARSE,
         GGML_OP_EXT_CROSS_ENTROPY_LOSS_SPARSE_BACK,
+        GGML_OP_EXT_FUSED_LINEAR_CROSS_ENTROPY,
+        GGML_OP_EXT_FUSED_LINEAR_CROSS_ENTROPY_BACK,
 
         GGML_OP_EXT_COUNT,
     };
@@ -2706,6 +2708,26 @@ extern "C" {
             struct ggml_tensor  * logits,
             struct ggml_tensor  * labels,  // I32 [nrows]
             struct ggml_tensor  * weights); // F32 [nrows]
+
+    // Fused linear + sparse cross entropy. The output matrix is not materialized;
+    // implementations process bounded token chunks and recompute them in backward.
+    // The weight matrix is [n_embd, n_vocab], input is F32 [n_embd, n_tokens].
+    // logit_softcap <= 0 disables soft-capping; otherwise applies cap*tanh(logit/cap).
+    GGML_API struct ggml_tensor * ggml_fused_linear_cross_entropy(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * weight,
+            struct ggml_tensor  * input,
+            struct ggml_tensor  * labels,  // I32 [n_tokens]
+            struct ggml_tensor  * weights, // F32 [n_tokens]
+            float                 logit_softcap); // 0 disables soft-capping
+
+    GGML_API struct ggml_tensor * ggml_fused_linear_cross_entropy_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * grad,    // scalar gradient of loss
+            struct ggml_tensor  * weight,
+            struct ggml_tensor  * input,
+            struct ggml_tensor  * labels,
+            struct ggml_tensor  * weights);
 
     // AdamW optimizer step
     // Paper: https://arxiv.org/pdf/1711.05101v3.pdf

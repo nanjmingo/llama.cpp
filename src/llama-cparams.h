@@ -53,6 +53,7 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
     bool training;           // set by llama_opt_init()
+    bool fused_linear_cross_entropy; // stream the frozen output projection into sparse CE
     bool moe_random_routing; // benchmark only: random expert ids in the MoE GEMMs
 
     size_t moe_cache_size;

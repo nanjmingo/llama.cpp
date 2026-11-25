@@ -1139,6 +1139,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_EXT_CROSS_ENTROPY_LOSS_SPARSE_BACK: {
                 split_state = handle_per_row(src_ss);
             } break;
+            case GGML_OP_EXT_FUSED_LINEAR_CROSS_ENTROPY: {
+                // Fused projection currently requires the output weight, hidden
+                // input, labels, and row weights to be mirrored on one device.
+                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+            } break;
+            case GGML_OP_EXT_FUSED_LINEAR_CROSS_ENTROPY_BACK: {
+                split_state = handle_generic(src_ss, /*scalar_only =*/ false);
+            } break;
             case GGML_OP_OPT_STEP_ADAMW:
             case GGML_OP_OPT_STEP_SGD:
             case GGML_OP_GLU: {

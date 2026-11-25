@@ -12829,6 +12829,171 @@ void ggml_compute_forward_cross_entropy_loss_sparse_back(
     }
 }
 
+// Fused output projection + sparse cross entropy. Logits are held only for one
+// token row at a time, so temporary storage is O(n_vocab), not O(n_vocab*n_tokens).
+void ggml_compute_forward_fused_linear_cross_entropy(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * weight  = dst->src[0];
+    const ggml_tensor * input   = dst->src[1];
+    const ggml_tensor * labels  = dst->src[2];
+    const ggml_tensor * weights = dst->src[3];
+
+    const int64_t n_embd   = weight->ne[0];
+    const int64_t n_vocab  = weight->ne[1];
+    const int64_t n_tokens = input->ne[1];
+    float logit_softcap = 0.0f;
+    memcpy(&logit_softcap, dst->op_params + sizeof(int32_t) * 8, sizeof(logit_softcap));
+    GGML_ASSERT(input->type == GGML_TYPE_F32 && ggml_is_contiguous(input));
+    GGML_ASSERT(ggml_is_contiguous(weight));
+    GGML_ASSERT(labels->type == GGML_TYPE_I32 && ggml_is_contiguous(labels));
+    GGML_ASSERT(weights->type == GGML_TYPE_F32 && ggml_is_contiguous(weights));
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_is_scalar(dst));
+    GGML_ASSERT(weight->ne[2] == 1 && weight->ne[3] == 1);
+
+    const ggml_type_traits * traits = ggml_get_type_traits(weight->type);
+    GGML_ASSERT(traits && traits->to_float);
+    const int32_t * label_data = (const int32_t *) labels->data;
+    const float * weight_data = (const float *) weights->data;
+    const float * input_data = (const float *) input->data;
+    float * partial_sums = (float *) params->wdata;
+    GGML_ASSERT(params->wsize >= sizeof(float) * params->nth);
+
+    const int64_t tokens_per_thread = (n_tokens + params->nth - 1) / params->nth;
+    const int64_t token_begin = tokens_per_thread * params->ith;
+    const int64_t token_end = MIN(token_begin + tokens_per_thread, n_tokens);
+    std::vector<float> weight_row((size_t) n_embd);
+    std::vector<float> logits((size_t) n_vocab);
+    float sum_thread = 0.0f;
+
+    for (int64_t token = token_begin; token < token_end; ++token) {
+        const int32_t label = label_data[token];
+        const float row_weight = weight_data[token];
+        GGML_ASSERT(std::isfinite(row_weight) && row_weight >= 0.0f);
+        GGML_ASSERT(label == -1 || (label >= 0 && label < n_vocab));
+        if (label == -1 || row_weight == 0.0f) {
+            continue;
+        }
+
+        const float * x = input_data + token * n_embd;
+        float max_logit = -INFINITY;
+        float target_logit = 0.0f;
+        for (int64_t vocab = 0; vocab < n_vocab; ++vocab) {
+            const void * row = (const char *) weight->data + vocab * weight->nb[1];
+            traits->to_float(row, weight_row.data(), n_embd);
+            float dot = 0.0f;
+            for (int64_t i = 0; i < n_embd; ++i) {
+                dot += weight_row[(size_t) i] * x[i];
+            }
+            const float effective_logit = logit_softcap > 0.0f
+                ? logit_softcap * std::tanh(dot / logit_softcap)
+                : dot;
+            logits[(size_t) vocab] = effective_logit;
+            max_logit = std::max(max_logit, effective_logit);
+            if (vocab == label) target_logit = effective_logit;
+        }
+
+        double sum_exp = 0.0;
+        for (float logit : logits) {
+            sum_exp += std::exp((double) (logit - max_logit));
+        }
+        sum_thread += (max_logit + std::log((float) sum_exp) - target_logit) * row_weight;
+    }
+
+    partial_sums[params->ith] = sum_thread;
+    ggml_barrier(params->threadpool);
+    if (params->ith == 0) {
+        float total = 0.0f;
+        for (int i = 0; i < params->nth; ++i) total += partial_sums[i];
+        ((float *) dst->data)[0] = total / (float) n_tokens;
+    }
+}
+
+void ggml_compute_forward_fused_linear_cross_entropy_back(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * grad    = dst->src[0];
+    const ggml_tensor * weight  = dst->src[1];
+    const ggml_tensor * input   = dst->src[2];
+    const ggml_tensor * labels  = dst->src[3];
+    const ggml_tensor * weights = dst->src[4];
+
+    const int64_t n_embd   = weight->ne[0];
+    const int64_t n_vocab  = weight->ne[1];
+    const int64_t n_tokens = input->ne[1];
+    float logit_softcap = 0.0f;
+    memcpy(&logit_softcap, dst->op_params + sizeof(int32_t) * 8, sizeof(logit_softcap));
+    GGML_ASSERT(ggml_is_scalar(grad) && grad->type == GGML_TYPE_F32);
+    GGML_ASSERT(input->type == GGML_TYPE_F32 && ggml_is_contiguous(input));
+    GGML_ASSERT(ggml_is_contiguous(weight));
+    GGML_ASSERT(labels->type == GGML_TYPE_I32 && ggml_is_contiguous(labels));
+    GGML_ASSERT(weights->type == GGML_TYPE_F32 && ggml_is_contiguous(weights));
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_are_same_shape(dst, input));
+
+    const ggml_type_traits * traits = ggml_get_type_traits(weight->type);
+    GGML_ASSERT(traits && traits->to_float);
+    const int32_t * label_data = (const int32_t *) labels->data;
+    const float * weight_data = (const float *) weights->data;
+    const float * input_data = (const float *) input->data;
+    const float scale = ((const float *) grad->data)[0] / (float) n_tokens;
+
+    const int64_t tokens_per_thread = (n_tokens + params->nth - 1) / params->nth;
+    const int64_t token_begin = tokens_per_thread * params->ith;
+    const int64_t token_end = MIN(token_begin + tokens_per_thread, n_tokens);
+    std::vector<float> weight_row((size_t) n_embd);
+    std::vector<float> logits((size_t) n_vocab);
+    std::vector<float> input_grad((size_t) n_embd);
+
+    for (int64_t token = token_begin; token < token_end; ++token) {
+        float * dx = (float *) dst->data + token * n_embd;
+        const int32_t label = label_data[token];
+        const float row_weight = weight_data[token];
+        GGML_ASSERT(std::isfinite(row_weight) && row_weight >= 0.0f);
+        GGML_ASSERT(label == -1 || (label >= 0 && label < n_vocab));
+        if (label == -1 || row_weight == 0.0f) {
+            std::fill(dx, dx + n_embd, 0.0f);
+            continue;
+        }
+
+        const float * x = input_data + token * n_embd;
+        float max_logit = -INFINITY;
+        for (int64_t vocab = 0; vocab < n_vocab; ++vocab) {
+            const void * row = (const char *) weight->data + vocab * weight->nb[1];
+            traits->to_float(row, weight_row.data(), n_embd);
+            float dot = 0.0f;
+            for (int64_t i = 0; i < n_embd; ++i) dot += weight_row[(size_t) i] * x[i];
+            const float effective_logit = logit_softcap > 0.0f
+                ? logit_softcap * std::tanh(dot / logit_softcap)
+                : dot;
+            logits[(size_t) vocab] = effective_logit;
+            max_logit = std::max(max_logit, effective_logit);
+        }
+
+        double sum_exp = 0.0;
+        for (float logit : logits) sum_exp += std::exp((double) (logit - max_logit));
+        std::fill(input_grad.begin(), input_grad.end(), 0.0f);
+        const float inv_sum = 1.0f / (float) sum_exp;
+        const float row_scale = row_weight * scale;
+        for (int64_t vocab = 0; vocab < n_vocab; ++vocab) {
+            float dlogit = (std::exp(logits[(size_t) vocab] - max_logit) * inv_sum -
+                (vocab == label ? 1.0f : 0.0f)) * row_scale;
+            const void * row = (const char *) weight->data + vocab * weight->nb[1];
+            traits->to_float(row, weight_row.data(), n_embd);
+            if (logit_softcap > 0.0f) {
+                float raw_logit = 0.0f;
+                for (int64_t i = 0; i < n_embd; ++i) raw_logit += weight_row[(size_t) i] * x[i];
+                const float tanh_logit = std::tanh(raw_logit / logit_softcap);
+                dlogit *= 1.0f - tanh_logit * tanh_logit;
+            }
+            if (dlogit == 0.0f) continue;
+            for (int64_t i = 0; i < n_embd; ++i) {
+                input_grad[(size_t) i] += weight_row[(size_t) i] * dlogit;
+            }
+        }
+        std::copy(input_grad.begin(), input_grad.end(), dx);
+    }
+}
+
 static void ggml_compute_forward_opt_step_adamw_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {

@@ -252,6 +252,80 @@ static bool test_sparse_cross_entropy_dense_equivalence(ggml_backend_t backend) 
     return true;
 }
 
+static bool test_fused_linear_cross_entropy_dense_equivalence(ggml_backend_t backend) {
+    constexpr int64_t n_embd = 7;
+    constexpr int64_t n_vocab = 19;
+    constexpr int64_t n_tokens = 4;
+    const int32_t labels_data[n_tokens] = { -1, 18, 7, 0 };
+    const float weights_data[n_tokens] = { 0.0f, 0.25f, 0.8f, 1.0f };
+
+    ggml_init_params init_params = { 1024 * 1024, nullptr, true };
+    ggml_context * ctx = ggml_init(init_params);
+    ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_vocab);
+    ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_set_param(input);
+    ggml_tensor * labels = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_tensor * weights = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_tokens);
+    ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+
+    ggml_tensor * logits = ggml_mul_mat(ctx, weight, input);
+    ggml_tensor * scaled_logits = ggml_mul(ctx, logits, scale);
+    ggml_tensor * scaled_input = ggml_mul(ctx, input, scale);
+    constexpr float softcap = 2.75f;
+    ggml_tensor * capped_logits = ggml_scale(ctx,
+        ggml_tanh(ctx, ggml_scale(ctx, scaled_logits, 1.0f / softcap)), softcap);
+    ggml_tensor * reference_loss = ggml_cross_entropy_loss_sparse(ctx, capped_logits, labels, weights);
+    ggml_tensor * fused_loss = ggml_fused_linear_cross_entropy(ctx, weight, scaled_input, labels, weights, softcap);
+    ggml_tensor * difference = ggml_sub(ctx, fused_loss, reference_loss);
+    ggml_set_loss(difference);
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 256, true);
+    ggml_build_forward_expand(graph, difference);
+    ggml_build_backward_expand(ctx, graph, nullptr);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    GGML_ASSERT(buffer != nullptr);
+
+    std::vector<float> weight_data(n_embd * n_vocab);
+    std::vector<float> input_data(n_embd * n_tokens);
+    for (size_t i = 0; i < weight_data.size(); ++i) {
+        weight_data[i] = (float) ((int) (i * 13 % 31) - 15) * 0.017f;
+    }
+    for (size_t i = 0; i < input_data.size(); ++i) {
+        input_data[i] = (float) ((int) (i * 7 % 17) - 8) * 0.031f;
+    }
+    ggml_backend_tensor_set(weight, weight_data.data(), 0, ggml_nbytes(weight));
+    ggml_backend_tensor_set(input, input_data.data(), 0, ggml_nbytes(input));
+    ggml_backend_tensor_set(labels, labels_data, 0, sizeof(labels_data));
+    ggml_backend_tensor_set(weights, weights_data, 0, sizeof(weights_data));
+    const float scale_data = 0.73f;
+    ggml_backend_tensor_set(scale, &scale_data, 0, sizeof(scale_data));
+
+    const ggml_status status = ggml_backend_graph_compute(backend, graph);
+    float reference_value = NAN;
+    float fused_value = NAN;
+    ggml_backend_tensor_get(reference_loss, &reference_value, 0, sizeof(reference_value));
+    ggml_backend_tensor_get(fused_loss, &fused_value, 0, sizeof(fused_value));
+
+    ggml_tensor * input_grad = ggml_graph_get_grad(graph, input);
+    std::vector<float> grad(ggml_nelements(input_grad));
+    ggml_backend_tensor_get(input_grad, grad.data(), 0, ggml_nbytes(input_grad));
+    float max_grad = 0.0f;
+    for (float value : grad) max_grad = std::max(max_grad, std::fabs(value));
+
+    const float loss_diff = std::fabs(reference_value - fused_value);
+    const bool ok = status == GGML_STATUS_SUCCESS && std::isfinite(reference_value) &&
+        std::isfinite(fused_value) && loss_diff < 1e-6f && max_grad < 1e-5f;
+    if (!ok) {
+        fprintf(stderr, "fused/dense cross entropy mismatch: status=%d reference=%g fused=%g loss_diff=%g max_grad=%g\n",
+                (int) status, reference_value, fused_value, loss_diff, max_grad);
+    }
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return ok;
+}
+
 static std::pair<int, int> test_sparse_cross_entropy(
         enum ggml_opt_optimizer_type optimizer,
         ggml_backend_sched_t backend_sched,
@@ -1245,6 +1319,10 @@ int main(void) {
                 printf("  sparse/dense cross entropy equivalence: ");
                 print_ok(equivalent);
                 GGML_ASSERT(equivalent);
+                const bool fused_equivalent = test_fused_linear_cross_entropy_dense_equivalence(backends[i]);
+                printf("  fused/dense linear cross entropy equivalence: ");
+                print_ok(fused_equivalent);
+                GGML_ASSERT(fused_equivalent);
             }
 
             std::pair<int, int> result;

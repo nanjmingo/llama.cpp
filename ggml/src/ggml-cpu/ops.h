@@ -120,6 +120,8 @@ void ggml_compute_forward_cross_entropy_loss(const struct ggml_compute_params * 
 void ggml_compute_forward_cross_entropy_loss_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_cross_entropy_loss_sparse(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_cross_entropy_loss_sparse_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_fused_linear_cross_entropy(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_fused_linear_cross_entropy_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_opt_step_adamw(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_mul_mat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_fwht(const struct ggml_compute_params * params, struct ggml_tensor * dst);

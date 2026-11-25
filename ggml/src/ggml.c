@@ -1245,6 +1245,8 @@ static const char * GGML_OP_EXT_NAME[GGML_OP_EXT_COUNT - GGML_OP_COUNT] = {
     "MUL_MAT_ID_BACK",
     "CROSS_ENTROPY_LOSS_SPARSE",
     "CROSS_ENTROPY_LOSS_SPARSE_BACK",
+    "FUSED_LINEAR_CROSS_ENTROPY",
+    "FUSED_LINEAR_CROSS_ENTROPY_BACK",
 };
 
 static const char * GGML_OP_EXT_SYMBOL[GGML_OP_EXT_COUNT - GGML_OP_COUNT] = {
@@ -1253,6 +1255,8 @@ static const char * GGML_OP_EXT_SYMBOL[GGML_OP_EXT_COUNT - GGML_OP_COUNT] = {
     "dY -> dB via X[i]^T",
     "cross_entropy_loss_sparse(logits, labels, weights)",
     "cross_entropy_loss_sparse_back(grad, logits, labels, weights)",
+    "fused_linear_cross_entropy(weight, input, labels, weights)",
+    "fused_linear_cross_entropy_back(grad, weight, input, labels, weights)",
 };
 
 static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
@@ -6438,6 +6442,74 @@ struct ggml_tensor * ggml_cross_entropy_loss_sparse_back(
     return result;
 }
 
+// ggml_fused_linear_cross_entropy
+
+struct ggml_tensor * ggml_fused_linear_cross_entropy(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * weight,
+        struct ggml_tensor  * input,
+        struct ggml_tensor  * labels,
+        struct ggml_tensor  * weights,
+        float                 logit_softcap) {
+    GGML_ASSERT(isfinite(logit_softcap) && logit_softcap >= 0.0f);
+    GGML_ASSERT(weight->ne[0] == input->ne[0]);
+    GGML_ASSERT(input->type == GGML_TYPE_F32);
+    GGML_ASSERT(labels->type == GGML_TYPE_I32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(weight));
+    GGML_ASSERT(ggml_is_contiguous(input));
+    GGML_ASSERT(ggml_is_contiguous(labels));
+    GGML_ASSERT(ggml_is_contiguous(weights));
+    GGML_ASSERT(input->ne[2] == 1 && input->ne[3] == 1);
+    GGML_ASSERT(weight->ne[2] == 1 && weight->ne[3] == 1);
+    GGML_ASSERT(ggml_nelements(labels) == input->ne[1]);
+    GGML_ASSERT(ggml_nelements(weights) == input->ne[1]);
+    GGML_ASSERT(input->ne[1] > 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    result->op     = GGML_OP_EXT_FUSED_LINEAR_CROSS_ENTROPY;
+    memcpy(result->op_params + sizeof(int32_t) * 8, &logit_softcap, sizeof(logit_softcap));
+    result->src[0] = weight;
+    result->src[1] = input;
+    result->src[2] = labels;
+    result->src[3] = weights;
+    return result;
+}
+
+// ggml_fused_linear_cross_entropy_back
+
+struct ggml_tensor * ggml_fused_linear_cross_entropy_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * grad,
+        struct ggml_tensor  * weight,
+        struct ggml_tensor  * input,
+        struct ggml_tensor  * labels,
+        struct ggml_tensor  * weights) {
+    GGML_ASSERT(ggml_is_scalar(grad) && grad->type == GGML_TYPE_F32);
+    GGML_ASSERT(weight->ne[0] == input->ne[0]);
+    GGML_ASSERT(input->type == GGML_TYPE_F32);
+    GGML_ASSERT(labels->type == GGML_TYPE_I32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(grad));
+    GGML_ASSERT(ggml_is_contiguous(weight));
+    GGML_ASSERT(ggml_is_contiguous(input));
+    GGML_ASSERT(ggml_is_contiguous(labels));
+    GGML_ASSERT(ggml_is_contiguous(weights));
+    GGML_ASSERT(input->ne[2] == 1 && input->ne[3] == 1);
+    GGML_ASSERT(weight->ne[2] == 1 && weight->ne[3] == 1);
+    GGML_ASSERT(ggml_nelements(labels) == input->ne[1]);
+    GGML_ASSERT(ggml_nelements(weights) == input->ne[1]);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, input);
+    result->op     = GGML_OP_EXT_FUSED_LINEAR_CROSS_ENTROPY_BACK;
+    result->src[0] = grad;
+    result->src[1] = weight;
+    result->src[2] = input;
+    result->src[3] = labels;
+    result->src[4] = weights;
+    return result;
+}
+
 // opt_step_adamw
 
 struct ggml_tensor * ggml_opt_step_adamw(
@@ -7684,6 +7756,22 @@ static void ggml_compute_backward(
             }
             GGML_ASSERT(!src1_needs_grads && "backward pass for sparse labels not implemented");
             GGML_ASSERT(!src2_needs_grads && "backward pass for sparse label weights not implemented");
+        } break;
+        case GGML_OP_EXT_FUSED_LINEAR_CROSS_ENTROPY: {
+            // This operator intentionally returns gradients only for the hidden
+            // input. The output projection is frozen for the fused QLoRA path.
+            struct ggml_tensor * src3 = tensor->src[3];
+            const size_t isrc3 = src3 ? ggml_hash_find(hash_set, src3) : (size_t) -1;
+            const bool src3_needs_grads = src3 && isrc3 != GGML_HASHSET_FULL &&
+                ggml_bitset_get(hash_set->used, isrc3) && grads_needed[isrc3];
+            if (src1_needs_grads) {
+                struct ggml_tensor * back = ggml_fused_linear_cross_entropy_back(ctx, grad, src0, src1, src2, src3);
+                memcpy(back->op_params, tensor->op_params, sizeof(back->op_params));
+                ggml_add_or_set(ctx, cgraph, isrc1, back);
+            }
+            GGML_ASSERT(!src0_needs_grads && "fused linear cross entropy requires a frozen output weight");
+            GGML_ASSERT(!src2_needs_grads && "backward pass for fused sparse labels not implemented");
+            GGML_ASSERT(!src3_needs_grads && "backward pass for fused sparse label weights not implemented");
         } break;
         case GGML_OP_GLU: {
             switch (ggml_get_glu_op(tensor)) {
