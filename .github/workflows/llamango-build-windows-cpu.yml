@@ -334,7 +334,7 @@ jobs:
           $ctestArgs = @(
             '--test-dir', 'build',
             '-C', 'Release',
-            '-L', 'main',
+            # '-L', 'main',
             '--output-on-failure',
             '--timeout', '900',
             '--parallel', "$env:NUMBER_OF_PROCESSORS"
