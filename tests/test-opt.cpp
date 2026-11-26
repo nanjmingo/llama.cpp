@@ -3,8 +3,10 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "ggml-opt.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cinttypes>
 #include <cstring>
@@ -173,6 +175,446 @@ static void helper_free_ctx_data(struct helper_ctx_data ctx_data) {
 
 static void print_ok(bool subtest_ok) {
     printf(subtest_ok ? "\033[1;32mOK\033[0m\n" : "\033[1;31mFAIL\033[0m\n");
+}
+
+static bool test_sparse_cross_entropy_dense_equivalence(ggml_backend_t backend) {
+    const int64_t class_counts[] = { 3, 17, 33 };
+    const int32_t label_indices[] = { -1, 1, 2, 0 };
+    const float weight_data[] = { 0.0f, 0.25f, 0.8f, 1.0f };
+
+    for (int64_t nclasses : class_counts) {
+        ggml_init_params init_params = { 1024 * 1024, nullptr, true };
+        ggml_context * ctx = ggml_init(init_params);
+        ggml_tensor * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nclasses, 4);
+        ggml_set_param(logits);
+        ggml_tensor * dense_labels = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nclasses, 4);
+        ggml_tensor * sparse_labels = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4);
+        ggml_tensor * sparse_weights = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+
+        ggml_tensor * dense_loss = ggml_cross_entropy_loss(ctx, logits, dense_labels);
+        ggml_tensor * sparse_loss = ggml_cross_entropy_loss_sparse(ctx, logits, sparse_labels, sparse_weights);
+        ggml_tensor * difference = ggml_sub(ctx, sparse_loss, dense_loss);
+        ggml_set_loss(difference);
+
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx, 256, true);
+        ggml_build_forward_expand(graph, difference);
+        ggml_build_backward_expand(ctx, graph, nullptr);
+
+        ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        GGML_ASSERT(buffer != nullptr);
+
+        std::vector<float> logits_data(nclasses * 4);
+        std::vector<float> dense_data(nclasses * 4, 0.0f);
+        for (int64_t row = 0; row < 4; ++row) {
+            for (int64_t col = 0; col < nclasses; ++col) {
+                const int32_t value = (int32_t) ((row * 7 + col * 5) % 23) - 11;
+                logits_data[row*nclasses + col] = value * 0.13f;
+            }
+            if (label_indices[row] >= 0) {
+                const int32_t label = row == 1 ? (int32_t) (nclasses - 1) :
+                    row == 2 ? (int32_t) (nclasses / 2) : label_indices[row];
+                dense_data[row*nclasses + label] = weight_data[row];
+            }
+        }
+        int32_t labels_data[4] = {
+            -1, (int32_t) (nclasses - 1), (int32_t) (nclasses / 2), 0,
+        };
+        ggml_backend_tensor_set(logits, logits_data.data(), 0, ggml_nbytes(logits));
+        ggml_backend_tensor_set(dense_labels, dense_data.data(), 0, ggml_nbytes(dense_labels));
+        ggml_backend_tensor_set(sparse_labels, labels_data, 0, sizeof(labels_data));
+        ggml_backend_tensor_set(sparse_weights, weight_data, 0, sizeof(weight_data));
+
+        const ggml_status status = ggml_backend_graph_compute(backend, graph);
+        float dense_value = NAN;
+        float sparse_value = NAN;
+        ggml_backend_tensor_get(dense_loss, &dense_value, 0, sizeof(dense_value));
+        ggml_backend_tensor_get(sparse_loss, &sparse_value, 0, sizeof(sparse_value));
+
+        ggml_tensor * logits_grad = ggml_graph_get_grad(graph, logits);
+        std::vector<float> grad(ggml_nelements(logits_grad));
+        ggml_backend_tensor_get(logits_grad, grad.data(), 0, ggml_nbytes(logits_grad));
+        float max_grad = 0.0f;
+        for (float value : grad) max_grad = std::max(max_grad, std::fabs(value));
+
+        const float loss_diff = std::fabs(dense_value - sparse_value);
+        const bool ok = status == GGML_STATUS_SUCCESS && std::isfinite(dense_value) &&
+            std::isfinite(sparse_value) && loss_diff < 1e-6f && max_grad < 1e-6f;
+        if (!ok) {
+            fprintf(stderr, "sparse/dense cross entropy mismatch: nclasses=%" PRId64 " status=%d dense=%g sparse=%g loss_diff=%g max_grad=%g\n",
+                    nclasses, (int) status, dense_value, sparse_value, loss_diff, max_grad);
+        }
+
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+        if (!ok) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool backend_supports_fused_linear_cross_entropy(ggml_backend_t backend, enum ggml_type weight_type) {
+    constexpr int64_t n_embd = 32;
+    constexpr int64_t n_vocab = 37;
+    constexpr int64_t n_tokens = 5;
+    ggml_init_params params = { 1024 * 1024, nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+
+    ggml_tensor * weight = ggml_new_tensor_2d(ctx, weight_type, n_embd, n_vocab);
+    ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_set_param(input);
+    ggml_tensor * labels = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_tensor * weights = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_tokens);
+
+    ggml_tensor * logits = ggml_mul_mat(ctx, weight, input);
+    ggml_tensor * capped_logits = ggml_scale(ctx,
+        ggml_tanh(ctx, ggml_scale(ctx, logits, 1.0f / 2.75f)), 2.75f);
+    ggml_tensor * reference_loss = ggml_cross_entropy_loss_sparse(ctx, capped_logits, labels, weights);
+    ggml_set_loss(reference_loss);
+    ggml_cgraph * graph_ref = ggml_new_graph_custom(ctx, 512, true);
+    ggml_build_forward_expand(graph_ref, reference_loss);
+    ggml_build_backward_expand(ctx, graph_ref, nullptr);
+
+    ggml_tensor * stats = ggml_fused_linear_cross_entropy(ctx, weight, input, labels, weights, 2.75f, 8);
+    ggml_tensor * loss = ggml_scale(ctx,
+        ggml_sum(ctx, ggml_view_1d(ctx, stats, n_tokens, 0)), 1.0f / n_tokens);
+    ggml_set_loss(loss);
+    ggml_cgraph * graph_fused = ggml_new_graph_custom(ctx, 512, true);
+    ggml_build_forward_expand(graph_fused, loss);
+    ggml_build_backward_expand(ctx, graph_fused, nullptr);
+
+    bool supported = true;
+    for (int i = 0; i < ggml_graph_n_nodes(graph_ref) && supported; ++i) {
+        supported = ggml_backend_supports_op(backend, ggml_graph_node(graph_ref, i));
+    }
+    for (int i = 0; i < ggml_graph_n_nodes(graph_fused) && supported; ++i) {
+        supported = ggml_backend_supports_op(backend, ggml_graph_node(graph_fused, i));
+    }
+    ggml_free(ctx);
+    return supported;
+}
+
+static bool test_fused_linear_cross_entropy_vocab_tiling(
+        ggml_backend_t backend, enum ggml_type weight_type, int32_t opt_period) {
+    // Force several graph workers even on small CI runners. The fused CPU
+    // kernels are currently serial and must guard non-zero worker indices.
+    const bool is_cpu_backend = ggml_backend_is_cpu(backend);
+    const int restore_n_threads = is_cpu_backend
+        ? (int) (std::thread::hardware_concurrency() / 2) : 0;
+    if (is_cpu_backend) {
+        const int test_n_threads = std::max(4, restore_n_threads);
+        ggml_backend_cpu_set_n_threads(backend, test_n_threads);
+    }
+
+    constexpr int64_t n_embd = 32;
+    constexpr int64_t n_vocab = 37;
+    constexpr int64_t n_tokens = 5;
+    constexpr int32_t vocab_chunk = 8;
+    constexpr float softcap = 2.75f;
+    const int32_t labels_data[n_tokens] = { 36, 7, -1, 19, 0 };
+    const float weights_data[n_tokens] = { 0.3f, 1.0f, 0.0f, 0.5f, 0.9f };
+
+    ggml_init_params init_params = { 4 * 1024 * 1024, nullptr, true };
+    ggml_context * ctx = ggml_init(init_params);
+    ggml_tensor * weight = ggml_new_tensor_2d(ctx, weight_type, n_embd, n_vocab);
+    ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_set_param(input);
+    ggml_tensor * labels = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_tensor * weights = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_tokens);
+
+    ggml_tensor * logits = ggml_mul_mat(ctx, weight, input);
+    GGML_ASSERT(opt_period >= 1);
+    ggml_tensor * capped_logits = ggml_scale(ctx,
+        ggml_tanh(ctx, ggml_scale(ctx, logits, 1.0f / softcap)), softcap);
+    ggml_tensor * reference_loss_mean = ggml_cross_entropy_loss_sparse(ctx, capped_logits, labels, weights);
+    ggml_tensor * reference_loss = opt_period == 1 ? reference_loss_mean :
+        ggml_scale(ctx, reference_loss_mean, 1.0f / (float) opt_period);
+
+    ggml_tensor * fused_stats = ggml_fused_linear_cross_entropy(
+        ctx, weight, input, labels, weights, softcap, vocab_chunk);
+    ggml_tensor * fused_loss_tokens = ggml_view_1d(ctx, fused_stats, n_tokens, 0);
+    ggml_tensor * fused_loss = ggml_scale(ctx, ggml_sum(ctx, fused_loss_tokens),
+        1.0f / (float) (n_tokens * opt_period));
+    ggml_set_loss(reference_loss);
+    ggml_set_loss(fused_loss);
+
+    ggml_cgraph * graph_ref = ggml_new_graph_custom(ctx, 512, true);
+    ggml_build_forward_expand(graph_ref, reference_loss);
+    ggml_build_backward_expand(ctx, graph_ref, nullptr);
+
+    ggml_cgraph * graph_fused = ggml_new_graph_custom(ctx, 512, true);
+    ggml_build_forward_expand(graph_fused, fused_loss);
+    ggml_build_backward_expand(ctx, graph_fused, nullptr);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    GGML_ASSERT(buffer != nullptr);
+
+    std::vector<float> weight_data(n_embd * n_vocab);
+    std::vector<float> input_data(n_embd * n_tokens);
+    for (size_t i = 0; i < weight_data.size(); ++i) {
+        weight_data[i] = (float) ((int) (i * 17 % 43) - 21) * 0.013f;
+    }
+    for (size_t i = 0; i < input_data.size(); ++i) {
+        input_data[i] = (float) ((int) (i * 11 % 29) - 14) * 0.021f;
+    }
+    if (weight_type == GGML_TYPE_F32) {
+        ggml_backend_tensor_set(weight, weight_data.data(), 0, ggml_nbytes(weight));
+    } else {
+        std::vector<uint8_t> quantized_weight_data(ggml_nbytes(weight));
+        ggml_quantize_chunk(weight_type, weight_data.data(), quantized_weight_data.data(),
+            0, n_vocab, n_embd, nullptr);
+        ggml_backend_tensor_set(weight, quantized_weight_data.data(), 0, ggml_nbytes(weight));
+    }
+    ggml_backend_tensor_set(input, input_data.data(), 0, ggml_nbytes(input));
+    ggml_backend_tensor_set(labels, labels_data, 0, sizeof(labels_data));
+    ggml_backend_tensor_set(weights, weights_data, 0, sizeof(weights_data));
+
+    ggml_graph_reset(graph_ref);
+    const ggml_status ref_status = ggml_backend_graph_compute(backend, graph_ref);
+    float reference_value = NAN;
+    ggml_backend_tensor_get(reference_loss, &reference_value, 0, sizeof(reference_value));
+
+    ggml_tensor * ref_dx_tensor = ggml_graph_get_grad(graph_ref, input);
+    ggml_tensor * ref_dlogits_tensor = ggml_graph_get_grad(graph_ref, logits);
+    ggml_tensor * ref_dcapped_tensor = ggml_graph_get_grad(graph_ref, capped_logits);
+    GGML_ASSERT(ref_dx_tensor != nullptr && ref_dlogits_tensor != nullptr && ref_dcapped_tensor != nullptr);
+    std::vector<float> ref_dx(ggml_nelements(ref_dx_tensor));
+    std::vector<float> ref_dlogits(ggml_nelements(ref_dlogits_tensor));
+    std::vector<float> ref_dcapped(ggml_nelements(ref_dcapped_tensor));
+    ggml_backend_tensor_get(ref_dx_tensor, ref_dx.data(), 0, ggml_nbytes(ref_dx_tensor));
+    ggml_backend_tensor_get(ref_dlogits_tensor, ref_dlogits.data(), 0, ggml_nbytes(ref_dlogits_tensor));
+    ggml_backend_tensor_get(ref_dcapped_tensor, ref_dcapped.data(), 0, ggml_nbytes(ref_dcapped_tensor));
+
+    std::vector<float> ref_logits_values(ggml_nelements(logits));
+    std::vector<float> ref_capped_values(ggml_nelements(capped_logits));
+    ggml_backend_tensor_get(logits, ref_logits_values.data(), 0, ggml_nbytes(logits));
+    ggml_backend_tensor_get(capped_logits, ref_capped_values.data(), 0, ggml_nbytes(capped_logits));
+
+    ggml_graph_reset(graph_fused);
+    const ggml_status fused_status = ggml_backend_graph_compute(backend, graph_fused);
+    float fused_value = NAN;
+    ggml_backend_tensor_get(fused_loss, &fused_value, 0, sizeof(fused_value));
+    ggml_tensor * fused_dx_tensor = ggml_graph_get_grad(graph_fused, input);
+    ggml_tensor * fused_stats_grad_tensor = ggml_graph_get_grad(graph_fused, fused_stats);
+    GGML_ASSERT(fused_dx_tensor != nullptr && fused_stats_grad_tensor != nullptr);
+    std::vector<float> fused_dx(ggml_nelements(fused_dx_tensor));
+    std::vector<float> fused_stats_values(ggml_nelements(fused_stats));
+    std::vector<float> fused_stats_grad(ggml_nelements(fused_stats_grad_tensor));
+    ggml_backend_tensor_get(fused_dx_tensor, fused_dx.data(), 0, ggml_nbytes(fused_dx_tensor));
+    ggml_backend_tensor_get(fused_stats, fused_stats_values.data(), 0, ggml_nbytes(fused_stats));
+    ggml_backend_tensor_get(fused_stats_grad_tensor, fused_stats_grad.data(), 0, ggml_nbytes(fused_stats_grad_tensor));
+
+    ggml_tensor * ref_loss_grad_tensor = ggml_graph_get_grad(graph_ref, reference_loss);
+    ggml_tensor * fused_loss_grad_tensor = ggml_graph_get_grad(graph_fused, fused_loss);
+    GGML_ASSERT(ref_loss_grad_tensor != nullptr && fused_loss_grad_tensor != nullptr);
+    float ref_loss_grad = NAN;
+    float fused_loss_grad = NAN;
+    ggml_backend_tensor_get(ref_loss_grad_tensor, &ref_loss_grad, 0, sizeof(ref_loss_grad));
+    ggml_backend_tensor_get(fused_loss_grad_tensor, &fused_loss_grad, 0, sizeof(fused_loss_grad));
+    float gradient_seed_error = std::max(std::fabs(ref_loss_grad - 1.0f),
+        std::fabs(fused_loss_grad - 1.0f));
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        gradient_seed_error = std::max(gradient_seed_error,
+            std::fabs(fused_stats_grad[(size_t) t] -
+                1.0f / (float) (n_tokens * opt_period)));
+        gradient_seed_error = std::max(gradient_seed_error,
+            std::fabs(fused_stats_grad[(size_t) n_tokens + t]));
+    }
+
+    float max_abs = 0.0f;
+    float max_rel = 0.0f;
+    size_t max_abs_index = 0;
+    size_t max_rel_index = 0;
+    std::vector<std::pair<float, size_t>> ranked_diff;
+    ranked_diff.reserve(ref_dx.size());
+    for (size_t i = 0; i < ref_dx.size(); ++i) {
+        const float diff = std::fabs(fused_dx[i] - ref_dx[i]);
+        const float denom = std::max(std::fabs(fused_dx[i]), std::fabs(ref_dx[i]));
+        const float rel = diff / std::max(denom, 1e-12f);
+        if (diff > max_abs) {
+            max_abs = diff;
+            max_abs_index = i;
+        }
+        if (rel > max_rel) {
+            max_rel = rel;
+            max_rel_index = i;
+        }
+        ranked_diff.emplace_back(diff, i);
+    }
+    std::sort(ranked_diff.begin(), ranked_diff.end(), [](const auto & a, const auto & b) {
+        return a.first > b.first;
+    });
+
+    const float loss_diff = std::fabs(reference_value - fused_value);
+    const float tolerance = weight_type == GGML_TYPE_F32 ? 2e-6f : 1e-4f;
+    const bool ok = ref_status == GGML_STATUS_SUCCESS && fused_status == GGML_STATUS_SUCCESS &&
+        std::isfinite(reference_value) && std::isfinite(fused_value) &&
+        gradient_seed_error < 1e-7f && loss_diff < tolerance && max_abs < tolerance;
+
+    if (!ok) {
+        const size_t max_token = max_abs_index / (size_t) n_embd;
+        const size_t max_embd = max_abs_index % (size_t) n_embd;
+        fprintf(stderr,
+            "FUSED_CE_DIAG weight=%s ref_status=%d fused_status=%d "
+            "ref_loss=%.9g fused_loss=%.9g loss_abs=%.9g "
+            "max_dx_abs=%.9g at token=%zu embd=%zu ref=%.9g fused=%.9g max_dx_rel=%.9g "
+            "ref_loss_grad=%.9g fused_loss_grad=%.9g grad_seed_error=%.9g\n",
+            ggml_type_name(weight_type), (int) ref_status, (int) fused_status,
+            reference_value, fused_value, loss_diff, max_abs, max_token, max_embd,
+            ref_dx[max_abs_index], fused_dx[max_abs_index], max_rel,
+            ref_loss_grad, fused_loss_grad, gradient_seed_error);
+        fprintf(stderr, "FUSED_CE_DIAG max_relative_index=%zu token=%zu embd=%zu ref=%.9g fused=%.9g\n",
+            max_rel_index, max_rel_index / (size_t) n_embd, max_rel_index % (size_t) n_embd,
+            ref_dx[max_rel_index], fused_dx[max_rel_index]);
+        fprintf(stderr, "FUSED_CE_DIAG upstream_gradient:");
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            fprintf(stderr, " t%" PRId64 "=%.9g", t, fused_stats_grad[(size_t) t]);
+        }
+        fprintf(stderr, "\nFUSED_CE_DIAG token_stats:");
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            fprintf(stderr, " t%" PRId64 "=(loss=%.9g,lse=%.9g,label=%d,weight=%.9g)",
+                t, fused_stats_values[(size_t) t], fused_stats_values[(size_t) n_tokens + t],
+                labels_data[t], weights_data[t]);
+        }
+        fprintf(stderr, "\nFUSED_CE_DIAG max_token_logits/gradients:\n");
+        for (int64_t v = 0; v < n_vocab; ++v) {
+            const size_t index = max_token * (size_t) n_vocab + (size_t) v;
+            fprintf(stderr, "  vocab=%" PRId64 " logit=%.9g capped=%.9g d_capped=%.9g d_logit=%.9g\n",
+                v, ref_logits_values[index], ref_capped_values[index],
+                ref_dcapped[index], ref_dlogits[index]);
+        }
+        fprintf(stderr, "FUSED_CE_DIAG largest_dx_differences:\n");
+        for (size_t i = 0; i < std::min<size_t>(ranked_diff.size(), 8); ++i) {
+            const size_t index = ranked_diff[i].second;
+            fprintf(stderr, "  rank=%zu token=%zu embd=%zu ref=%.9g fused=%.9g abs=%.9g\n",
+                i + 1, index / (size_t) n_embd, index % (size_t) n_embd,
+                ref_dx[index], fused_dx[index], ranked_diff[i].first);
+        }
+    }
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    if (is_cpu_backend) {
+        ggml_backend_cpu_set_n_threads(backend, restore_n_threads);
+    }
+    return ok;
+}
+
+static std::pair<int, int> test_sparse_cross_entropy(
+        enum ggml_opt_optimizer_type optimizer,
+        ggml_backend_sched_t backend_sched,
+        ggml_backend_t backend) {
+    int ntest = 0;
+    int npass = 0;
+
+    ggml_init_params static_params = { 2 * ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx_static = ggml_init(static_params);
+    ggml_tensor * class_bias = ggml_new_tensor_2d(ctx_static, GGML_TYPE_F32, 1, 3);
+    ggml_set_name(class_bias, "class_bias");
+    ggml_set_param(class_bias);
+    ggml_tensor * inputs = ggml_new_tensor_2d(ctx_static, GGML_TYPE_F32, 1, 4);
+    ggml_set_name(inputs, "inputs");
+    ggml_set_input(inputs);
+    ggml_backend_buffer_t static_buffer = ggml_backend_alloc_ctx_tensors(ctx_static, backend);
+    GGML_ASSERT(static_buffer != nullptr);
+    const float initial_bias[3] = { 0.0f, 0.0f, 0.0f };
+    ggml_backend_tensor_set(class_bias, initial_bias, 0, sizeof(initial_bias));
+
+    ggml_init_params compute_params = { 32 * 1024 * 1024, nullptr, true };
+    ggml_context * ctx_compute = ggml_init(compute_params);
+    ggml_tensor * outputs = ggml_mul_mat(ctx_compute, class_bias, inputs);
+    ggml_set_name(outputs, "logits");
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx_compute, 1024, false);
+    ggml_build_forward_expand(gf, outputs);
+
+    ggml_opt_params params = ggml_opt_default_params(backend_sched, GGML_OPT_LOSS_TYPE_SPARSE_CROSS_ENTROPY);
+    params.optimizer = optimizer;
+    params.get_opt_pars = helper_get_test_opt_pars;
+    ggml_opt_context_t opt_ctx = ggml_opt_init(params);
+    ggml_opt_prepare_alloc(opt_ctx, ctx_compute, gf, inputs, outputs);
+    ggml_opt_alloc(opt_ctx, /*backward =*/ true);
+
+    const float input_values[4] = { 0.1f, -0.2f, 0.3f, 0.0f };
+    const int32_t label_values[4] = { 0, -1, 1, 2 };
+    const float weight_values[4] = { 1.0f, 0.0f, 0.5f, 1.0f };
+    ggml_backend_tensor_set(inputs, input_values, 0, sizeof(input_values));
+    ggml_backend_tensor_set(ggml_opt_sparse_labels(opt_ctx), label_values, 0, sizeof(label_values));
+    ggml_backend_tensor_set(ggml_opt_sparse_label_weights(opt_ctx), weight_values, 0, sizeof(weight_values));
+
+    ggml_opt_result_t result = ggml_opt_result_init();
+    ggml_opt_eval(opt_ctx, result);
+
+    float updated_bias[3] = {};
+    ggml_backend_tensor_get(class_bias, updated_bias, 0, sizeof(updated_bias));
+    double loss = 0.0;
+    ggml_opt_result_last_loss(result, &loss);
+    const bool changed = !almost_equal(updated_bias[0], initial_bias[0], 1e-6) ||
+        !almost_equal(updated_bias[1], initial_bias[1], 1e-6) ||
+        !almost_equal(updated_bias[2], initial_bias[2], 1e-6);
+    const bool subtest_ok = std::isfinite(loss) && loss > 0.0 && changed;
+
+    printf("  %s(optimizer=%s): ", __func__, ggml_opt_optimizer_name(optimizer));
+    print_ok(subtest_ok);
+    if (subtest_ok) npass++;
+    ntest++;
+
+    ggml_opt_result_free(result);
+    ggml_opt_free(opt_ctx);
+    ggml_free(ctx_compute);
+    ggml_backend_buffer_free(static_buffer);
+    ggml_free(ctx_static);
+    return std::make_pair(npass, ntest);
+}
+
+static bool test_sparse_cross_entropy_dataset(
+        enum ggml_opt_optimizer_type optimizer,
+        ggml_backend_sched_t backend_sched,
+        ggml_backend_t backend) {
+    ggml_init_params static_params = { 2 * ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx_static = ggml_init(static_params);
+    ggml_tensor * class_weights = ggml_new_tensor_2d(ctx_static, GGML_TYPE_F32, 1, 3);
+    ggml_set_name(class_weights, "class_weights");
+    ggml_set_param(class_weights);
+    ggml_tensor * inputs = ggml_new_tensor_2d(ctx_static, GGML_TYPE_F32, 1, 2);
+    ggml_set_name(inputs, "inputs");
+    ggml_set_input(inputs);
+    ggml_backend_buffer_t static_buffer = ggml_backend_alloc_ctx_tensors(ctx_static, backend);
+    GGML_ASSERT(static_buffer != nullptr);
+    const float initial_weights[3] = { 0.0f, 0.0f, 0.0f };
+    ggml_backend_tensor_set(class_weights, initial_weights, 0, sizeof(initial_weights));
+
+    ggml_init_params compute_params = { 32 * 1024 * 1024, nullptr, true };
+    ggml_context * ctx_compute = ggml_init(compute_params);
+    ggml_tensor * outputs = ggml_mul_mat(ctx_compute, class_weights, inputs);
+
+    ggml_opt_dataset_t dataset = ggml_opt_dataset_init_with_weights(
+        GGML_TYPE_F32, GGML_TYPE_I32, GGML_TYPE_F32,
+        /*ne_datapoint =*/ 1, /*ne_label =*/ 1, /*ne_weights =*/ 1,
+        /*ndata =*/ 4, /*ndata_shard =*/ 2);
+    const float data_values[4] = { 0.1f, -0.2f, 0.3f, 0.0f };
+    const int32_t label_values[4] = { 0, -1, 1, 2 };
+    const float weight_values[4] = { 1.0f, 0.0f, 0.5f, 1.0f };
+    ggml_backend_tensor_set(ggml_opt_dataset_data(dataset), data_values, 0, sizeof(data_values));
+    ggml_backend_tensor_set(ggml_opt_dataset_labels(dataset), label_values, 0, sizeof(label_values));
+    ggml_backend_tensor_set(ggml_opt_dataset_weights(dataset), weight_values, 0, sizeof(weight_values));
+
+    ggml_opt_fit(backend_sched, ctx_compute, inputs, outputs, dataset,
+        GGML_OPT_LOSS_TYPE_SPARSE_CROSS_ENTROPY, optimizer,
+        helper_get_test_opt_pars, /*nepoch =*/ 1, /*nbatch_logical =*/ 2,
+        /*val_split =*/ 0.0f, /*silent =*/ true);
+
+    float updated_weights[3] = {};
+    ggml_backend_tensor_get(class_weights, updated_weights, 0, sizeof(updated_weights));
+    const bool changed = !almost_equal(updated_weights[0], initial_weights[0], 1e-6) ||
+        !almost_equal(updated_weights[1], initial_weights[1], 1e-6) ||
+        !almost_equal(updated_weights[2], initial_weights[2], 1e-6);
+
+    ggml_opt_dataset_free(dataset);
+    ggml_free(ctx_compute);
+    ggml_backend_buffer_free(static_buffer);
+    ggml_free(ctx_static);
+    return changed;
 }
 
 static void helper_after_test(
@@ -602,6 +1044,78 @@ static std::pair<int, int> test_idata_split(
     return std::make_pair(npass, ntest);
 }
 
+static ggml_opt_optimizer_params helper_get_activation_checkpointing_opt_pars(void * userdata) {
+    ggml_opt_optimizer_params result = ggml_opt_get_default_optimizer_params(userdata);
+    result.adamw.alpha = 1e-2f;
+    result.adamw.beta1 = 0.0f;
+    result.adamw.beta2 = 0.0f;
+    result.adamw.eps   = 1e-8f;
+    result.adamw.wd    = 0.0f;
+    return result;
+}
+
+static std::pair<int, int> test_dynamic_activation_checkpointing(
+        ggml_backend_sched_t backend_sched, ggml_backend_t backend) {
+    int ntest = 0;
+    int npass = 0;
+
+    for (const int32_t opt_period : { 1, 2 }) {
+        ggml_init_params static_params = { 1024 * 1024, nullptr, true };
+        ggml_context * ctx_static = ggml_init(static_params);
+        ggml_tensor * weight = ggml_new_tensor_1d(ctx_static, GGML_TYPE_F32, 1);
+        ggml_set_name(weight, "weight");
+        ggml_set_param(weight);
+        ggml_backend_buffer_t weight_buffer = ggml_backend_alloc_ctx_tensors(ctx_static, backend);
+        const float initial_weight = 1.0f;
+        ggml_backend_tensor_set(weight, &initial_weight, 0, sizeof(initial_weight));
+
+        ggml_opt_params opt_params = ggml_opt_default_params(backend_sched, GGML_OPT_LOSS_TYPE_MEAN_SQUARED_ERROR);
+        opt_params.opt_period = opt_period;
+        opt_params.optimizer = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
+        opt_params.get_opt_pars = helper_get_activation_checkpointing_opt_pars;
+        ggml_opt_context_t opt_ctx = ggml_opt_init(opt_params);
+        ggml_opt_set_activation_checkpointing(opt_ctx, true);
+        ggml_opt_result_t result = ggml_opt_result_init();
+
+        // Run two complete optimizer steps to verify that the persistent
+        // gradient accumulators are cleared between updates at opt_period=1.
+        for (int32_t i = 0; i < 2 * opt_period; ++i) {
+            ggml_init_params compute_params = { 64 * 1024 * 1024, nullptr, true };
+            ggml_context * ctx_compute = ggml_init(compute_params);
+            ggml_tensor * input = ggml_new_tensor_1d(ctx_compute, GGML_TYPE_F32, 1);
+            ggml_set_input(input);
+            ggml_tensor * shifted = ggml_add(ctx_compute, input, weight);
+            ggml_tensor * squared = ggml_sqr(ctx_compute, shifted);
+            ggml_tensor * output = ggml_scale(ctx_compute, squared, 1.0f);
+            ggml_set_output(output);
+            ggml_cgraph * gf = ggml_new_graph_custom(ctx_compute, 8192, false);
+            ggml_build_forward_expand(gf, output);
+
+            ggml_opt_prepare_alloc(opt_ctx, ctx_compute, gf, input, output);
+            ggml_opt_alloc(opt_ctx, /*backward =*/ true);
+            const float input_value = 0.25f + 0.1f * (i % opt_period);
+            ggml_backend_tensor_set(input, &input_value, 0, sizeof(input_value));
+            ggml_tensor * labels = ggml_opt_labels(opt_ctx);
+            ggml_set_zero(labels);
+            ggml_opt_eval(opt_ctx, result);
+            ggml_free(ctx_compute);
+        }
+
+        float final_weight = initial_weight;
+        ggml_backend_tensor_get(weight, &final_weight, 0, sizeof(final_weight));
+        const bool subtest_ok = std::isfinite(final_weight) && almost_equal(final_weight, 0.98, 1e-5);
+        const std::string args = "activation_checkpointing=yes, opt_period=" + std::to_string(opt_period);
+        print_ok(__func__, subtest_ok, npass, ntest, args.c_str());
+
+        ggml_opt_result_free(result);
+        ggml_opt_free(opt_ctx);
+        ggml_backend_buffer_free(weight_buffer);
+        ggml_free(ctx_static);
+    }
+
+    return std::make_pair(npass, ntest);
+}
+
 static void helper_after_test_gradient_accumulation(
         enum ggml_opt_optimizer_type optim,
         const char * func, const int nbatch_physical, const enum ggml_opt_loss_type loss_type, const int epoch,
@@ -877,6 +1391,11 @@ static std::pair<int, int> test_backend(
     }
     bool const adamw = optim == GGML_OPT_OPTIMIZER_TYPE_ADAMW;
     if (adamw) {
+        {
+            std::pair<int, int> partial = test_dynamic_activation_checkpointing(backend_sched, backend);
+            npass += partial.first;
+            ntest += partial.second;
+        }
         for (int32_t nbatch_physical : { 2, 1 }) {
             for (enum ggml_opt_loss_type loss_type : { GGML_OPT_LOSS_TYPE_SUM, GGML_OPT_LOSS_TYPE_MEAN }) {
                 std::pair<int, int> partial =
@@ -970,10 +1489,43 @@ int main(void) {
                 ggml_free(ctx);
             }
 
+            if (!skip && ggml_backend_dev_type(devs[i]) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                const bool equivalent = test_sparse_cross_entropy_dense_equivalence(backends[i]);
+                printf("  sparse/dense cross entropy equivalence: ");
+                print_ok(equivalent);
+                GGML_ASSERT(equivalent);
+            }
+            if (!skip) {
+                for (const enum ggml_type weight_type : { GGML_TYPE_F32, GGML_TYPE_Q4_0 }) {
+                    const char * type_name = ggml_type_name(weight_type);
+                    if (!backend_supports_fused_linear_cross_entropy(backends[i], weight_type)) {
+                        printf("  vocabulary-tiled fused linear cross entropy (%s): SKIPPED (unsupported backend ops)\n", type_name);
+                        continue;
+                    }
+                    for (const int32_t opt_period : { 1, 2 }) {
+                        const bool fused_ok = test_fused_linear_cross_entropy_vocab_tiling(
+                            backends[i], weight_type, opt_period);
+                        printf("  vocabulary-tiled fused linear cross entropy (%s, accumulation=%d): ",
+                            type_name, opt_period);
+                        print_ok(fused_ok);
+                        GGML_ASSERT(fused_ok);
+                    }
+                }
+            }
+
             std::pair<int, int> result;
             if (!skip) {
                 result = test_backend(backend_sched, backends[i], optim);
                 printf("  %d/%d tests passed\n", result.first, result.second);
+                const std::pair<int, int> sparse_result = test_sparse_cross_entropy(optim, backend_sched, backends[i]);
+                result.first += sparse_result.first;
+                result.second += sparse_result.second;
+                if (ggml_backend_dev_type(devs[i]) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    const bool sparse_dataset_ok = test_sparse_cross_entropy_dataset(optim, backend_sched, backends[i]);
+                    printf("  sparse cross entropy dataset/fit: ");
+                    print_ok(sparse_dataset_ok);
+                    GGML_ASSERT(sparse_dataset_ok);
+                }
             }
 
             printf("  Backend %s %s: ", ggml_backend_name(backends[i]), ggml_opt_optimizer_name(optim));
