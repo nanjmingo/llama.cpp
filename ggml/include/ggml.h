@@ -435,7 +435,20 @@ extern "C" {
 
         GGML_OP_SIGMOID_BACK,
 
+        // End of the upstream operation range. Fork-only operations start here
+        // so upstream additions automatically shift the extension IDs.
         GGML_OP_COUNT,
+
+        // Fork-specific training operators. Keep these after GGML_OP_COUNT.
+        GGML_OP_EXT_OUT_PROD_ID = GGML_OP_COUNT,
+        GGML_OP_EXT_GATED_DELTA_NET_BACK,
+        GGML_OP_EXT_MUL_MAT_ID_BACK,
+        GGML_OP_EXT_CROSS_ENTROPY_LOSS_SPARSE,
+        GGML_OP_EXT_CROSS_ENTROPY_LOSS_SPARSE_BACK,
+        GGML_OP_EXT_FUSED_LINEAR_CROSS_ENTROPY,
+        GGML_OP_EXT_FUSED_LINEAR_CROSS_ENTROPY_BACK,
+
+        GGML_OP_EXT_COUNT,
     };
 
     enum ggml_unary_op {
@@ -1335,6 +1348,13 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
 
+    GGML_API struct ggml_tensor * ggml_mul_mat_id_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as,
+            struct ggml_tensor  * grad,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * b_like);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows
@@ -1342,6 +1362,13 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
+
+    GGML_API struct ggml_tensor * ggml_out_prod_id(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids,
+            int64_t               n_expert);
 
     //
     // operations on tensors without backpropagation
@@ -2301,15 +2328,10 @@ extern "C" {
             struct ggml_tensor * table,
             struct ggml_tensor * indices);
 
-    // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * q,
-            struct ggml_tensor  * k,
-            struct ggml_tensor  * v,
-            struct ggml_tensor  * d,
-            bool                  masked);
-
+           struct ggml_context * ctx,
+           struct ggml_tensor  * fa,
+           struct ggml_tensor  * d);
     GGML_API struct ggml_tensor * ggml_ssm_conv(
             struct ggml_context * ctx,
             struct ggml_tensor  * sx,
@@ -2472,6 +2494,16 @@ extern "C" {
             struct ggml_tensor  * state,
             int64_t               K),
         "use ggml_gated_delta_net_ext instead");
+
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * d);
 
     // DSA lightning indexer
     //
@@ -2659,6 +2691,47 @@ extern "C" {
             struct ggml_tensor  * a,  // logits
             struct ggml_tensor  * b,  // labels
             struct ggml_tensor  * c); // gradients of cross_entropy_loss result
+
+    // Sparse cross entropy for one class ID and one weight per logits row.
+    // Labels must be I32; valid IDs are [0, nclasses), and -1 skips a row.
+    // Weights must be finite and nonnegative; zero weights also skip a row.
+    // The loss is divided by the total number of rows, including skipped rows.
+    GGML_API struct ggml_tensor * ggml_cross_entropy_loss_sparse(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * logits,
+            struct ggml_tensor  * labels,  // I32 [nrows]
+            struct ggml_tensor  * weights); // F32 [nrows]
+
+    GGML_API struct ggml_tensor * ggml_cross_entropy_loss_sparse_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * grad,    // scalar gradient of sparse cross entropy
+            struct ggml_tensor  * logits,
+            struct ggml_tensor  * labels,  // I32 [nrows]
+            struct ggml_tensor  * weights); // F32 [nrows]
+
+    // Fused linear projection and sparse cross entropy.
+    // weight: [n_embd, n_vocab], input: F32 [n_embd, n_tokens].
+    // The returned F32 vector has 2*n_tokens elements: weighted per-token
+    // losses followed by per-token log-sum-exp values used by backward.
+    // Vocabulary rows are processed in bounded chunks; no [n_vocab, n_tokens]
+    // logits tensor is materialized.
+    GGML_API struct ggml_tensor * ggml_fused_linear_cross_entropy(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * weight,
+            struct ggml_tensor  * input,
+            struct ggml_tensor  * labels,  // I32 [n_tokens], -1 means ignored
+            struct ggml_tensor  * weights, // F32 [n_tokens]
+            float                 logit_softcap,
+            int32_t               vocab_chunk_size);
+
+    GGML_API struct ggml_tensor * ggml_fused_linear_cross_entropy_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * grad,         // F32 [2*n_tokens], first half has d(loss)/d(loss_i)
+            struct ggml_tensor  * weight,
+            struct ggml_tensor  * input,
+            struct ggml_tensor  * labels,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * forward_stats); // output of ggml_fused_linear_cross_entropy
 
     // AdamW optimizer step
     // Paper: https://arxiv.org/pdf/1711.05101v3.pdf

@@ -426,6 +426,7 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool no_alloc_kv_cache;
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -1755,6 +1756,10 @@ extern "C" {
         void * get_opt_pars_ud;                     // userdata for calculating optimizer parameters
 
         enum ggml_opt_optimizer_type optimizer_type;
+
+        // Use a vocabulary-tiled fused output projection + sparse cross entropy.
+        // Intended for QLoRA with a frozen, directly applied output matrix.
+        bool fused_linear_cross_entropy;
     };
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);

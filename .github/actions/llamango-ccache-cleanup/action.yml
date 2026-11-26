@@ -1,0 +1,70 @@
+name: Cleanup Llamango ccache
+
+description: Retain the latest ccache entry for a Llamango build target.
+
+inputs:
+  cache-key-prefix:
+    description: Stable prefix for the ccache key.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Retain the latest cache for this build target
+      uses: actions/github-script@v9
+      continue-on-error: true
+      env:
+        CACHE_KEY_PREFIX: ${{ inputs.cache-key-prefix }}
+      with:
+        github-token: ${{ github.token }}
+        script: |
+          const prefix = process.env.CACHE_KEY_PREFIX;
+          const { owner, repo } = context.repo;
+          const ref = context.ref;
+          const caches = [];
+
+          for (let page = 1; ; page += 1) {
+            const { data } = await github.request(
+              "GET /repos/{owner}/{repo}/actions/caches",
+              {
+                owner,
+                repo,
+                ref,
+                key: prefix,
+                sort: "created_at",
+                direction: "desc",
+                per_page: 100,
+                page,
+              },
+            );
+            const pageCaches = data.actions_caches ?? [];
+            caches.push(
+              ...pageCaches.filter(
+                (cache) =>
+                  cache.ref === ref && cache.key.startsWith(`${prefix}-`),
+              ),
+            );
+
+            if (pageCaches.length < 100) {
+              break;
+            }
+          }
+
+          caches.sort(
+            (left, right) =>
+              Date.parse(right.created_at) - Date.parse(left.created_at) ||
+              right.id - left.id,
+          );
+
+          for (const cache of caches.slice(1)) {
+            try {
+              await github.request(
+                "DELETE /repos/{owner}/{repo}/actions/caches/{cache_id}",
+                { owner, repo, cache_id: cache.id },
+              );
+            } catch (error) {
+              if (error.status !== 404) {
+                throw error;
+              }
+            }
+          }
