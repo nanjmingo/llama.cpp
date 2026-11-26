@@ -278,6 +278,7 @@ static bool test_fused_linear_cross_entropy_vocab_tiling(ggml_backend_t backend,
         ctx, weight, input, labels, weights, softcap, vocab_chunk);
     ggml_tensor * fused_loss_tokens = ggml_view_1d(ctx, fused_stats, n_tokens, 0);
     ggml_tensor * fused_loss = ggml_scale(ctx, ggml_sum(ctx, fused_loss_tokens), 1.0f / n_tokens);
+
     ggml_tensor * difference = ggml_sub(ctx, fused_loss, reference_loss);
     ggml_set_loss(difference);
 

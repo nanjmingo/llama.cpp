@@ -12844,9 +12844,95 @@ static void ggml_fused_linear_cross_entropy_get_weight_row_f32(
     traits->to_float(row, output, n_embd);
 }
 
+struct ggml_fused_linear_cross_entropy_cpu_dot {
+    const ggml_tensor * weight;
+    const ggml_type_traits_cpu * weight_traits;
+    const ggml_type_traits_cpu * dot_traits;
+    enum ggml_type dot_type;
+    enum ggml_prec activation_precision;
+    bool use_fp32_dot;
+    size_t dot_row_size;
+    std::vector<uint8_t> quantized_inputs;
+    std::vector<float> fp32_inputs;
+};
+
+static ggml_fused_linear_cross_entropy_cpu_dot ggml_fused_linear_cross_entropy_prepare_dot(
+        const ggml_tensor * weight,
+        const ggml_tensor * input,
+        const ggml_tensor * op) {
+    ggml_fused_linear_cross_entropy_cpu_dot result = {};
+    result.weight = weight;
+    result.weight_traits = ggml_get_type_traits_cpu(weight->type);
+    GGML_ASSERT(result.weight_traits && result.weight_traits->vec_dot);
+    result.dot_type = result.weight_traits->vec_dot_type;
+    result.dot_traits = ggml_get_type_traits_cpu(result.dot_type);
+    GGML_ASSERT(result.dot_traits && result.dot_traits->from_float);
+    result.activation_precision = (enum ggml_prec) ggml_get_op_params_i32(op, 3);
+
+    // Match ggml_compute_forward_mul_mat(): unless an explicit F32/F16/BF16
+    // activation precision is requested, quantized weights use their native
+    // vec_dot_type (for example Q4_0 x Q8_0).
+    result.use_fp32_dot = ggml_is_quantized(weight->type) &&
+        (result.activation_precision == GGML_PREC_F32 ||
+         result.activation_precision == GGML_PREC_F16 ||
+         result.activation_precision == GGML_PREC_BF16);
+
+    const int64_t n_embd = input->ne[0];
+    const int64_t n_tokens = input->ne[1];
+    const float * input_data = (const float *) input->data;
+    if (result.use_fp32_dot) {
+        result.fp32_inputs.resize((size_t) n_embd * (size_t) n_tokens);
+        for (int64_t token = 0; token < n_tokens; ++token) {
+            for (int64_t i = 0; i < n_embd; ++i) {
+                const float value = input_data[token * n_embd + i];
+                if (result.activation_precision == GGML_PREC_F16) {
+                    result.fp32_inputs[(size_t) token * n_embd + i] =
+                        ggml_fp16_to_fp32(ggml_fp32_to_fp16(value));
+                } else if (result.activation_precision == GGML_PREC_BF16) {
+                    result.fp32_inputs[(size_t) token * n_embd + i] =
+                        ggml_bf16_to_fp32(ggml_fp32_to_bf16(value));
+                } else {
+                    result.fp32_inputs[(size_t) token * n_embd + i] = value;
+                }
+            }
+        }
+    } else {
+        result.dot_row_size = ggml_row_size(result.dot_type, n_embd);
+        result.quantized_inputs.resize(result.dot_row_size * (size_t) n_tokens);
+        for (int64_t token = 0; token < n_tokens; ++token) {
+            result.dot_traits->from_float(
+                input_data + (size_t) token * (size_t) n_embd,
+                result.quantized_inputs.data() + (size_t) token * result.dot_row_size,
+                n_embd);
+        }
+    }
+    return result;
+}
+
+static float ggml_fused_linear_cross_entropy_dot_row(
+        const ggml_fused_linear_cross_entropy_cpu_dot & dot,
+        int64_t vocab_row,
+        int64_t token,
+        const float * dequantized_weight_row) {
+    const int64_t n_embd = dot.weight->ne[0];
+    const void * weight_row = (const char *) dot.weight->data + vocab_row * dot.weight->nb[1];
+    float value = 0.0f;
+    if (dot.use_fp32_dot) {
+        const float * x = dot.fp32_inputs.data() + (size_t) token * (size_t) n_embd;
+        for (int64_t i = 0; i < n_embd; ++i) {
+            value += dequantized_weight_row[i] * x[i];
+        }
+    } else {
+        const void * x = dot.quantized_inputs.data() + (size_t) token * dot.dot_row_size;
+        dot.weight_traits->vec_dot((int) n_embd, &value, 0, weight_row, 0, x, 0, 1);
+    }
+    return value;
+}
+
 // Fused linear projection + sparse cross entropy with vocabulary-axis tiling.
-// Each quantized weight row is converted once per forward pass and is reused
-// across every token in the batch. Only per-token LSE/loss statistics persist.
+// The native quantized dot path consumes quantized weights directly and converts
+// each input row once. Backward dequantizes each weight row once and reuses it
+// across all tokens for the input-gradient accumulation.
 void ggml_compute_forward_fused_linear_cross_entropy(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -12872,7 +12958,8 @@ void ggml_compute_forward_fused_linear_cross_entropy(
 
     const int32_t * label_data = (const int32_t *) labels->data;
     const float * row_weights = (const float *) weights->data;
-    const float * input_data = (const float *) input->data;
+    const ggml_fused_linear_cross_entropy_cpu_dot dot =
+        ggml_fused_linear_cross_entropy_prepare_dot(weight, input, dst);
     float * stats = (float *) dst->data;
     for (int64_t token = 0; token < n_tokens; ++token) {
         GGML_ASSERT(label_data[token] == -1 || (label_data[token] >= 0 && label_data[token] < n_vocab));
@@ -12891,17 +12978,16 @@ void ggml_compute_forward_fused_linear_cross_entropy(
         // One dequantization per vocabulary row, reused for all input tokens.
         for (int64_t v = 0; v < n_vocab_tile; ++v) {
             const int64_t vocab = vocab_start + v;
-            ggml_fused_linear_cross_entropy_get_weight_row_f32(weight, vocab, weight_row.data());
+            if (dot.use_fp32_dot) {
+                ggml_fused_linear_cross_entropy_get_weight_row_f32(weight, vocab, weight_row.data());
+            }
             for (int64_t token = 0; token < n_tokens; ++token) {
                 if (label_data[token] < 0 || row_weights[token] == 0.0f) {
                     tile_logits[(size_t) v * n_tokens + token] = -INFINITY;
                     continue;
                 }
-                const float * x = input_data + token * n_embd;
-                float logit = 0.0f;
-                for (int64_t i = 0; i < n_embd; ++i) {
-                    logit += weight_row[(size_t) i] * x[i];
-                }
+                float logit = ggml_fused_linear_cross_entropy_dot_row(
+                    dot, vocab, token, weight_row.data());
                 if (softcap > 0.0f) {
                     logit = softcap * std::tanh(logit / softcap);
                 }
@@ -12976,7 +13062,8 @@ void ggml_compute_forward_fused_linear_cross_entropy_back(
 
     const int32_t * label_data = (const int32_t *) labels->data;
     const float * row_weights = (const float *) weights->data;
-    const float * input_data = (const float *) input->data;
+    const ggml_fused_linear_cross_entropy_cpu_dot dot =
+        ggml_fused_linear_cross_entropy_prepare_dot(weight, input, dst);
     const float * token_grad = (const float *) grad->data;
     const float * lse = (const float *) stats->data + n_tokens;
     float * input_grad = (float *) dst->data;
@@ -12996,11 +13083,8 @@ void ggml_compute_forward_fused_linear_cross_entropy_back(
                 continue;
             }
             GGML_ASSERT(label < n_vocab);
-            float raw_logit = 0.0f;
-            const float * x = input_data + token * n_embd;
-            for (int64_t i = 0; i < n_embd; ++i) {
-                raw_logit += weight_row[(size_t) i] * x[i];
-            }
+            const float raw_logit = ggml_fused_linear_cross_entropy_dot_row(
+                dot, vocab, token, weight_row.data());
             float logit = raw_logit;
             float derivative = 1.0f;
             if (softcap > 0.0f) {
