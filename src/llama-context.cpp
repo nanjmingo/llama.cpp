@@ -630,13 +630,15 @@ llama_context::llama_context(
             moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
         }
 
-        if (!params.no_alloc_kv_cache) {
+        if (!params.no_alloc_kv_cache || model.no_alloc()) {
+            // Keep the split-only size probe for no-alloc models: --fit uses these
+            // estimates to account for compute buffers without allocating them.
             sched_reserve();
         } else {
-            // no_alloc_kv_cache is used by QLoRA/optimizer-managed training contexts.
-            // Their inference graph is replaced by the optimizer graph in opt_init,
-            // so reserving it here only allocates buffers that are immediately freed.
-            LLAMA_LOG_INFO("%s: skipping the initial inference scheduler reserve because no_alloc_kv_cache is enabled; buffers will be allocated for the first actual graph\n", __func__);
+            // QLoRA/optimizer-managed contexts with allocated model weights replace
+            // the inference graph in opt_init. Reserving it here would allocate
+            // buffers that are immediately discarded before the optimizer graph.
+            LLAMA_LOG_INFO("%s: skipping the initial inference scheduler reserve because no_alloc_kv_cache is enabled for an allocated model; buffers will be allocated for the first actual graph\n", __func__);
         }
 
         if (!cparams.flash_attn) {
@@ -4173,6 +4175,14 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].context += size;
         }
     }
+    // QLoRA/optimizer-managed contexts may intentionally defer scheduler creation
+    // until opt_init(). common_fit_params() queries this breakdown before that
+    // point, so there is no compute buffer to report yet and sched is null.
+    if (!sched) {
+        LLAMA_LOG_DEBUG("%s: scheduler is not initialized; reporting model/context memory only\n", __func__);
+        return ret;
+    }
+
     if (model.no_alloc()) {
         for (size_t i = 0; i < backends.size(); ++i) {
             ggml_backend_t             backend = backends[i].get();
