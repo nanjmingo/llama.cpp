@@ -2960,11 +2960,30 @@ static void ggml_cuda_fused_linear_cross_entropy_back(ggml_backend_cuda_context 
             n_vocab_tile, n_tokens, vocab_start, n_vocab, softcap);
         CUDA_CHECK(cudaGetLastError());
 
+        // OUT_PROD computes dX = W * dLogits. Its second operand is a
+        // [n_tokens, n_vocab_tile] view with transposed strides over the
+        // [n_vocab_tile, n_tokens] logits scratch written by the gradient kernel.
+        ggml_tensor logits_transposed = {};
+        logits_transposed.type = GGML_TYPE_F32;
+        logits_transposed.ne[0] = n_tokens;
+        logits_transposed.ne[1] = n_vocab_tile;
+        logits_transposed.ne[2] = 1;
+        logits_transposed.ne[3] = 1;
+        logits_transposed.nb[0] = (size_t) n_vocab_tile * sizeof(float);
+        logits_transposed.nb[1] = sizeof(float);
+        logits_transposed.nb[2] = logits_transposed.nb[0] * (size_t) n_tokens;
+        logits_transposed.nb[3] = logits_transposed.nb[2];
+        logits_transposed.data = logits.ptr;
+
+        GGML_ASSERT(weight_tile.ne[1] == logits_transposed.ne[1]);
+        GGML_ASSERT(weight_tile.ne[0] == n_embd);
+        GGML_ASSERT(logits_transposed.ne[0] == n_tokens);
+
         ggml_tensor grad_input_desc = {};
         grad_input_desc.type = GGML_TYPE_F32;
-        grad_input_desc.op = GGML_OP_MUL_MAT;
+        grad_input_desc.op = GGML_OP_OUT_PROD;
         grad_input_desc.src[0] = &weight_tile;
-        grad_input_desc.src[1] = &logits_tile;
+        grad_input_desc.src[1] = &logits_transposed;
         memcpy(grad_input_desc.op_params, dst->op_params, sizeof(grad_input_desc.op_params));
         grad_input_desc.ne[0] = n_embd;
         grad_input_desc.ne[1] = n_tokens;
@@ -2976,7 +2995,7 @@ static void ggml_cuda_fused_linear_cross_entropy_back(ggml_backend_cuda_context 
         grad_input_desc.nb[3] = grad_input_desc.nb[2];
         grad_input_desc.data = grad_input_tile.ptr;
 
-        ggml_cuda_mul_mat(ctx, &weight_tile, &logits_tile, &grad_input_desc);
+        ggml_cuda_out_prod(ctx, &grad_input_desc);
         const int64_t n_input_grad = n_embd * n_tokens;
         const int accum_blocks = (int) ((n_input_grad + 255) / 256);
         ggml_cuda_fused_linear_ce_accumulate_kernel<<<accum_blocks, 256, 0, stream>>>(

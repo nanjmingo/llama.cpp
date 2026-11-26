@@ -1218,7 +1218,17 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
                 linear_input->ne[2] == 1 && linear_input->ne[3] == 1;
 
             if (direct_linear) {
-                constexpr int32_t vocab_chunk_size = 256;
+                // Bound the vocabulary-tile logits scratch while avoiding hundreds
+                // of tiny CUDA matmuls for large vocabularies. The same cap also
+                // bounds the CPU tile buffer. Keep row counts aligned to 256 for MMQ.
+                constexpr int64_t fce_tile_scratch_bytes = 64ll * 1024 * 1024;
+                constexpr int32_t fce_min_vocab_chunk = 256;
+                constexpr int32_t fce_max_vocab_chunk = 8192;
+                const int64_t max_rows_by_scratch = fce_tile_scratch_bytes /
+                    (int64_t) sizeof(float) / std::max<int64_t>(1, nrows);
+                const int64_t aligned_rows = (max_rows_by_scratch / 256) * 256;
+                const int32_t vocab_chunk_size = (int32_t) std::clamp<int64_t>(
+                    aligned_rows, fce_min_vocab_chunk, fce_max_vocab_chunk);
                 struct ggml_tensor * stats = ggml_fused_linear_cross_entropy(ctx_results,
                     linear_output->src[0], linear_input, opt_ctx->labels_sparse,
                     opt_ctx->label_weights, logit_softcap, vocab_chunk_size);

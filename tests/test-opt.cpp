@@ -254,12 +254,58 @@ static bool test_sparse_cross_entropy_dense_equivalence(ggml_backend_t backend) 
     return true;
 }
 
-static bool test_fused_linear_cross_entropy_vocab_tiling(ggml_backend_t backend, enum ggml_type weight_type) {
+static bool backend_supports_fused_linear_cross_entropy(ggml_backend_t backend, enum ggml_type weight_type) {
+    constexpr int64_t n_embd = 32;
+    constexpr int64_t n_vocab = 37;
+    constexpr int64_t n_tokens = 5;
+    ggml_init_params params = { 1024 * 1024, nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+
+    ggml_tensor * weight = ggml_new_tensor_2d(ctx, weight_type, n_embd, n_vocab);
+    ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_set_param(input);
+    ggml_tensor * labels = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_tensor * weights = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_tokens);
+
+    ggml_tensor * logits = ggml_mul_mat(ctx, weight, input);
+    ggml_tensor * capped_logits = ggml_scale(ctx,
+        ggml_tanh(ctx, ggml_scale(ctx, logits, 1.0f / 2.75f)), 2.75f);
+    ggml_tensor * reference_loss = ggml_cross_entropy_loss_sparse(ctx, capped_logits, labels, weights);
+    ggml_set_loss(reference_loss);
+    ggml_cgraph * graph_ref = ggml_new_graph_custom(ctx, 512, true);
+    ggml_build_forward_expand(graph_ref, reference_loss);
+    ggml_build_backward_expand(ctx, graph_ref, nullptr);
+
+    ggml_tensor * stats = ggml_fused_linear_cross_entropy(ctx, weight, input, labels, weights, 2.75f, 8);
+    ggml_tensor * loss = ggml_scale(ctx,
+        ggml_sum(ctx, ggml_view_1d(ctx, stats, n_tokens, 0)), 1.0f / n_tokens);
+    ggml_set_loss(loss);
+    ggml_cgraph * graph_fused = ggml_new_graph_custom(ctx, 512, true);
+    ggml_build_forward_expand(graph_fused, loss);
+    ggml_build_backward_expand(ctx, graph_fused, nullptr);
+
+    bool supported = true;
+    for (int i = 0; i < ggml_graph_n_nodes(graph_ref) && supported; ++i) {
+        supported = ggml_backend_supports_op(backend, ggml_graph_node(graph_ref, i));
+    }
+    for (int i = 0; i < ggml_graph_n_nodes(graph_fused) && supported; ++i) {
+        supported = ggml_backend_supports_op(backend, ggml_graph_node(graph_fused, i));
+    }
+    ggml_free(ctx);
+    return supported;
+}
+
+static bool test_fused_linear_cross_entropy_vocab_tiling(
+        ggml_backend_t backend, enum ggml_type weight_type, int32_t opt_period) {
     // Force several graph workers even on small CI runners. The fused CPU
     // kernels are currently serial and must guard non-zero worker indices.
-    const int restore_n_threads = (int) (std::thread::hardware_concurrency() / 2);
-    const int test_n_threads = std::max(4, restore_n_threads);
-    ggml_backend_cpu_set_n_threads(backend, test_n_threads);
+    const bool is_cpu_backend = ggml_backend_is_cpu(backend);
+    const int restore_n_threads = is_cpu_backend
+        ? (int) (std::thread::hardware_concurrency() / 2) : 0;
+    if (is_cpu_backend) {
+        const int test_n_threads = std::max(4, restore_n_threads);
+        ggml_backend_cpu_set_n_threads(backend, test_n_threads);
+    }
 
     constexpr int64_t n_embd = 32;
     constexpr int64_t n_vocab = 37;
@@ -278,14 +324,18 @@ static bool test_fused_linear_cross_entropy_vocab_tiling(ggml_backend_t backend,
     ggml_tensor * weights = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_tokens);
 
     ggml_tensor * logits = ggml_mul_mat(ctx, weight, input);
+    GGML_ASSERT(opt_period >= 1);
     ggml_tensor * capped_logits = ggml_scale(ctx,
         ggml_tanh(ctx, ggml_scale(ctx, logits, 1.0f / softcap)), softcap);
-    ggml_tensor * reference_loss = ggml_cross_entropy_loss_sparse(ctx, capped_logits, labels, weights);
+    ggml_tensor * reference_loss_mean = ggml_cross_entropy_loss_sparse(ctx, capped_logits, labels, weights);
+    ggml_tensor * reference_loss = opt_period == 1 ? reference_loss_mean :
+        ggml_scale(ctx, reference_loss_mean, 1.0f / (float) opt_period);
 
     ggml_tensor * fused_stats = ggml_fused_linear_cross_entropy(
         ctx, weight, input, labels, weights, softcap, vocab_chunk);
     ggml_tensor * fused_loss_tokens = ggml_view_1d(ctx, fused_stats, n_tokens, 0);
-    ggml_tensor * fused_loss = ggml_scale(ctx, ggml_sum(ctx, fused_loss_tokens), 1.0f / n_tokens);
+    ggml_tensor * fused_loss = ggml_scale(ctx, ggml_sum(ctx, fused_loss_tokens),
+        1.0f / (float) (n_tokens * opt_period));
     ggml_set_loss(reference_loss);
     ggml_set_loss(fused_loss);
 
@@ -366,7 +416,8 @@ static bool test_fused_linear_cross_entropy_vocab_tiling(ggml_backend_t backend,
         std::fabs(fused_loss_grad - 1.0f));
     for (int64_t t = 0; t < n_tokens; ++t) {
         gradient_seed_error = std::max(gradient_seed_error,
-            std::fabs(fused_stats_grad[(size_t) t] - 1.0f / (float) n_tokens));
+            std::fabs(fused_stats_grad[(size_t) t] -
+                1.0f / (float) (n_tokens * opt_period)));
         gradient_seed_error = std::max(gradient_seed_error,
             std::fabs(fused_stats_grad[(size_t) n_tokens + t]));
     }
@@ -444,7 +495,9 @@ static bool test_fused_linear_cross_entropy_vocab_tiling(ggml_backend_t backend,
 
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
-    ggml_backend_cpu_set_n_threads(backend, restore_n_threads);
+    if (is_cpu_backend) {
+        ggml_backend_cpu_set_n_threads(backend, restore_n_threads);
+    }
     return ok;
 }
 
@@ -1441,14 +1494,23 @@ int main(void) {
                 printf("  sparse/dense cross entropy equivalence: ");
                 print_ok(equivalent);
                 GGML_ASSERT(equivalent);
-                const bool fused_tiled_f32 = test_fused_linear_cross_entropy_vocab_tiling(backends[i], GGML_TYPE_F32);
-                printf("  vocabulary-tiled fused linear cross entropy (F32): ");
-                print_ok(fused_tiled_f32);
-                GGML_ASSERT(fused_tiled_f32);
-                const bool fused_tiled_q4 = test_fused_linear_cross_entropy_vocab_tiling(backends[i], GGML_TYPE_Q4_0);
-                printf("  vocabulary-tiled fused linear cross entropy (Q4_0): ");
-                print_ok(fused_tiled_q4);
-                GGML_ASSERT(fused_tiled_q4);
+            }
+            if (!skip) {
+                for (const enum ggml_type weight_type : { GGML_TYPE_F32, GGML_TYPE_Q4_0 }) {
+                    const char * type_name = ggml_type_name(weight_type);
+                    if (!backend_supports_fused_linear_cross_entropy(backends[i], weight_type)) {
+                        printf("  vocabulary-tiled fused linear cross entropy (%s): SKIPPED (unsupported backend ops)\n", type_name);
+                        continue;
+                    }
+                    for (const int32_t opt_period : { 1, 2 }) {
+                        const bool fused_ok = test_fused_linear_cross_entropy_vocab_tiling(
+                            backends[i], weight_type, opt_period);
+                        printf("  vocabulary-tiled fused linear cross entropy (%s, accumulation=%d): ",
+                            type_name, opt_period);
+                        print_ok(fused_ok);
+                        GGML_ASSERT(fused_ok);
+                    }
+                }
             }
 
             std::pair<int, int> result;
