@@ -4309,12 +4309,15 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
         /*.op_offload =*/ cparams.op_offload,
     });
 
-    const int cpu_threadpool_threads = threadpool ? ggml_threadpool_get_n_threads(threadpool) : 0;
-    LLAMA_LOG_INFO("%s: optimizer backend thread count = %d, external CPU threadpool = %s (workers=%d)\n",
-        __func__, std::max(1, cparams.n_threads), threadpool ? "enabled" : "disabled", cpu_threadpool_threads);
+    int cpu_threadpool_threads = 0;
     if (backend_cpu != nullptr) {
         auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
         if (reg) {
+            auto * get_n_threads_fn = (int (*)(ggml_threadpool_t))
+                ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_get_n_threads");
+            if (threadpool && get_n_threads_fn) {
+                cpu_threadpool_threads = get_n_threads_fn(threadpool);
+            }
             auto * set_threadpool_fn = (decltype(ggml_backend_cpu_set_threadpool) *)
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
             if (set_threadpool_fn) {
@@ -4322,6 +4325,8 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
             }
         }
     }
+    LLAMA_LOG_INFO("%s: optimizer backend thread count = %d, external CPU threadpool = %s (workers=%d)\n",
+        __func__, std::max(1, cparams.n_threads), threadpool ? "enabled" : "disabled", cpu_threadpool_threads);
     for (const auto & set_n_threads_fn : set_n_threads_fns) {
         set_n_threads_fn.second(set_n_threads_fn.first, std::max(1, cparams.n_threads));
     }

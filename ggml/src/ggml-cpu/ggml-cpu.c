@@ -3,6 +3,7 @@
 
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "traits.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
@@ -512,6 +513,10 @@ struct ggml_threadpool {
 
     enum ggml_status ec;
 };
+
+int ggml_threadpool_get_n_threads(struct ggml_threadpool * threadpool) {
+    return threadpool ? threadpool->n_threads : 0;
+}
 
 // Per-thread state
 struct ggml_compute_state {
