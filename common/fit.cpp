@@ -271,10 +271,6 @@ static void common_params_fit_impl(
     constexpr int64_t MiB = 1024*1024;
     typedef std::vector<llama_device_memory_data> dmds_t;
     const llama_model_params default_mparams = llama_model_default_params();
-    // --gpu-layers all fixes the total number of GPU layers, but does not fix
-    // their distribution across devices. --fit may still balance that distribution
-    // as long as every layer remains on a GPU.
-    const bool requested_all_gpu_layers = mparams->n_gpu_layers == -2;
 
     std::vector<ggml_backend_dev_t> devs;
     uint32_t hp_ngl = 0; // hparams.n_gpu_layers
@@ -551,10 +547,8 @@ static void common_params_fit_impl(
         throw common_params_fit_exception("was unable to fit model into system memory by reducing context, abort");
     }
 
-    if (mparams->n_gpu_layers != default_mparams.n_gpu_layers && !requested_all_gpu_layers) {
-        throw common_params_fit_exception(
-            "--gpu-layers was explicitly set to " + std::to_string(mparams->n_gpu_layers) +
-            "; --fit will not override an explicit layer count. Use --gpu-layers auto or adjust the value manually");
+    if (mparams->n_gpu_layers != default_mparams.n_gpu_layers) {
+        throw common_params_fit_exception("n_gpu_layers already set by user to " + std::to_string(mparams->n_gpu_layers) + ", abort");
     }
     if (nd > 1) {
         if (!tensor_split) {
@@ -767,23 +761,6 @@ static void common_params_fit_impl(
     std::vector<ngl_t> ngl_per_device(nd);
     std::vector<int64_t> mem = get_memory_for_layers(__func__, ngl_per_device, overflow_bufts);
 
-    auto ensure_requested_gpu_layer_count = [&]() {
-        if (!requested_all_gpu_layers) {
-            return;
-        }
-        uint64_t assigned = 0;
-        for (const ngl_t & per_device : ngl_per_device) {
-            assigned += per_device.n_layer;
-        }
-        const uint64_t requested = uint64_t(hp_ngl) + 1;
-        if (assigned != requested) {
-            throw common_params_fit_exception(
-                "--gpu-layers all was requested, but only " + std::to_string(assigned) + " of " +
-                std::to_string(requested) + " GPU layers fit within the device memory targets. "
-                "Use --gpu-layers auto or specify a smaller layer count");
-        }
-    };
-
     // optimize the number of layers per device using the method of false position:
     //   - ngl_per_device has 0 layers for each device, lower bound
     //   - try a "high" configuration where a device is given all unassigned layers
@@ -852,7 +829,6 @@ static void common_params_fit_impl(
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB, projected_margin/MiB);
     }
     if (hp_nex == 0 || global_surplus_cpu_moe <= 0) {
-        ensure_requested_gpu_layer_count();
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
         return;
     }
@@ -998,7 +974,6 @@ static void common_params_fit_impl(
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, ngl_per_device[id].n_part, mem[id]/MiB, projected_margin/MiB);
     }
 
-    ensure_requested_gpu_layer_count();
     set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
 }
 
