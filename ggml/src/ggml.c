@@ -6476,7 +6476,7 @@ struct ggml_tensor * ggml_fused_linear_cross_entropy(
     result->src[1] = input;
     result->src[2] = labels;
     result->src[3] = weights;
-    memcpy(result->op_params + 12 * sizeof(int32_t), &logit_softcap, sizeof(logit_softcap));
+    ggml_set_op_params_f32(result, 12, logit_softcap);
     ggml_set_op_params_i32(result, 13, vocab_chunk_size);
     return result;
 }

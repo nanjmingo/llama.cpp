@@ -12947,7 +12947,7 @@ void ggml_compute_forward_fused_linear_cross_entropy(
     const int64_t vocab_chunk = std::min<int64_t>(
         n_vocab, ggml_get_op_params_i32(dst, 13));
     float softcap = 0.0f;
-    memcpy(&softcap, dst->op_params + 12 * sizeof(int32_t), sizeof(softcap));
+    softcap = ggml_get_op_params_f32(dst, 12);
 
     GGML_ASSERT(input->type == GGML_TYPE_F32 && ggml_is_contiguous(input));
     GGML_ASSERT(ggml_is_contiguous(weight));
@@ -13050,7 +13050,7 @@ void ggml_compute_forward_fused_linear_cross_entropy_back(
     const int64_t n_vocab  = weight->ne[1];
     const int64_t n_tokens = input->ne[1];
     float softcap = 0.0f;
-    memcpy(&softcap, dst->op_params + 12 * sizeof(int32_t), sizeof(softcap));
+    softcap = ggml_get_op_params_f32(dst, 12);
 
     GGML_ASSERT(ggml_nelements(grad) == 2 * n_tokens);
     GGML_ASSERT(input->type == GGML_TYPE_F32 && ggml_is_contiguous(input));

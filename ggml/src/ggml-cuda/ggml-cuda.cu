@@ -2839,7 +2839,7 @@ static void ggml_cuda_fused_linear_cross_entropy(ggml_backend_cuda_context & ctx
     const int64_t vocab_chunk = std::min<int64_t>(
         n_vocab, ggml_get_op_params_i32(dst, 13));
     float softcap = 0.0f;
-    memcpy(&softcap, dst->op_params + 12 * sizeof(int32_t), sizeof(softcap));
+    softcap = ggml_get_op_params_f32(dst, 12);
     GGML_ASSERT(vocab_chunk > 0);
 
     ggml_cuda_pool_alloc<float> logits(ctx.pool(), (size_t) vocab_chunk * (size_t) n_tokens);
@@ -2912,7 +2912,7 @@ static void ggml_cuda_fused_linear_cross_entropy_back(ggml_backend_cuda_context 
     const int64_t vocab_chunk = std::min<int64_t>(
         n_vocab, ggml_get_op_params_i32(dst, 13));
     float softcap = 0.0f;
-    memcpy(&softcap, dst->op_params + 12 * sizeof(int32_t), sizeof(softcap));
+    softcap = ggml_get_op_params_f32(dst, 12);
     GGML_ASSERT(vocab_chunk > 0);
 
     ggml_cuda_pool_alloc<float> logits(ctx.pool(), (size_t) vocab_chunk * (size_t) n_tokens);

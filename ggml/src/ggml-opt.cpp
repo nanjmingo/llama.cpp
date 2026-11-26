@@ -1224,7 +1224,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
                     opt_ctx->label_weights, logit_softcap, vocab_chunk_size);
                 // Preserve matmul precision and accumulator policy in the fused op.
                 memcpy(stats->op_params, linear_output->op_params, sizeof(linear_output->op_params));
-                memcpy(stats->op_params + 12 * sizeof(int32_t), &logit_softcap, sizeof(logit_softcap));
+                ggml_set_op_params_f32(stats, 12, logit_softcap);
                 ggml_set_op_params_i32(stats, 13, vocab_chunk_size);
                 ggml_set_name(stats, "fused_linear_cross_entropy_stats");
 
