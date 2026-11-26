@@ -13034,23 +13034,23 @@ void ggml_compute_forward_fused_linear_cross_entropy(
     }
 }
 
-// Backward reuses the forward LSE and dequantizes each output row exactly once.
+// Backward reuses the forward LSE and processes bounded token tiles. Vectorized
+// softmax and MAD helpers mirror the unfused CPU CE/OUT_PROD reference path.
 // The resulting gradient is accumulated directly into [n_embd, n_tokens].
 void ggml_compute_forward_fused_linear_cross_entropy_back(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
     GGML_UNUSED(params);
-    const ggml_tensor * grad   = dst->src[0];
-    const ggml_tensor * weight = dst->src[1];
-    const ggml_tensor * input  = dst->src[2];
-    const ggml_tensor * labels = dst->src[3];
+    const ggml_tensor * grad    = dst->src[0];
+    const ggml_tensor * weight  = dst->src[1];
+    const ggml_tensor * input   = dst->src[2];
+    const ggml_tensor * labels  = dst->src[3];
     const ggml_tensor * weights = dst->src[4];
-    const ggml_tensor * stats  = dst->src[5];
+    const ggml_tensor * stats   = dst->src[5];
     const int64_t n_embd   = weight->ne[0];
     const int64_t n_vocab  = weight->ne[1];
     const int64_t n_tokens = input->ne[1];
-    float softcap = 0.0f;
-    softcap = ggml_get_op_params_f32(dst, 12);
+    const float softcap = ggml_get_op_params_f32(dst, 12);
 
     GGML_ASSERT(ggml_nelements(grad) == 2 * n_tokens);
     GGML_ASSERT(input->type == GGML_TYPE_F32 && ggml_is_contiguous(input));
@@ -13065,42 +13065,93 @@ void ggml_compute_forward_fused_linear_cross_entropy_back(
     const ggml_fused_linear_cross_entropy_cpu_dot dot =
         ggml_fused_linear_cross_entropy_prepare_dot(weight, input, dst);
     const float * token_grad = (const float *) grad->data;
-    const float * lse = (const float *) stats->data + n_tokens;
     float * input_grad = (float *) dst->data;
     std::fill(input_grad, input_grad + n_embd * n_tokens, 0.0f);
-    for (int64_t token = 0; token < n_tokens; ++token) {
-        GGML_ASSERT(label_data[token] == -1 || (label_data[token] >= 0 && label_data[token] < n_vocab));
-        GGML_ASSERT(std::isfinite(row_weights[token]) && row_weights[token] >= 0.0f);
-    }
 
+    // Match the reference sparse-CE and quantized OUT_PROD kernels more closely:
+    // use the same vectorized softmax reduction, scaling order, and vector MAD.
+    // The scratch is bounded independently of the total token count.
+    constexpr size_t max_logits_scratch = 32u * 1024u * 1024u;
+    const int64_t token_tile = std::max<int64_t>(1, std::min<int64_t>(n_tokens,
+        (int64_t) std::max<size_t>(1, max_logits_scratch / (sizeof(float) * (size_t) n_vocab))));
+    std::vector<float> tile_logits((size_t) token_tile * (size_t) n_vocab);
+    std::vector<float> tile_derivatives;
+    if (softcap > 0.0f) {
+        tile_derivatives.resize((size_t) token_tile * (size_t) n_vocab);
+    }
     std::vector<float> weight_row((size_t) n_embd);
-    for (int64_t vocab = 0; vocab < n_vocab; ++vocab) {
-        ggml_fused_linear_cross_entropy_get_weight_row_f32(weight, vocab, weight_row.data());
-        for (int64_t token = 0; token < n_tokens; ++token) {
+
+    for (int64_t token_start = 0; token_start < n_tokens; token_start += token_tile) {
+        const int64_t n_tile_tokens = std::min(token_tile, n_tokens - token_start);
+
+        // Recompute one bounded token tile of logits. Each row uses the same
+        // quantized activation dot product as the regular MUL_MAT forward path.
+        for (int64_t vocab = 0; vocab < n_vocab; ++vocab) {
+            if (dot.use_fp32_dot) {
+                ggml_fused_linear_cross_entropy_get_weight_row_f32(weight, vocab, weight_row.data());
+            }
+            for (int64_t t = 0; t < n_tile_tokens; ++t) {
+                const int64_t token = token_start + t;
+                const size_t offset = (size_t) t * (size_t) n_vocab + (size_t) vocab;
+                float raw_logit = 0.0f;
+                if (label_data[token] >= 0 && row_weights[token] != 0.0f && token_grad[token] != 0.0f) {
+                    raw_logit = ggml_fused_linear_cross_entropy_dot_row(
+                        dot, vocab, token, weight_row.data());
+                }
+                if (softcap > 0.0f && label_data[token] >= 0 &&
+                    row_weights[token] != 0.0f && token_grad[token] != 0.0f) {
+                    const float tanh_logit = std::tanh(raw_logit / softcap);
+                    tile_derivatives[offset] = 1.0f - tanh_logit * tanh_logit;
+                    tile_logits[offset] = softcap * tanh_logit;
+                } else {
+                    if (softcap > 0.0f) tile_derivatives[offset] = 0.0f;
+                    tile_logits[offset] = raw_logit;
+                }
+            }
+        }
+
+        // Reproduce ggml_compute_forward_cross_entropy_loss_sparse_back's
+        // normalization and scaling sequence for each token independently.
+        for (int64_t t = 0; t < n_tile_tokens; ++t) {
+            const int64_t token = token_start + t;
+            float * row_grad = tile_logits.data() + (size_t) t * (size_t) n_vocab;
             const int32_t label = label_data[token];
             const float row_weight = row_weights[token];
             if (label < 0 || row_weight == 0.0f || token_grad[token] == 0.0f) {
+                std::fill(row_grad, row_grad + n_vocab, 0.0f);
                 continue;
             }
-            GGML_ASSERT(label < n_vocab);
-            const float raw_logit = ggml_fused_linear_cross_entropy_dot_row(
-                dot, vocab, token, weight_row.data());
-            float logit = raw_logit;
-            float derivative = 1.0f;
+
+            float max_logit = -INFINITY;
+            ggml_vec_max_f32((int) n_vocab, &max_logit, row_grad);
+            const ggml_float sum_exp = ggml_vec_soft_max_f32((int) n_vocab, row_grad, row_grad, max_logit);
+            ggml_vec_scale_f32((int) n_vocab, row_grad, 1.0 / sum_exp);
+            ggml_vec_scale_f32((int) n_vocab, row_grad, row_weight);
+            row_grad[label] -= row_weight;
+            ggml_vec_scale_f32((int) n_vocab, row_grad, token_grad[token]);
+
             if (softcap > 0.0f) {
-                const float tanh_logit = std::tanh(raw_logit / softcap);
-                logit = softcap * tanh_logit;
-                derivative = 1.0f - tanh_logit * tanh_logit;
+                // Backpropagate through scale(cap) -> tanh -> scale(1/cap)
+                // in the same order as the unfused graph.
+                ggml_vec_scale_f32((int) n_vocab, row_grad, softcap);
+                ggml_vec_mul_f32((int) n_vocab, row_grad, row_grad,
+                    tile_derivatives.data() + (size_t) t * (size_t) n_vocab);
+                ggml_vec_scale_f32((int) n_vocab, row_grad, 1.0f / softcap);
             }
-            const float probability = std::exp(logit - lse[token]);
-            const float dlogit = (probability - (vocab == label ? 1.0f : 0.0f)) *
-                row_weight * token_grad[token] * derivative;
-            if (dlogit == 0.0f) {
-                continue;
-            }
-            float * dx = input_grad + token * n_embd;
-            for (int64_t i = 0; i < n_embd; ++i) {
-                dx[i] += weight_row[(size_t) i] * dlogit;
+        }
+
+        // Match ggml_compute_forward_out_prod_q_f32: dequantize each weight row
+        // once per token tile and accumulate with the architecture's vector MAD.
+        for (int64_t vocab = 0; vocab < n_vocab; ++vocab) {
+            ggml_fused_linear_cross_entropy_get_weight_row_f32(weight, vocab, weight_row.data());
+            for (int64_t t = 0; t < n_tile_tokens; ++t) {
+                const int64_t token = token_start + t;
+                const float dlogit = tile_logits[(size_t) t * (size_t) n_vocab + (size_t) vocab];
+                if (dlogit == 0.0f) {
+                    continue;
+                }
+                float * dx = input_grad + (size_t) token * (size_t) n_embd;
+                ggml_vec_mad_f32((int) n_embd, dx, weight_row.data(), dlogit);
             }
         }
     }
