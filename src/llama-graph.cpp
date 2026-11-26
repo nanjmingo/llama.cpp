@@ -3833,7 +3833,15 @@ static ggml_tensor * build_attn_iswa_impl(
     // Shared-KV source layers are kept as graph tensors so gradients reach the source.
     const bool use_kv_cur = cparams.training && k_cur && v_cur;
     if (use_kv_cur) {
-        GGML_ASSERT(mctx_cur->get_n_kv() == gctx.n_tokens);
+        // The SWA cache capacity is padded to 256 cells for backend efficiency,
+        // while training attends directly to the current K/V tensors and uses an
+        // exact n_tokens mask. Capacity may therefore exceed, but never undershoot,
+        // the current training sequence length.
+        const uint32_t n_kv_capacity = mctx_cur->get_n_kv();
+        GGML_ASSERT(n_kv_capacity >= gctx.n_tokens);
+        GGML_ASSERT(k_cur->ne[2] == gctx.n_tokens);
+        GGML_ASSERT(v_cur->ne[2] == gctx.n_tokens);
+        GGML_ASSERT(kq_mask->ne[0] == gctx.n_tokens);
     }
 
     const bool store_kv = !use_kv_cur || hparams.n_layer_kv_from_start >= 0;
