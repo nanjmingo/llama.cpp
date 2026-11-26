@@ -2685,8 +2685,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_EXT_FUSED_LINEAR_CROSS_ENTROPY:
         case GGML_OP_EXT_FUSED_LINEAR_CROSS_ENTROPY_BACK:
             {
-                // The vocabulary loop accumulates into shared per-token statistics
-                // and input gradients. Keep this reference CPU implementation serial.
+                // The fused CPU implementation is serial and explicitly ignores
+                // non-zero worker indices. The graph-wide thread count can still
+                // exceed one when a different node in the graph is parallel.
                 n_tasks = 1;
             } break;
         case GGML_OP_NONE:

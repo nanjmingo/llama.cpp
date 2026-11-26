@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "ggml-opt.h"
 
 #include <algorithm>
@@ -254,6 +255,12 @@ static bool test_sparse_cross_entropy_dense_equivalence(ggml_backend_t backend) 
 }
 
 static bool test_fused_linear_cross_entropy_vocab_tiling(ggml_backend_t backend, enum ggml_type weight_type) {
+    // Force several graph workers even on small CI runners. The fused CPU
+    // kernels are currently serial and must guard non-zero worker indices.
+    const int restore_n_threads = (int) (std::thread::hardware_concurrency() / 2);
+    const int test_n_threads = std::max(4, restore_n_threads);
+    ggml_backend_cpu_set_n_threads(backend, test_n_threads);
+
     constexpr int64_t n_embd = 32;
     constexpr int64_t n_vocab = 37;
     constexpr int64_t n_tokens = 5;
@@ -437,6 +444,7 @@ static bool test_fused_linear_cross_entropy_vocab_tiling(ggml_backend_t backend,
 
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
+    ggml_backend_cpu_set_n_threads(backend, restore_n_threads);
     return ok;
 }
 

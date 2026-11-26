@@ -12936,7 +12936,12 @@ static float ggml_fused_linear_cross_entropy_dot_row(
 void ggml_compute_forward_fused_linear_cross_entropy(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
-    GGML_UNUSED(params);
+    // This implementation is intentionally serial. CPU graph workers still
+    // visit nodes with n_tasks == 1 when another node raises the graph-wide
+    // thread count, so explicitly restrict writes to worker 0.
+    if (params->ith != 0) {
+        return;
+    }
     const ggml_tensor * weight  = dst->src[0];
     const ggml_tensor * input   = dst->src[1];
     const ggml_tensor * labels  = dst->src[2];
@@ -13040,7 +13045,11 @@ void ggml_compute_forward_fused_linear_cross_entropy(
 void ggml_compute_forward_fused_linear_cross_entropy_back(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
-    GGML_UNUSED(params);
+    // See the forward operator: n_tasks == 1 does not prevent other active
+    // graph workers from visiting this node when a different node is parallel.
+    if (params->ith != 0) {
+        return;
+    }
     const ggml_tensor * grad    = dst->src[0];
     const ggml_tensor * weight  = dst->src[1];
     const ggml_tensor * input   = dst->src[2];
