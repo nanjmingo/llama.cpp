@@ -630,7 +630,14 @@ llama_context::llama_context(
             moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
         }
 
-        sched_reserve();
+        if (!params.no_alloc_kv_cache) {
+            sched_reserve();
+        } else {
+            // no_alloc_kv_cache is used by QLoRA/optimizer-managed training contexts.
+            // Their inference graph is replaced by the optimizer graph in opt_init,
+            // so reserving it here only allocates buffers that are immediately freed.
+            LLAMA_LOG_INFO("%s: skipping the initial inference scheduler reserve because no_alloc_kv_cache is enabled; buffers will be allocated for the first actual graph\n", __func__);
+        }
 
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
@@ -1397,6 +1404,12 @@ void llama_context::set_n_threads(int32_t n_threads, int32_t n_threads_batch) {
 
     cparams.n_threads       = n_threads;
     cparams.n_threads_batch = n_threads_batch;
+
+    // Optimizer evaluation bypasses llama_context::graph_compute(), so propagate
+    // thread-count changes immediately to backend contexts as well.
+    for (const auto & set_n_threads_fn : set_n_threads_fns) {
+        set_n_threads_fn.second(set_n_threads_fn.first, std::max(1, cparams.n_threads));
+    }
 }
 
 void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data) {
@@ -4286,9 +4299,32 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     cparams.fused_linear_cross_entropy = lopt_params.fused_linear_cross_entropy && cparams.training &&
         model->split_mode() != LLAMA_SPLIT_MODE_ROW && model->split_mode() != LLAMA_SPLIT_MODE_TENSOR;
 
-    // the training graph is different, need to reserve again
-    sched_need_reserve = true;
-    sched_reserve();
+    // Probe the training graph without allocating compute buffers. The optimizer
+    // graph has a different backend placement and is allocated on first use.
+    sched.reset();
+    sched_params_cur = {};
+    sched_new({
+        /*.max_nodes  =*/ graph_max_nodes(),
+        /*.parallel   =*/ false,
+        /*.op_offload =*/ cparams.op_offload,
+    });
+
+    const int cpu_threadpool_threads = threadpool ? ggml_threadpool_get_n_threads(threadpool) : 0;
+    LLAMA_LOG_INFO("%s: optimizer backend thread count = %d, external CPU threadpool = %s (workers=%d)\n",
+        __func__, std::max(1, cparams.n_threads), threadpool ? "enabled" : "disabled", cpu_threadpool_threads);
+    if (backend_cpu != nullptr) {
+        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
+        if (reg) {
+            auto * set_threadpool_fn = (decltype(ggml_backend_cpu_set_threadpool) *)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
+            if (set_threadpool_fn) {
+                set_threadpool_fn(backend_cpu, threadpool);
+            }
+        }
+    }
+    for (const auto & set_n_threads_fn : set_n_threads_fns) {
+        set_n_threads_fn.second(set_n_threads_fn.first, std::max(1, cparams.n_threads));
+    }
 
     {
         uint32_t train_fwd_nodes = 0;
@@ -4322,8 +4358,13 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
         }
         gf_res_reserve.reset(new llm_graph_result(inflated));
         gf_res_prev_active = nullptr;
-        sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
-                                           sched_size, cparams.pipeline_parallel, cparams.op_offload));
+        sched.reset();
+        sched_params_cur = {};
+        sched_new({
+            /*.max_nodes  =*/ (size_t) sched_size,
+            /*.parallel   =*/ cparams.pipeline_parallel,
+            /*.op_offload =*/ cparams.op_offload,
+        });
         sched_need_reserve = false;
     }
 

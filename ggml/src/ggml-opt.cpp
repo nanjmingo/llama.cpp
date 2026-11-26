@@ -72,6 +72,7 @@ struct ggml_opt_context {
     std::vector<struct ggml_tensor *> grad_accs;
     std::vector<std::pair<int32_t, int32_t>> recompute_backend_affinities;
     std::vector<std::pair<struct ggml_tensor *, ggml_backend_t>> checkpoint_backend_assignments;
+    std::unordered_set<std::string> backend_placement_log_signatures;
     bool checkpoint_diagnostics_logged = false;
     bool checkpoint_forward_buffer_logged = false;
     bool checkpoint_optimizer_buffer_logged = false;
@@ -349,6 +350,112 @@ namespace {
             GGML_ASSERT(clone->nodes[i] == clones.at(graph->nodes[i]));
         }
         return clone;
+    }
+
+    static void ggml_opt_log_backend_placement(ggml_opt_context_t opt_ctx, ggml_cgraph * graph, const char * graph_name) {
+        const int n_backends = ggml_backend_sched_get_n_backends(opt_ctx->backend_sched);
+        std::vector<size_t> backend_node_counts(n_backends, 0);
+        std::map<ggml_op, size_t> cpu_ops;
+        std::vector<size_t> buffer_sizes(n_backends, 0);
+        std::map<ggml_op, std::map<std::string, size_t>> special_ops;
+
+        std::ostringstream signature;
+        signature << graph_name << ':' << graph->n_nodes << ':' << graph->n_leafs;
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            ggml_tensor * node = graph->nodes[i];
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(opt_ctx->backend_sched, node);
+            int backend_id = -1;
+            for (int ib = 0; ib < n_backends; ++ib) {
+                if (ggml_backend_sched_get_backend(opt_ctx->backend_sched, ib) == backend) {
+                    backend_id = ib;
+                    ++backend_node_counts[ib];
+                    break;
+                }
+            }
+            signature << ';' << (int) node->op << '@' << backend_id;
+
+            if (backend_id >= 0) {
+                ggml_backend_dev_t device = ggml_backend_get_device(backend);
+                if (device && ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    ++cpu_ops[node->op];
+                }
+            }
+
+            if (node->op == GGML_OP_EXT_FUSED_LINEAR_CROSS_ENTROPY ||
+                    node->op == GGML_OP_EXT_FUSED_LINEAR_CROSS_ENTROPY_BACK ||
+                    node->op == GGML_OP_OPT_STEP_ADAMW || node->op == GGML_OP_OPT_STEP_SGD) {
+                std::ostringstream detail;
+                detail << "backend=" << (backend ? ggml_backend_name(backend) : "unassigned")
+                       << " device=" << (backend ? ggml_backend_dev_name(ggml_backend_get_device(backend)) : "unknown");
+                if (node->op == GGML_OP_EXT_FUSED_LINEAR_CROSS_ENTROPY) {
+                    detail << " weight_type=" << ggml_type_name(node->src[0]->type)
+                           << " input_type=" << ggml_type_name(node->src[1]->type);
+                } else if (node->op == GGML_OP_EXT_FUSED_LINEAR_CROSS_ENTROPY_BACK) {
+                    detail << " weight_type=" << ggml_type_name(node->src[1]->type)
+                           << " input_type=" << ggml_type_name(node->src[2]->type);
+                } else {
+                    detail << " parameter_type=" << ggml_type_name(node->src[0]->type)
+                           << " grad_type=" << ggml_type_name(node->src[1]->type)
+                           << " optimizer_state_type=" << ggml_type_name(node->src[2]->type);
+                    const bool parallel_adamw = node->op == GGML_OP_OPT_STEP_ADAMW &&
+                        node->src[0]->type == GGML_TYPE_F32 && node->src[2]->type == GGML_TYPE_F32;
+                    detail << " cpu_kernel=" << (parallel_adamw || node->op == GGML_OP_OPT_STEP_SGD ? "row-parallel" : "serial-generic");
+                }
+                ++special_ops[node->op][detail.str()];
+                const bool cpu_assigned = backend && ggml_backend_get_device(backend) &&
+                    ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+                if (cpu_assigned && (node->op == GGML_OP_EXT_FUSED_LINEAR_CROSS_ENTROPY ||
+                        node->op == GGML_OP_EXT_FUSED_LINEAR_CROSS_ENTROPY_BACK)) {
+                    GGML_LOG_WARN("%s: fused linear cross entropy is assigned to the CPU backend; the CPU FCE kernel is serial\n",
+                        __func__);
+                }
+                const bool serial_generic_adamw = node->op == GGML_OP_OPT_STEP_ADAMW &&
+                    (node->src[0]->type != GGML_TYPE_F32 || node->src[2]->type != GGML_TYPE_F32);
+                if (cpu_assigned && serial_generic_adamw) {
+                    GGML_LOG_WARN("%s: AdamW uses the serial generic CPU kernel (parameter=%s, state=%s)\n",
+                        __func__, ggml_type_name(node->src[0]->type), ggml_type_name(node->src[2]->type));
+                }
+            }
+        }
+
+        for (int ib = 0; ib < n_backends; ++ib) {
+            ggml_backend_t backend = ggml_backend_sched_get_backend(opt_ctx->backend_sched, ib);
+            buffer_sizes[ib] = ggml_backend_sched_get_buffer_size(opt_ctx->backend_sched, backend);
+            signature << '#' << ib << '=' << buffer_sizes[ib];
+        }
+
+        // Dynamic QLoRA graphs may be allocated for every micro-batch. Emit these
+        // diagnostics only when the graph/backend/buffer layout actually changes.
+        if (!opt_ctx->backend_placement_log_signatures.insert(signature.str()).second) {
+            return;
+        }
+
+        for (const auto & entry : special_ops) {
+            for (const auto & detail : entry.second) {
+                GGML_LOG_INFO("%s: graph=%s op=%s nodes=%zu %s\n",
+                    __func__, graph_name, ggml_op_name(entry.first), detail.second, detail.first.c_str());
+            }
+        }
+
+        for (int ib = 0; ib < n_backends; ++ib) {
+            ggml_backend_t backend = ggml_backend_sched_get_backend(opt_ctx->backend_sched, ib);
+            ggml_backend_dev_t device = ggml_backend_get_device(backend);
+            size_t free_bytes = 0;
+            size_t total_bytes = 0;
+            if (device) {
+                ggml_backend_dev_memory(device, &free_bytes, &total_bytes);
+            }
+            GGML_LOG_INFO("%s: graph=%s backend[%d]=%s device=%s nodes=%zu scheduler_buffer=%.1f MiB device_free=%.1f/%.1f MiB\n",
+                __func__, graph_name, ib, ggml_backend_name(backend),
+                device ? ggml_backend_dev_name(device) : "unknown", backend_node_counts[ib],
+                (double) buffer_sizes[ib] / (1024.0 * 1024.0),
+                (double) free_bytes / (1024.0 * 1024.0),
+                (double) total_bytes / (1024.0 * 1024.0));
+        }
+        for (const auto & entry : cpu_ops) {
+            GGML_LOG_INFO("%s: graph=%s CPU_op=%s nodes=%zu\n",
+                __func__, graph_name, ggml_op_name(entry.first), entry.second);
+        }
     }
 
     static void ggml_opt_log_sched_buffers(ggml_opt_context_t opt_ctx, const char * graph_name) {
@@ -2248,6 +2355,7 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     }
 
     ggml_backend_sched_alloc_graph(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
+    ggml_opt_log_backend_placement(opt_ctx, opt_ctx->allocated_graph_copy, "training");
 
     if (!opt_ctx->checkpoint_backend_assignments.empty()) {
         size_t mismatches = 0;
@@ -2379,6 +2487,7 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
         ggml_backend_sched_reset(opt_ctx->backend_sched);
         GGML_ASSERT(ggml_backend_sched_alloc_graph(opt_ctx->backend_sched, opt_ctx->gb_opt) &&
             "failed to allocate optimizer update graph");
+        ggml_opt_log_backend_placement(opt_ctx, opt_ctx->gb_opt, "optimizer-update");
         ggml_opt_log_sched_buffers(opt_ctx, "optimizer-update");
         ggml_backend_sched_graph_compute(opt_ctx->backend_sched, opt_ctx->gb_opt);
     }
