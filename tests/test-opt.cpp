@@ -5,6 +5,7 @@
 #include "ggml-backend.h"
 #include "ggml-opt.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cinttypes>
 #include <cstring>
@@ -278,13 +279,16 @@ static bool test_fused_linear_cross_entropy_vocab_tiling(ggml_backend_t backend,
         ctx, weight, input, labels, weights, softcap, vocab_chunk);
     ggml_tensor * fused_loss_tokens = ggml_view_1d(ctx, fused_stats, n_tokens, 0);
     ggml_tensor * fused_loss = ggml_scale(ctx, ggml_sum(ctx, fused_loss_tokens), 1.0f / n_tokens);
+    ggml_set_loss(reference_loss);
+    ggml_set_loss(fused_loss);
 
-    ggml_tensor * difference = ggml_sub(ctx, fused_loss, reference_loss);
-    ggml_set_loss(difference);
+    ggml_cgraph * graph_ref = ggml_new_graph_custom(ctx, 512, true);
+    ggml_build_forward_expand(graph_ref, reference_loss);
+    ggml_build_backward_expand(ctx, graph_ref, nullptr);
 
-    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 512, true);
-    ggml_build_forward_expand(graph, difference);
-    ggml_build_backward_expand(ctx, graph, nullptr);
+    ggml_cgraph * graph_fused = ggml_new_graph_custom(ctx, 512, true);
+    ggml_build_forward_expand(graph_fused, fused_loss);
+    ggml_build_backward_expand(ctx, graph_fused, nullptr);
 
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     GGML_ASSERT(buffer != nullptr);
@@ -309,22 +313,126 @@ static bool test_fused_linear_cross_entropy_vocab_tiling(ggml_backend_t backend,
     ggml_backend_tensor_set(labels, labels_data, 0, sizeof(labels_data));
     ggml_backend_tensor_set(weights, weights_data, 0, sizeof(weights_data));
 
-    const ggml_status status = ggml_backend_graph_compute(backend, graph);
-    float difference_value = NAN;
-    ggml_backend_tensor_get(difference, &difference_value, 0, sizeof(difference_value));
+    ggml_graph_reset(graph_ref);
+    const ggml_status ref_status = ggml_backend_graph_compute(backend, graph_ref);
+    float reference_value = NAN;
+    ggml_backend_tensor_get(reference_loss, &reference_value, 0, sizeof(reference_value));
 
-    ggml_tensor * input_grad = ggml_graph_get_grad(graph, input);
-    std::vector<float> grad(ggml_nelements(input_grad));
-    ggml_backend_tensor_get(input_grad, grad.data(), 0, ggml_nbytes(input_grad));
-    float max_grad = 0.0f;
-    for (float value : grad) max_grad = std::max(max_grad, std::fabs(value));
+    ggml_tensor * ref_dx_tensor = ggml_graph_get_grad(graph_ref, input);
+    ggml_tensor * ref_dlogits_tensor = ggml_graph_get_grad(graph_ref, logits);
+    ggml_tensor * ref_dcapped_tensor = ggml_graph_get_grad(graph_ref, capped_logits);
+    GGML_ASSERT(ref_dx_tensor != nullptr && ref_dlogits_tensor != nullptr && ref_dcapped_tensor != nullptr);
+    std::vector<float> ref_dx(ggml_nelements(ref_dx_tensor));
+    std::vector<float> ref_dlogits(ggml_nelements(ref_dlogits_tensor));
+    std::vector<float> ref_dcapped(ggml_nelements(ref_dcapped_tensor));
+    ggml_backend_tensor_get(ref_dx_tensor, ref_dx.data(), 0, ggml_nbytes(ref_dx_tensor));
+    ggml_backend_tensor_get(ref_dlogits_tensor, ref_dlogits.data(), 0, ggml_nbytes(ref_dlogits_tensor));
+    ggml_backend_tensor_get(ref_dcapped_tensor, ref_dcapped.data(), 0, ggml_nbytes(ref_dcapped_tensor));
 
+    std::vector<float> ref_logits_values(ggml_nelements(logits));
+    std::vector<float> ref_capped_values(ggml_nelements(capped_logits));
+    ggml_backend_tensor_get(logits, ref_logits_values.data(), 0, ggml_nbytes(logits));
+    ggml_backend_tensor_get(capped_logits, ref_capped_values.data(), 0, ggml_nbytes(capped_logits));
+
+    ggml_graph_reset(graph_fused);
+    const ggml_status fused_status = ggml_backend_graph_compute(backend, graph_fused);
+    float fused_value = NAN;
+    ggml_backend_tensor_get(fused_loss, &fused_value, 0, sizeof(fused_value));
+    ggml_tensor * fused_dx_tensor = ggml_graph_get_grad(graph_fused, input);
+    ggml_tensor * fused_stats_grad_tensor = ggml_graph_get_grad(graph_fused, fused_stats);
+    GGML_ASSERT(fused_dx_tensor != nullptr && fused_stats_grad_tensor != nullptr);
+    std::vector<float> fused_dx(ggml_nelements(fused_dx_tensor));
+    std::vector<float> fused_stats_values(ggml_nelements(fused_stats));
+    std::vector<float> fused_stats_grad(ggml_nelements(fused_stats_grad_tensor));
+    ggml_backend_tensor_get(fused_dx_tensor, fused_dx.data(), 0, ggml_nbytes(fused_dx_tensor));
+    ggml_backend_tensor_get(fused_stats, fused_stats_values.data(), 0, ggml_nbytes(fused_stats));
+    ggml_backend_tensor_get(fused_stats_grad_tensor, fused_stats_grad.data(), 0, ggml_nbytes(fused_stats_grad_tensor));
+
+    ggml_tensor * ref_loss_grad_tensor = ggml_graph_get_grad(graph_ref, reference_loss);
+    ggml_tensor * fused_loss_grad_tensor = ggml_graph_get_grad(graph_fused, fused_loss);
+    GGML_ASSERT(ref_loss_grad_tensor != nullptr && fused_loss_grad_tensor != nullptr);
+    float ref_loss_grad = NAN;
+    float fused_loss_grad = NAN;
+    ggml_backend_tensor_get(ref_loss_grad_tensor, &ref_loss_grad, 0, sizeof(ref_loss_grad));
+    ggml_backend_tensor_get(fused_loss_grad_tensor, &fused_loss_grad, 0, sizeof(fused_loss_grad));
+    float gradient_seed_error = std::max(std::fabs(ref_loss_grad - 1.0f),
+        std::fabs(fused_loss_grad - 1.0f));
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        gradient_seed_error = std::max(gradient_seed_error,
+            std::fabs(fused_stats_grad[(size_t) t] - 1.0f / (float) n_tokens));
+        gradient_seed_error = std::max(gradient_seed_error,
+            std::fabs(fused_stats_grad[(size_t) n_tokens + t]));
+    }
+
+    float max_abs = 0.0f;
+    float max_rel = 0.0f;
+    size_t max_abs_index = 0;
+    size_t max_rel_index = 0;
+    std::vector<std::pair<float, size_t>> ranked_diff;
+    ranked_diff.reserve(ref_dx.size());
+    for (size_t i = 0; i < ref_dx.size(); ++i) {
+        const float diff = std::fabs(fused_dx[i] - ref_dx[i]);
+        const float denom = std::max(std::fabs(fused_dx[i]), std::fabs(ref_dx[i]));
+        const float rel = diff / std::max(denom, 1e-12f);
+        if (diff > max_abs) {
+            max_abs = diff;
+            max_abs_index = i;
+        }
+        if (rel > max_rel) {
+            max_rel = rel;
+            max_rel_index = i;
+        }
+        ranked_diff.emplace_back(diff, i);
+    }
+    std::sort(ranked_diff.begin(), ranked_diff.end(), [](const auto & a, const auto & b) {
+        return a.first > b.first;
+    });
+
+    const float loss_diff = std::fabs(reference_value - fused_value);
     const float tolerance = weight_type == GGML_TYPE_F32 ? 2e-6f : 1e-4f;
-    const bool ok = status == GGML_STATUS_SUCCESS && std::isfinite(difference_value) &&
-        std::fabs(difference_value) < tolerance && max_grad < tolerance;
+    const bool ok = ref_status == GGML_STATUS_SUCCESS && fused_status == GGML_STATUS_SUCCESS &&
+        std::isfinite(reference_value) && std::isfinite(fused_value) &&
+        gradient_seed_error < 1e-7f && loss_diff < tolerance && max_abs < tolerance;
+
     if (!ok) {
-        fprintf(stderr, "vocabulary-tiled fused CE mismatch: weight_type=%s status=%d loss_diff=%g max_grad=%g\n",
-                ggml_type_name(weight_type), (int) status, difference_value, max_grad);
+        const size_t max_token = max_abs_index / (size_t) n_embd;
+        const size_t max_embd = max_abs_index % (size_t) n_embd;
+        fprintf(stderr,
+            "FUSED_CE_DIAG weight=%s ref_status=%d fused_status=%d "
+            "ref_loss=%.9g fused_loss=%.9g loss_abs=%.9g "
+            "max_dx_abs=%.9g at token=%zu embd=%zu ref=%.9g fused=%.9g max_dx_rel=%.9g "
+            "ref_loss_grad=%.9g fused_loss_grad=%.9g grad_seed_error=%.9g\n",
+            ggml_type_name(weight_type), (int) ref_status, (int) fused_status,
+            reference_value, fused_value, loss_diff, max_abs, max_token, max_embd,
+            ref_dx[max_abs_index], fused_dx[max_abs_index], max_rel,
+            ref_loss_grad, fused_loss_grad, gradient_seed_error);
+        fprintf(stderr, "FUSED_CE_DIAG max_relative_index=%zu token=%zu embd=%zu ref=%.9g fused=%.9g\n",
+            max_rel_index, max_rel_index / (size_t) n_embd, max_rel_index % (size_t) n_embd,
+            ref_dx[max_rel_index], fused_dx[max_rel_index]);
+        fprintf(stderr, "FUSED_CE_DIAG upstream_gradient:");
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            fprintf(stderr, " t%" PRId64 "=%.9g", t, fused_stats_grad[(size_t) t]);
+        }
+        fprintf(stderr, "\nFUSED_CE_DIAG token_stats:");
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            fprintf(stderr, " t%" PRId64 "=(loss=%.9g,lse=%.9g,label=%d,weight=%.9g)",
+                t, fused_stats_values[(size_t) t], fused_stats_values[(size_t) n_tokens + t],
+                labels_data[t], weights_data[t]);
+        }
+        fprintf(stderr, "\nFUSED_CE_DIAG max_token_logits/gradients:\n");
+        for (int64_t v = 0; v < n_vocab; ++v) {
+            const size_t index = max_token * (size_t) n_vocab + (size_t) v;
+            fprintf(stderr, "  vocab=%" PRId64 " logit=%.9g capped=%.9g d_capped=%.9g d_logit=%.9g\n",
+                v, ref_logits_values[index], ref_capped_values[index],
+                ref_dcapped[index], ref_dlogits[index]);
+        }
+        fprintf(stderr, "FUSED_CE_DIAG largest_dx_differences:\n");
+        for (size_t i = 0; i < std::min<size_t>(ranked_diff.size(), 8); ++i) {
+            const size_t index = ranked_diff[i].second;
+            fprintf(stderr, "  rank=%zu token=%zu embd=%zu ref=%.9g fused=%.9g abs=%.9g\n",
+                i + 1, index / (size_t) n_embd, index % (size_t) n_embd,
+                ref_dx[index], fused_dx[index], ranked_diff[i].first);
+        }
     }
 
     ggml_backend_buffer_free(buffer);
