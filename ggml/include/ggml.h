@@ -2306,13 +2306,6 @@ extern "C" {
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
 
-    // Set the matrix multiplication precision used by the Flash Attention backward pass.
-    GGML_API void ggml_flash_attn_ext_set_back_prec(
-            struct ggml_tensor * a,
-            enum ggml_prec       prec);
-    GGML_API enum ggml_prec ggml_flash_attn_ext_get_back_prec(
-            const struct ggml_tensor * a);
-
     // Use finite mask entries as a sparse K/V set. Set 0 to disable.
     // n_kv_max must bound the number of finite entries in every mask row.
     GGML_API void ggml_flash_attn_ext_set_n_kv_max(

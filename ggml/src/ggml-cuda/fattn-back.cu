@@ -1,4 +1,5 @@
 #include "fattn-back.cuh"
+#include "llamango-ggml.h"
 
 
 #define FATTN_BACK_MAX_CHUNKS 16

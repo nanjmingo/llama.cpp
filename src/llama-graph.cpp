@@ -1,5 +1,6 @@
 #include "llama-graph.h"
 #include "llama-graph-training.h"
+#include "llamango-ggml.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"

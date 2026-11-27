@@ -7,6 +7,7 @@
 #include "ggml-threading.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
+#include "llamango-ggml.h"
 
 // FIXME: required here for quantization functions
 #include "ggml-quants.h"
@@ -5644,12 +5645,26 @@ void ggml_flash_attn_ext_set_back_prec(
         struct ggml_tensor * a,
         enum ggml_prec       prec) {
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
+    switch (prec) {
+        case GGML_PREC_UNDEFINED:
+        case GGML_PREC_F32:
+        case GGML_PREC_BF16:
+        case GGML_PREC_F16:
+        case GGML_PREC_Q8:
+        case GGML_PREC_Q4:
+            break;
+        default:
+            GGML_ABORT("invalid FlashAttention backward precision: %d", (int) prec);
+    }
+
     ggml_set_op_params_i32(a, 6, (int32_t) prec);
 }
 
 enum ggml_prec ggml_flash_attn_ext_get_back_prec(
         const struct ggml_tensor * a) {
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
     return (enum ggml_prec) ggml_get_op_params_i32(a, 6);
 }
 
