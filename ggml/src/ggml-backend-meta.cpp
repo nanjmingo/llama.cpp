@@ -1135,8 +1135,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
             case GGML_OP_CROSS_ENTROPY_LOSS:
-            case GGML_OP_CROSS_ENTROPY_LOSS_BACK: {
+            case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+            case GGML_OP_EXT_CROSS_ENTROPY_LOSS_SPARSE:
+            case GGML_OP_EXT_CROSS_ENTROPY_LOSS_SPARSE_BACK: {
                 split_state = handle_per_row(src_ss);
+            } break;
+            case GGML_OP_EXT_FUSED_LINEAR_CROSS_ENTROPY:
+            case GGML_OP_EXT_FUSED_LINEAR_CROSS_ENTROPY_BACK: {
+                split_state = handle_generic(src_ss, false);
             } break;
             case GGML_OP_OPT_STEP_ADAMW:
             case GGML_OP_OPT_STEP_SGD:

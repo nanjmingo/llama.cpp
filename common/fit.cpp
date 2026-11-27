@@ -85,6 +85,9 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     const size_t nd = llama_model_n_devices(model);
     std::vector<llama_device_memory_data> ret(nd + 1);
 
+    if (cparams->no_alloc_kv_cache) {
+        LOG_TRC("%s: optimizer-managed no_alloc_kv_cache context; fit excludes inference compute buffers because opt_init reserves the optimizer graph instead\n", __func__);
+    }
     llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
 
     for (const auto & [buft, mb] : memory_breakdown) {
@@ -548,7 +551,10 @@ static void common_params_fit_impl(
     }
 
     if (mparams->n_gpu_layers != default_mparams.n_gpu_layers) {
-        throw common_params_fit_exception("n_gpu_layers already set by user to " + std::to_string(mparams->n_gpu_layers) + ", abort");
+        throw common_params_fit_exception(
+            "predicted device memory use exceeds the requested free-memory target, but --gpu-layers was explicitly set to " +
+            std::to_string(mparams->n_gpu_layers) + "; --fit will not move explicitly requested GPU layers to CPU. "
+            "Reduce context/batch size, increase available VRAM, or use --gpu-layers auto to allow layer offload");
     }
     if (nd > 1) {
         if (!tensor_split) {
