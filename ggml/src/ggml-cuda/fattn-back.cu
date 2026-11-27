@@ -349,48 +349,77 @@ static __global__ void fattn_back_gemm_rows(const fattn_back_params P, float * S
 }
 
 static __global__ void fattn_back_gemm_ds(const fattn_back_params P, const float * S, float * dP,
-        const half * mask, const float * Lbuf, const float * Dbuf, unsigned int * dP_absmax,
+        half * dP_f16, const float * dP_convert_scale,
+        const half * mask, const float * Lbuf, const float * Dbuf,
         const int64_t q0, const int64_t R, const int64_t rows, const int64_t iq3) {
-    __shared__ unsigned int block_absmax;
-    if (threadIdx.x == 0) {
-        block_absmax = 0;
+    const int64_t idx = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (idx >= P.KV*R*P.HQ) {
+        return;
     }
-    __syncthreads();
-
-    const int64_t n = P.KV*R*P.HQ;
-    const int64_t stride = (int64_t) blockDim.x*gridDim.x;
-    unsigned int thread_absmax = 0;
-    for (int64_t idx = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
-         idx < n; idx += stride) {
-        const int64_t j = idx % P.KV;
-        const int64_t i = (idx / P.KV) % R;
-        const int64_t h = idx / (P.KV*R);
-        if (i >= rows) {
-            continue;
+    const int64_t j = idx % P.KV;
+    const int64_t i = (idx / P.KV) % R;
+    const int64_t h = idx / (P.KV*R);
+    if (i >= rows) {
+        return;
+    }
+    const float p = S[idx];
+    float g = 0.0f;
+    if (p > 0.0f) {
+        g = p*(dP[idx] - Dbuf[h*R + i])*P.scale;
+        if (P.softcap != 0.0f) {
+            const float mv = mask ? fb_slope(P, h)*__half2float(mask[(q0 + i)*P.m1 + (h % P.m_ne2)*P.m2 + (iq3 % P.m_ne3)*P.m3 + j]) : 0.0f;
+            const float t = (logf(p) + Lbuf[h*R + i] - mv)/P.softcap;
+            g *= 1.0f - t*t;
         }
-        const float p = S[idx];
-        float g = 0.0f;
-        if (p > 0.0f) {
-            g = p*(dP[idx] - Dbuf[h*R + i])*P.scale;
-            if (P.softcap != 0.0f) {
-                const float mv = mask ? fb_slope(P, h)*__half2float(mask[(q0 + i)*P.m1 + (h % P.m_ne2)*P.m2 + (iq3 % P.m_ne3)*P.m3 + j]) : 0.0f;
-                const float t = (logf(p) + Lbuf[h*R + i] - mv)/P.softcap;
-                g *= 1.0f - t*t;
-            }
-        }
+    }
+    // In the low-precision path the FP32 GEMM output is only an input to this
+    // gradient calculation. Do not write it back after it has been consumed.
+    if (dP_f16) {
+        // Fuse the FP16 conversion into the gradient kernel. The scale is
+        // computed once for the whole backward operation from bounds on V
+        // and the incoming gradient, not from dP itself.
+        dP_f16[idx] = __float2half_rn(g * *dP_convert_scale);
+    } else {
         dP[idx] = g;
-        if (dP_absmax && isfinite(g)) {
-            const unsigned int bits = __float_as_uint(fabsf(g));
-            thread_absmax = thread_absmax > bits ? thread_absmax : bits;
+    }
+}
+
+static __global__ void fattn_back_max_v_norm2(
+        const half * v, const int64_t DV, const int64_t KV, const int64_t HK, const int64_t SEQ,
+        const int64_t s1, const int64_t s2, const int64_t s3, unsigned int * max_norm2_bits) {
+    constexpr int WARPS_PER_BLOCK = 8;
+    __shared__ float warp_norm2[WARPS_PER_BLOCK];
+
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int64_t n_rows = KV*HK*SEQ;
+    const int64_t row = (int64_t) blockIdx.x*WARPS_PER_BLOCK + warp;
+    float norm2 = 0.0f;
+    if (row < n_rows) {
+        const int64_t j = row % KV;
+        const int64_t h = (row / KV) % HK;
+        const int64_t sq = row / (KV*HK);
+        for (int64_t e = lane; e < DV; e += WARP_SIZE) {
+            const float value = __half2float(v[e + j*s1 + h*s2 + sq*s3]);
+            norm2 = fmaf(value, value, norm2);
         }
     }
-
-    if (dP_absmax && thread_absmax != 0) {
-        atomicMax(&block_absmax, thread_absmax);
+    norm2 = warp_reduce_sum(norm2);
+    if (!isfinite(norm2)) {
+        norm2 = INFINITY;
+    }
+    if (lane == 0) {
+        warp_norm2[warp] = norm2;
     }
     __syncthreads();
-    if (dP_absmax && threadIdx.x == 0 && block_absmax != 0) {
-        atomicMax(dP_absmax, block_absmax);
+
+    float block_max_norm2 = lane < WARPS_PER_BLOCK ? warp_norm2[lane] : 0.0f;
+    block_max_norm2 = warp_reduce_max(block_max_norm2);
+    if (threadIdx.x == 0) {
+        // Positive float bit patterns are monotonically ordered. Preserve
+        // non-finite inputs as an infinite bound rather than under-scaling.
+        const float bound = isfinite(block_max_norm2) ? block_max_norm2 : INFINITY;
+        atomicMax(max_norm2_bits, __float_as_uint(bound));
     }
 }
 
@@ -421,21 +450,7 @@ template <typename T>
 static __global__ void fattn_back_to_f16_linear(const T * x, half * y, const int64_t n, const float * scale) {
     const int64_t idx = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
     if (idx < n) {
-        y[idx] = __float2half_rn(fb_load(x, idx) * (scale ? *scale : 1.0f));
-    }
-}
-
-static __global__ void fattn_back_scale_dP_to_f16(
-        const float * src, half * dst, const int64_t KV, const int64_t R,
-        const int64_t HQ, const int64_t rows, const float * scale) {
-    const int64_t n = KV*R*HQ;
-    const int64_t stride = (int64_t) blockDim.x*gridDim.x;
-    for (int64_t idx = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
-         idx < n; idx += stride) {
-        const int64_t row = (idx / KV) % R;
-        if (row < rows) {
-            dst[idx] = __float2half_rn(src[idx] * *scale);
-        }
+        y[idx] = __float2half_rn(fb_load(x, idx) * *scale);
     }
 }
 
@@ -445,18 +460,33 @@ static __global__ void fattn_back_init_gemm_scalars(float * scalars) {
 }
 
 static __global__ void fattn_back_compute_dP_scale(
-        const unsigned int * absmax_bits, const float * d_scales,
-        float * dP_scales, float * alpha_dqdk) {
-    const float max_abs = __uint_as_float(*absmax_bits);
+        const unsigned int * max_v_norm2_bits, const unsigned int * d_absmax_bits,
+        const float * d_scales, float * dP_convert_scale, float * alpha_dqdk,
+        const int64_t DV, const float attn_scale) {
+    const float max_v_norm = sqrtf(__uint_as_float(*max_v_norm2_bits));
+    const float max_d_norm_bound = sqrtf((float) DV) * __uint_as_float(*d_absmax_bits);
+
+    // For each key, |V dot dO - O dot dO| is bounded by
+    // 2 * max(||V||_2) * max(||dO||_2). O is a convex combination of V rows,
+    // and ||dO||_2 <= sqrt(DV) * max(|dO_e|). d_absmax is already produced by
+    // the existing dynamic dO scaling pass, so no additional dO scan is needed.
+    // This chooses one conservative dP scale for the whole backward operation.
+    const float max_dP = 2.0f * max_v_norm * max_d_norm_bound * fabsf(attn_scale);
     int exponent = 0;
-    if (max_abs > 0.0f && isfinite(max_abs)) {
-        exponent = 14 - ilogbf(max_abs);
+    if (max_dP > 0.0f && isfinite(max_dP)) {
+        // Leave headroom below the FP16 maximum (scale the bound to <= 2^14).
+        exponent = 13 - ilogbf(max_dP);
         exponent = exponent < -126 ? -126 : exponent;
         exponent = exponent > 126 ? 126 : exponent;
+    } else if (!isfinite(max_dP)) {
+        exponent = -126;
     }
-    dP_scales[0] = ldexpf(1.0f, exponent);
-    dP_scales[1] = ldexpf(1.0f, -exponent);
-    *alpha_dqdk = d_scales[1] * dP_scales[1];
+    const float dP_scale = ldexpf(1.0f, exponent);
+    const float dP_inv_scale = ldexpf(1.0f, -exponent);
+    // The dP gradient is calculated with dO multiplied by d_scales[0]. Undo
+    // that scale while converting to FP16; the GEMM then only removes dP_scale.
+    *dP_convert_scale = d_scales[1] * dP_scale;
+    *alpha_dqdk = dP_inv_scale;
 }
 
 static void fattn_back_gemm_strided_batched(
@@ -576,6 +606,7 @@ static void fattn_back_gemm(ggml_backend_cuda_context & ctx, const fattn_back_pa
             (const float *) q->data, q_f16.get(), P.DK, P.N, P.HQ, P.SEQ, P.q1, P.q2, P.q3);
         fattn_back_to_f16_linear<float><<<(nd + 255)/256, 256, 0, stream>>>(
             (const float *) d->data, d_f16.get(), nd, d_scales.ptr);
+        CUDA_CHECK(cudaGetLastError());
         q_data = q_f16.get();
         d_data = d_f16.get();
         q1 = P.DK; q2 = P.DK*P.N; q3 = P.DK*P.N*P.HQ;
@@ -584,18 +615,29 @@ static void fattn_back_gemm(ggml_backend_cuda_context & ctx, const fattn_back_pa
     const int64_t R = std::max<int64_t>(1, std::min<int64_t>(P.N, (int64_t(32) << 20) / std::max<int64_t>(1, P.KV*P.HQ)));
     ggml_cuda_pool_alloc<float> S(ctx.pool(), P.KV*R*P.HQ), dP(ctx.pool(), P.KV*R*P.HQ);
     ggml_cuda_pool_alloc<half> S_f16(ctx.pool()), dP_f16(ctx.pool());
-    ggml_cuda_pool_alloc<unsigned int> dP_absmax(ctx.pool());
-    ggml_cuda_pool_alloc<float> dP_scales(ctx.pool());
+    ggml_cuda_pool_alloc<unsigned int> max_v_norm2(ctx.pool());
+    ggml_cuda_pool_alloc<float> dP_convert_scale(ctx.pool());
     ggml_cuda_pool_alloc<float> gemm_scalars(ctx.pool());
     if (use_f16) {
         S_f16.alloc(P.KV*R*P.HQ);
         dP_f16.alloc(P.KV*R*P.HQ);
-        dP_absmax.alloc(1);
-        dP_scales.alloc(2);
+        max_v_norm2.alloc(1);
+        dP_convert_scale.alloc(1);
         // Device-pointer mode lets GEMM apply the runtime inverse scales without
         // synchronizing the stream to read them back to the host.
         gemm_scalars.alloc(3);
         fattn_back_init_gemm_scalars<<<1, 1, 0, stream>>>(gemm_scalars.ptr);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemsetAsync(max_v_norm2.ptr, 0, sizeof(unsigned int), stream));
+        const int64_t n_v_rows = P.KV*P.HK*SEQK;
+        const int n_v_blocks = (int) ((n_v_rows + 7) / 8);
+        fattn_back_max_v_norm2<<<n_v_blocks, 256, 0, stream>>>(
+            (const half *) v_data, P.DV, P.KV, P.HK, SEQK, v1, v2, v3, max_v_norm2.ptr);
+        CUDA_CHECK(cudaGetLastError());
+        // Choose a conservative dP scale once for the whole backward operation.
+        fattn_back_compute_dP_scale<<<1, 1, 0, stream>>>(
+            max_v_norm2.ptr, d_absmax.ptr, d_scales.ptr, dP_convert_scale.ptr,
+            gemm_scalars.ptr + 2, P.DV, P.scale);
         CUDA_CHECK(cudaGetLastError());
     }
     ggml_cuda_pool_alloc<float> Lbuf(ctx.pool(), R*P.HQ), Dbuf(ctx.pool(), R*P.HQ);
@@ -649,22 +691,12 @@ static void fattn_back_gemm(ggml_backend_cuda_context & ctx, const fattn_back_pa
                     beta_one, dv + ik3*P.HK*P.KV*P.DV, (int) P.DV, (long long) (P.KV*P.DV), (int) P.HK);
             }
             const int64_t n = P.KV*R*P.HQ;
-            if (use_f16) {
-                CUDA_CHECK(cudaMemsetAsync(dP_absmax.ptr, 0, sizeof(unsigned int), stream));
-            }
-            const int ds_blocks = (int) std::min<int64_t>((n + 255)/256, 4096);
-            fattn_back_gemm_ds<<<ds_blocks, 256, 0, stream>>>(P, S.get(), dP.get(),
+            fattn_back_gemm_ds<<<(n + 255)/256, 256, 0, stream>>>(P, S.get(), dP.get(),
+                use_f16 ? dP_f16.get() : nullptr,
+                use_f16 ? dP_convert_scale.ptr : nullptr,
                 mask ? (const half *) mask->data : nullptr, Lbuf.get(), Dbuf.get(),
-                use_f16 ? dP_absmax.ptr : nullptr, q0, R, rows, iq3);
-            if (use_f16) {
-                fattn_back_compute_dP_scale<<<1, 1, 0, stream>>>(
-                    dP_absmax.ptr, d_scales.ptr, dP_scales.ptr, gemm_scalars.ptr + 2);
-                CUDA_CHECK(cudaGetLastError());
-                const int convert_blocks = (int) std::min<int64_t>((n + 255)/256, 4096);
-                fattn_back_scale_dP_to_f16<<<convert_blocks, 256, 0, stream>>>(
-                    dP.get(), dP_f16.get(), P.KV, R, P.HQ, rows, dP_scales.ptr);
-                CUDA_CHECK(cudaGetLastError());
-            }
+                q0, R, rows, iq3);
+            CUDA_CHECK(cudaGetLastError());
             for (int64_t g = 0; g < P.rk2; ++g) {
                 const void * dP_input = use_f16
                     ? (const void *) (dP_f16.get() + g*P.KV*R)
