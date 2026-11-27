@@ -135,9 +135,11 @@ When enabled, activation checkpointing retains every `l_out` layer boundary and 
 
 #### Precision Selection
 
-`--compute-type f32`, `f16`, and `bf16` set one matrix-multiplication compute precision. GGML stores this precision on the forward matmul op and propagates it to the corresponding backward matmul/out-product ops during automatic differentiation. The CUDA kernels convert supported inputs to that compute type; if the GPU does not support the requested low-precision type efficiently, they fall back to F32.
+`--compute-type f32`, `f16`, and `bf16` set the matrix-multiplication compute precision. GGML stores this precision on the forward matmul op and propagates it to the corresponding backward matmul/out-product ops during automatic differentiation. The CUDA kernels convert supported inputs to that compute type; if the GPU does not support the requested low-precision type efficiently, they fall back to F32.
 
-`--compute-type q8` requests Q8 activations for forward quantized-weight kernels. The same Q8 compute-type value is propagated through the backward graph, where the CUDA backward kernels use F16 because Q8 backward kernels are not supported. For floating-point weights, where Q8 activations are not applicable, the forward request resolves to F16. If the GPU does not support F16 computation, CUDA falls back to F32.
+`--compute-type q8` requests Q8 activations for forward quantized-weight kernels. The same Q8 compute-type value is propagated through the backward graph, where CUDA backward kernels use F16 because Q8 backward kernels are not supported. For floating-point weights, where Q8 activations are not applicable, the forward request resolves to F16. If the GPU does not support F16 computation, CUDA falls back to F32.
+
+For CUDA Flash Attention backward, `q8`, `f16`, and `bf16` use F16 GEMM inputs with F32 accumulation (including on Turing, where BF16 Tensor Core operations are unavailable). K/V remain F16 instead of being expanded to F32; Q, dO, and the FP32 Softmax intermediates are converted to F16 only for the GEMM inputs. `f32` uses F32 GEMMs and expands F16 K/V to F32. The forward Flash Attention precision and its F32 output accumulation remain unchanged.
 
 CPU support for applying F16/BF16 precision to F32 weights is not included in this change.
 
