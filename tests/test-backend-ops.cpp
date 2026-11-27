@@ -13984,6 +13984,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {30000, 1, 1, 1}));
 
+
     test_cases.emplace_back(new test_opt_step_adamw(GGML_TYPE_F32, {10, 5, 4, 3}));
     test_cases.emplace_back(new test_opt_step_sgd(GGML_TYPE_F32, {10, 5, 4, 3}));
 
@@ -15368,7 +15369,7 @@ static void list_all_ops() {
     printf("GGML operations:\n");
     std::set<std::string> all_ops;
 
-    for (int i = 1; i < GGML_OP_COUNT; i++) {
+    for (int i = 1; i < GGML_OP_EXT_COUNT; i++) {
         all_ops.insert(ggml_op_name((enum ggml_op)i));
     }
     for (int i = 0; i < GGML_UNARY_OP_COUNT; i++) {
@@ -15385,7 +15386,7 @@ static void list_all_ops() {
 
 static void show_test_coverage() {
     std::set<std::string> all_ops;
-    for (int i = 1; i < GGML_OP_COUNT; i++) {
+    for (int i = 1; i < GGML_OP_EXT_COUNT; i++) {
         auto op = (enum ggml_op)i;
         if (op == GGML_OP_VIEW      ||
             op == GGML_OP_RESHAPE   ||

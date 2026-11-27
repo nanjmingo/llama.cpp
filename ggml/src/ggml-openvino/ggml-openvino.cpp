@@ -2276,7 +2276,7 @@ static ggml_openvino_op_support ggml_backend_openvino_device_supports_op_impl(gg
         // GGML_OP_NONE has no translator but is always safe to add to the supported set.
         ops.insert(GGML_OP_NONE);
 
-        for (int i = 0; i < GGML_OP_COUNT; ++i) {
+        for (int i = 0; i < GGML_OP_EXT_COUNT; ++i) {
             const std::string key = std::string("GGML_OP_") + ggml_op_name(static_cast<ggml_op>(i));
             if (table.count(key)) {
                 ops.insert(static_cast<ggml_op>(i));
