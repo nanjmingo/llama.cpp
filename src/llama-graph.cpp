@@ -112,6 +112,7 @@ static llm_attn_mask build_attn_inp_attn_mask(
         const llama_kv_cache_context * mctx,
         const llama_ubatch & ubatch,
         const llama_cparams & cparams,
+        bool force_f16 = false,
         bool use_current_kv = false) {
     llm_attn_mask attn_mask;
 
@@ -121,7 +122,7 @@ static llm_attn_mask build_attn_inp_attn_mask(
 
     if (n_kv_rows == 0) {
         attn_mask.rows = nullptr;
-        attn_mask.raw = build_attn_inp_kq_mask(ctx, mctx, ubatch, cparams, use_current_kv);
+        attn_mask.raw = build_attn_inp_kq_mask(ctx, mctx, ubatch, cparams, force_f16, use_current_kv);
     } else {
         const uint32_t n_slices = llama_kv_cache::get_n_kv_slices(ubatch);
 
@@ -3466,7 +3467,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
 
-        inp->self_attn_mask = build_attn_inp_attn_mask(ctx0, mctx_cur, ubatch, cparams, true);
+        inp->self_attn_mask = build_attn_inp_attn_mask(ctx0, mctx_cur, ubatch, cparams, /* force_f16 = */ false, /* use_current_kv = */ true);
 
     }
 
@@ -4143,7 +4144,7 @@ llm_graph_input_attn_kv_msa * llm_graph_context::build_attn_inp_kv_msa(bool msa_
         inp->self_k_idxs = mctx_base->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_base->build_input_v_idxs(ctx0, ubatch);
 
-        inp->self_attn_mask = build_attn_inp_attn_mask(ctx0, mctx_base, ubatch, cparams, true);
+        inp->self_attn_mask = build_attn_inp_attn_mask(ctx0, mctx_base, ubatch, cparams, /* force_f16 = */ false, /* use_current_kv = */ true);
 
     }
 
@@ -4169,7 +4170,7 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
         inp->self_k_idxs = mctx_cur->get_base()->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->get_base()->build_input_v_idxs(ctx0, ubatch);
 
-        inp->self_attn_mask = build_attn_inp_attn_mask(ctx0, mctx_cur->get_base(), ubatch, cparams, true);
+        inp->self_attn_mask = build_attn_inp_attn_mask(ctx0, mctx_cur->get_base(), ubatch, cparams, /* force_f16 = */ false, /* use_current_kv = */ true);
 
     }
 
@@ -4179,7 +4180,7 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
         inp->self_k_idxs_swa = mctx_cur->get_swa()->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs_swa = mctx_cur->get_swa()->build_input_v_idxs(ctx0, ubatch);
 
-        inp->self_attn_mask_swa = build_attn_inp_attn_mask(ctx0, mctx_cur->get_swa(), ubatch, cparams, true);
+        inp->self_attn_mask_swa = build_attn_inp_attn_mask(ctx0, mctx_cur->get_swa(), ubatch, cparams, /* force_f16 = */ false, /* use_current_kv = */ true);
 
     }
 
@@ -4524,13 +4525,13 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa()
     {
         inp_attn->self_k_idxs = attn_ctx->get_base()->build_input_k_idxs(ctx0, ubatch);
         inp_attn->self_v_idxs = attn_ctx->get_base()->build_input_v_idxs(ctx0, ubatch);
-        inp_attn->self_attn_mask = build_attn_inp_attn_mask(ctx0, attn_ctx->get_base(), ubatch, cparams, true);
+        inp_attn->self_attn_mask = build_attn_inp_attn_mask(ctx0, attn_ctx->get_base(), ubatch, cparams, /* force_f16 = */ false, /* use_current_kv = */ true);
     }
 
     {
         inp_attn->self_k_idxs_swa = attn_ctx->get_swa()->build_input_k_idxs(ctx0, ubatch);
         inp_attn->self_v_idxs_swa = attn_ctx->get_swa()->build_input_v_idxs(ctx0, ubatch);
-        inp_attn->self_attn_mask_swa = build_attn_inp_attn_mask(ctx0, attn_ctx->get_swa(), ubatch, cparams, true);
+        inp_attn->self_attn_mask_swa = build_attn_inp_attn_mask(ctx0, attn_ctx->get_swa(), ubatch, cparams, /* force_f16 = */ false, /* use_current_kv = */ true);
     }
 
     inp_attn->self_k_rot = attn_ctx->get_base()->get_k_rot();
@@ -4558,13 +4559,13 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
     {
         inp_attn->self_k_idxs = attn_ctx->get_base()->build_input_k_idxs(ctx0, ubatch);
         inp_attn->self_v_idxs = attn_ctx->get_base()->build_input_v_idxs(ctx0, ubatch);
-        inp_attn->self_attn_mask.raw = build_attn_inp_kq_mask(ctx0, attn_ctx->get_base(), ubatch, cparams, true);
+        inp_attn->self_attn_mask.raw = build_attn_inp_kq_mask(ctx0, attn_ctx->get_base(), ubatch, cparams, /* force_f16 = */ false, /* use_current_kv = */ true);
     }
 
     {
         inp_attn->self_k_idxs_swa = attn_ctx->get_swa()->build_input_k_idxs(ctx0, ubatch);
         inp_attn->self_v_idxs_swa = attn_ctx->get_swa()->build_input_v_idxs(ctx0, ubatch);
-        inp_attn->self_attn_mask_swa.raw = build_attn_inp_kq_mask(ctx0, attn_ctx->get_swa(), ubatch, cparams, true);
+        inp_attn->self_attn_mask_swa.raw = build_attn_inp_kq_mask(ctx0, attn_ctx->get_swa(), ubatch, cparams, /* force_f16 = */ false, /* use_current_kv = */ true);
     }
 
     inp_attn->self_k_rot = attn_ctx->get_base()->get_k_rot();
