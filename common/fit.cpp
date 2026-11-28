@@ -548,10 +548,7 @@ static void common_params_fit_impl(
     }
 
     if (mparams->n_gpu_layers != default_mparams.n_gpu_layers) {
-        throw common_params_fit_exception(
-            "predicted device memory use exceeds the requested free-memory target, but --gpu-layers was explicitly set to " +
-            std::to_string(mparams->n_gpu_layers) + "; --fit will not move explicitly requested GPU layers to CPU. "
-            "Reduce context/batch size, increase available VRAM, or use --gpu-layers auto to allow layer offload");
+        throw common_params_fit_exception("n_gpu_layers already set by user to " + std::to_string(mparams->n_gpu_layers) + ", abort");
     }
     if (nd > 1) {
         if (!tensor_split) {
