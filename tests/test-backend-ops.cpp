@@ -16505,7 +16505,7 @@ static void list_all_ops() {
     printf("GGML operations:\n");
     std::set<std::string> all_ops;
 
-    for (int i = 1; i < GGML_OP_COUNT; i++) {
+    for (int i = 1; i < GGML_OP_EXT_COUNT; i++) {
         all_ops.insert(ggml_op_name((enum ggml_op)i));
     }
     for (int i = 0; i < GGML_UNARY_OP_COUNT; i++) {
@@ -16522,7 +16522,7 @@ static void list_all_ops() {
 
 static void show_test_coverage() {
     std::set<std::string> all_ops;
-    for (int i = 1; i < GGML_OP_COUNT; i++) {
+    for (int i = 1; i < GGML_OP_EXT_COUNT; i++) {
         auto op = (enum ggml_op)i;
         if (op == GGML_OP_VIEW      ||
             op == GGML_OP_RESHAPE   ||

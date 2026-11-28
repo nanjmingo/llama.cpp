@@ -436,6 +436,17 @@ extern "C" {
         GGML_OP_SIGMOID_BACK,
 
         GGML_OP_COUNT,
+
+        GGML_OP_EXT_OUT_PROD_ID = GGML_OP_COUNT,
+        GGML_OP_EXT_GATED_DELTA_NET_BACK,
+        GGML_OP_EXT_MUL_MAT_ID_BACK,
+        GGML_OP_EXT_CROSS_ENTROPY_LOSS_SPARSE,
+        GGML_OP_EXT_CROSS_ENTROPY_LOSS_SPARSE_BACK,
+        GGML_OP_EXT_FUSED_LINEAR_CROSS_ENTROPY,
+        GGML_OP_EXT_FUSED_LINEAR_CROSS_ENTROPY_BACK,
+
+        GGML_OP_EXT_COUNT,
+
     };
 
     enum ggml_unary_op {
@@ -2322,14 +2333,10 @@ extern "C" {
             struct ggml_tensor * table,
             struct ggml_tensor * indices);
 
-    // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
             struct ggml_context * ctx,
-            struct ggml_tensor  * q,
-            struct ggml_tensor  * k,
-            struct ggml_tensor  * v,
-            struct ggml_tensor  * d,
-            bool                  masked);
+            struct ggml_tensor  * fa,
+            struct ggml_tensor  * d);
 
     GGML_API struct ggml_tensor * ggml_ssm_conv(
             struct ggml_context * ctx,

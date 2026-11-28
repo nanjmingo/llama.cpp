@@ -10,14 +10,17 @@ file(GLOB LLAMA_MODELS_SOURCES "models/*.cpp")
 
 set(LLAMA_CORE_SOURCES
     llama.cpp
+    llamango-model.cpp
     llama-adapter.cpp
     llama-arch.cpp
     llama-batch.cpp
     llama-chat.cpp
     llama-context.cpp
+    llamango-context.cpp
     llama-cparams.cpp
     llama-grammar.cpp
     llama-graph.cpp
+    llamango-graph-training.cpp
     llama-hparams.cpp
     llama-impl.cpp
     llama-io.cpp
@@ -46,6 +49,10 @@ set(LLAMA_CORE_SOURCES
 
 add_library(llama
             ../include/llama.h
+            ../include/llamango.h
+            llamango-context.h
+            llamango-graph-training.h
+            llamango-model.h
             ${LLAMA_CORE_SOURCES}
             unicode.h
             ${LLAMA_MODELS_SOURCES}
@@ -60,7 +67,7 @@ set_target_properties(llama PROPERTIES
 )
 
 # exclude non-model sources from unity build
-set_source_files_properties(${LLAMA_CORE_SOURCES} ../include/llama.h unicode.h
+set_source_files_properties(${LLAMA_CORE_SOURCES} ../include/llama.h ../include/llamango.h llamango-context.h llamango-graph-training.h llamango-model.h unicode.h
     PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 
 configure_file(llama-version.h.in ${CMAKE_CURRENT_BINARY_DIR}/llama-version.h @ONLY)
