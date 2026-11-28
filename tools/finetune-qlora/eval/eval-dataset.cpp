@@ -151,7 +151,7 @@ std::string token_bytes_hex(const llama_vocab * vocab, llama_token token) {
 }
 
 float effective_sample_weight(const training_sample & sample, size_t index, int32_t context_size) {
-    if (sample.text_continuation && index < static_cast<size_t>(context_size / 2)) {
+    if (sample.text_continuation && index <= static_cast<size_t>(context_size / 2)) {
         return 0.0f;
     }
     return sample.weights[index];

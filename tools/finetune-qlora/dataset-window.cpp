@@ -100,7 +100,7 @@ size_t count_window_supervised_labels(const training_sample & sample,
             continue;
         }
         if (sample.text_continuation && offset == 0 &&
-            target_index < static_cast<size_t>(context_length / 2)) {
+            target_index <= static_cast<size_t>(context_length / 2)) {
             continue;
         }
         if (sample.weights[target_index] > 0.0f) {

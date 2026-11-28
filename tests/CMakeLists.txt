@@ -364,6 +364,7 @@ target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp  LABEL "main behavior backend"  LINK ggml)
+  llama_build_and_test(test-opt-dynamic.cpp  LABEL "main behavior backend"  LINK ggml)
 endif()
 if (GGML_METAL AND NOT GGML_BACKEND_DL)
     # calls the Metal backend's graph optimizer and fusion table directly
