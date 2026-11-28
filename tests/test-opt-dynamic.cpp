@@ -72,10 +72,11 @@ static training_result run_dynamic_training(
     }
     ggml_opt_set_activation_checkpointing(opt_ctx, activation_checkpointing);
 
-    // Keep the compute contexts alive until the optimizer is freed. Dynamic
-    // graph allocation resets the preceding graph at the beginning of a group.
+    // Keep compute contexts alive until the optimizer is freed; dynamic graph
+    // nodes can still be referenced by the optimizer context during each step.
     std::vector<ggml_context *> compute_contexts;
     bool has_parameter_gradient = true;
+    int32_t training_step = 0;
     for (size_t igroup = 0; igroup < accumulation_groups.size(); ++igroup) {
         const int32_t period = accumulation_groups[igroup];
         if (period < 1) {
@@ -119,7 +120,11 @@ static training_result run_dynamic_training(
             ggml_opt_alloc(opt_ctx, /*backward =*/ true);
             has_parameter_gradient = has_parameter_gradient && ggml_opt_has_grad(opt_ctx, parameter);
 
-            const float input_value = 1.0f;
+            // Vary gradients across optimizer steps so that accidentally
+            // resetting AdamW momenta is observable in the final parameter.
+            const float magnitude = 0.5f + 0.75f * training_step;
+            const float input_value = (training_step % 2 == 0 ? 1.0f : -1.0f) * magnitude;
+            ++training_step;
             ggml_backend_tensor_set(input, &input_value, 0, sizeof(input_value));
             ggml_opt_eval(opt_ctx, nullptr);
         }
@@ -138,7 +143,7 @@ static training_result run_dynamic_training(
     return { final_parameter, has_parameter_gradient };
 }
 
-static bool test_graph_reset_preserves_adamw_momenta() {
+static bool test_graph_reset_resets_adamw_momenta() {
     ggml_init_params params = {
         /*.mem_size   =*/ 1 * 1024 * 1024,
         /*.mem_buffer =*/ nullptr,
@@ -166,11 +171,11 @@ static bool test_graph_reset_preserves_adamw_momenta() {
 
     ggml_graph_reset(graph);
 
-    const bool preserved =
-        ggml_get_data_f32(moment1)[0] == 0.25f &&
-        ggml_get_data_f32(moment2)[0] == 0.75f;
+    const bool reset =
+        ggml_get_data_f32(moment1)[0] == 0.0f &&
+        ggml_get_data_f32(moment2)[0] == 0.0f;
     ggml_free(ctx);
-    return preserved;
+    return reset;
 }
 
 static bool almost_equal(float a, float b, float tolerance = 1e-6f) {
@@ -207,8 +212,8 @@ int main() {
     int passed = 0;
     int total = 0;
 
-    report("graph_reset_preserves_adamw_momenta",
-        test_graph_reset_preserves_adamw_momenta(), passed, total);
+    report("graph_reset_resets_adamw_momenta",
+        test_graph_reset_resets_adamw_momenta(), passed, total);
 
     const std::vector<int32_t> period_one = { 1, 1, 1, 1 };
     const std::vector<int32_t> period_two = { 2, 2 };
@@ -220,7 +225,7 @@ int main() {
         backend_sched, backend, false, period_one);
     report("dynamic_ac_off_period_1_matches_ac_on_and_updates_parameter",
         std::isfinite(ac_off_period_one.parameter) &&
-        ac_off_period_one.parameter < 1.0f &&
+        std::fabs(ac_off_period_one.parameter - 1.0f) > 1e-3f &&
         ac_off_period_one.has_parameter_gradient && ac_on_period_one.has_parameter_gradient &&
         almost_equal(ac_off_period_one.parameter, ac_on_period_one.parameter), passed, total);
 
@@ -230,7 +235,7 @@ int main() {
         backend_sched, backend, false, period_two);
     report("dynamic_ac_off_period_2_matches_ac_on_and_updates_parameter",
         std::isfinite(ac_off_period_two.parameter) &&
-        ac_off_period_two.parameter < 1.0f &&
+        std::fabs(ac_off_period_two.parameter - 1.0f) > 1e-3f &&
         ac_off_period_two.has_parameter_gradient && ac_on_period_two.has_parameter_gradient &&
         almost_equal(ac_off_period_two.parameter, ac_on_period_two.parameter), passed, total);
 

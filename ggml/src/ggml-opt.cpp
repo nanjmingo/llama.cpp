@@ -1205,6 +1205,20 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     ggml_build_backward_expand(opt_ctx->ctx_compute, opt_ctx->gb_grad, opt_ctx->grad_accs.data());
     ggml_opt_recompute_checkpoints(opt_ctx);
 
+    if (!opt_ctx->static_graphs) {
+        // Allocate the persistent loss-gradient tensor before resetting it.
+        // Reset gb_grad at the start of an accumulation group, while it still
+        // contains only the backward graph. ggml_graph_reset() also clears
+        // AdamW momenta if optimizer-step nodes have already been appended.
+        if (!opt_ctx->buf_static) {
+            opt_ctx->buf_static = ggml_backend_alloc_ctx_tensors(
+                opt_ctx->ctx_static, ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0));
+        }
+        if (opt_ctx->opt_i == 0) {
+            ggml_graph_reset(opt_ctx->gb_grad);
+        }
+    }
+
     if (opt_ctx->buf_static) {
         if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_GRAD) {
             return;
@@ -1851,9 +1865,6 @@ void ggml_opt_prepare_alloc(
 
 void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     GGML_ASSERT(!opt_ctx->eval_ready);
-    if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_OPT && opt_ctx->opt_period > 1 && opt_ctx->opt_i == 0) {
-        ggml_graph_reset(opt_ctx->gb_grad);
-    }
     if (backward) {
         const int32_t opt_i_next = (opt_ctx->opt_i + 1) % opt_ctx->opt_period;
         opt_ctx->build_type = opt_i_next == 0 ? GGML_OPT_BUILD_TYPE_OPT : GGML_OPT_BUILD_TYPE_GRAD;
@@ -1863,10 +1874,6 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
 
     if (!opt_ctx->static_graphs) {
         ggml_opt_build(opt_ctx);
-
-        if (opt_ctx->gb_grad && opt_ctx->opt_i == 0) {
-            ggml_graph_reset(opt_ctx->gb_grad);
-        }
     }
 
     struct ggml_cgraph * graph = nullptr;
